@@ -886,7 +886,7 @@ def main() -> int:
         "--timestamp-mode",
         choices=["auto", "reliable", "unavailable"],
         default="auto",
-        help="时间戳可靠性；reliable 要求带时间戳表头，unavailable 要求无时间戳表头，auto 接受两者",
+        help="时间戳可靠性；reliable 要求带时间戳表头，unavailable 用于音频来源但无可靠 anchor 的无时间戳表格校验，auto 接受两者",
     )
     parser.add_argument("--require-audio-timestamps", action="store_true", help="音频来源不允许把存疑时间戳批量写成未提供")
     parser.add_argument("--json", action="store_true", help="输出 JSON")

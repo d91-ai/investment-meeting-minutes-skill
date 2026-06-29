@@ -84,6 +84,7 @@
 
 - 原文中存在不确定识别的词、公司名或术语时，正文必须对存疑片段加粗；导出 Word 时存疑词必须同时加粗并加下划线。
 - 含音频/视频或带时间戳转写且时间戳可靠时，正文存疑片段后立即标注 `（存疑时间戳：MM:SS）`、`（存疑时间戳：HH:MM:SS）` 或同格式范围；可靠时间戳只接受 sentence/phrase 级 anchor，或 `source=sensevoice_vad_segment` 且 `duration_ms <= 10000` 的短 VAD segment。文稿/document-only、无可靠时间戳，或只有其他 segment/chunk/minute 级范围时，只加粗存疑词，不写时间戳占位。
+- 音频来源但没有可靠时间戳 anchor 时，使用无时间戳表格，并用 `validate_meeting_minutes_contract.py NOTE.md --source-mode audio --timestamp-mode unavailable` 显式校验该路径。
 - 存疑表列固定：有可靠时间戳时用 `时间戳 | 原始表述 | 当前判断 | 候选项 | 人工确认`；无可靠时间戳或 document-only 时用 `原始表述 | 当前判断 | 候选项 | 人工确认`。
 - 不写 `未提供` 时间戳列；没有可靠时间戳就使用无时间戳表格。
 - `人工确认` 列必须留空。

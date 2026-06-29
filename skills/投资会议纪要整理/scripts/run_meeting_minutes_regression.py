@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,9 @@ from validate_meeting_minutes_contract import (  # noqa: E402
     validate_contract,
     validate_timestamp_index_file,
     validate_verification_sidecar,
+    validate_word_contract,
 )
+from export_to_obsidian import convert_markdown_to_docx  # noqa: E402
 
 
 def read_cases(path: Path) -> list[dict[str, Any]]:
@@ -76,6 +79,18 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             result["errors"].extend(timestamp_index_result["errors"])
             result["warnings"].extend(timestamp_index_result["warnings"])
             result["ok"] = result["ok"] and timestamp_index_result["ok"]
+        if case.get("word_export"):
+            with tempfile.TemporaryDirectory(prefix="meeting-minutes-regression-") as tmpdir:
+                docx_path = Path(tmpdir) / f"{file_path.stem}.docx"
+                word_ok, word_message = convert_markdown_to_docx(file_path, docx_path)
+                if not word_ok:
+                    word_result: dict[str, Any] = {"ok": False, "errors": [word_message], "warnings": []}
+                else:
+                    word_result = validate_word_contract(docx_path, markdown)
+                result["word"] = word_result
+                result["errors"].extend(word_result["errors"])
+                result["warnings"].extend(word_result["warnings"])
+                result["ok"] = result["ok"] and word_result["ok"]
     raw_ok = bool(result["ok"])
     expect_fail = bool(case.get("expect_fail"))
     required_error_terms = [str(term) for term in case.get("required_error_terms", [])]

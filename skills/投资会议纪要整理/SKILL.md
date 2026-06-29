@@ -13,7 +13,7 @@ Use the fastest safe path for the source risk. The default path is a single fina
 
 ## Stable Contract
 
-- Workflow after input archive: 转录 -> 校对 -> 识别 -> 编辑 -> 排版.
+- Workflow after input archive: 转录 -> 校对 -> 识别 -> 编辑 -> 排版 -> 验证. Do not silently skip any step; when a step is not applicable, record `skipped_reason`, and when a step fails, record the failure reason and safest next action.
 - Source boundary: use only current-session materials as meeting-content sources. External sources may verify names, codes, terms, or public facts, but must not add meeting content.
 - ASR: use local SenseVoiceSmall as the primary transcript model and Paraformer-Large as auxiliary proofreading plus timestamp evidence when available. Do not switch to Whisper or another ASR. If the local ASR/timestamp chain cannot run, first diagnose and repair model cache, dependencies, device compatibility, memory, or chunking; use a text-only path only when the runtime cannot be restored and the user accepts that audio review is incomplete.
 - Final writer: Subagents may produce intermediate notes, candidate blocks, verification notes, and omission findings; they must not directly write final deliverables. Subagent dispatch follows an any-risk trigger: one qualifying risk condition is enough to trigger the relevant reviewer; multiple conditions only raise priority.
@@ -112,7 +112,7 @@ Before export, do a source-fidelity pass against the current-session transcript 
 
 ### 5. 排版
 
-After final Markdown confirmation, validate and export locally.
+After final Markdown confirmation, validate and export locally. Do not skip transcription, proofreading, identification, editing, formatting, export, or validation silently; if one step is not applicable or cannot complete, record `skipped_reason` or the failure reason in the process notes before continuing or reporting the blocker.
 
 ```bash
 python3 scripts/validate_utf8_text.py NOTE.md --require-cjk

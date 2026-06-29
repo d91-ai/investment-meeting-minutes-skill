@@ -91,6 +91,14 @@
       "required_terms": ["多人复盘会", "真实顺序", "中际旭创", "我今天还是围绕", "我没有减仓", "不想改成别的说法"]
     },
     {
+      "name": "Word 标题存疑加粗下划线样例",
+      "mode": "word_bold_heading_doubtful",
+      "source_mode": "document",
+      "file": "word_bold_heading_doubtful.md",
+      "word_export": true,
+      "required_terms": ["候选公司(09999.HK)", "候选板块", "候选术语"]
+    },
+    {
       "name": "发言人标题上下文识别样例",
       "mode": "speaker_identity_context",
       "source_mode": "document",

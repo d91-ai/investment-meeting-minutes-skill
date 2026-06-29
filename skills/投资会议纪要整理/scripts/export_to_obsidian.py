@@ -177,19 +177,26 @@ def parse_metadata_line(line: str) -> tuple[str, str] | None:
     return label, match.group(2).strip()
 
 
-def _add_docx_runs(paragraph, text: str) -> None:
+def _add_docx_runs(paragraph, text: str, *, run_style=None) -> None:
+    def add_run(chunk: str, *, strong: bool = False):
+        run = paragraph.add_run(chunk)
+        _style_run(run)
+        if run_style is not None:
+            run_style(run)
+        if strong:
+            run.bold = True
+            run.underline = True
+        return run
+
     cursor = 0
     for match in re.finditer(r"\*\*(.+?)\*\*", text):
         start, end = match.span()
         if start > cursor:
-            _style_run(paragraph.add_run(text[cursor:start]))
-        run = paragraph.add_run(match.group(1))
-        run.bold = True
-        run.underline = True
-        _style_run(run)
+            add_run(text[cursor:start])
+        add_run(match.group(1), strong=True)
         cursor = end
     if cursor < len(text):
-        _style_run(paragraph.add_run(text[cursor:]))
+        add_run(text[cursor:])
 
 
 def _set_run_font(run, font_name: str = "PingFang SC", size_pt: int | None = None) -> None:
@@ -343,33 +350,39 @@ def convert_markdown_to_docx(source_md: Path, target_docx: Path) -> tuple[bool, 
             continue
 
         if stripped.startswith("# "):
-            paragraph = doc.add_heading(stripped[2:].strip(), level=1)
+            paragraph = doc.add_heading("", level=1)
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             paragraph.paragraph_format.space_after = Pt(14)
-            for run in paragraph.runs:
+            def style_heading_1(run):
                 _set_run_font(run, size_pt=18)
                 run.bold = True
                 run.font.color.rgb = RGBColor(31, 78, 121)
+
+            _add_docx_runs(paragraph, stripped[2:].strip(), run_style=style_heading_1)
             idx += 1
             continue
         if stripped.startswith("## "):
-            paragraph = doc.add_heading(stripped[3:].strip(), level=2)
+            paragraph = doc.add_heading("", level=2)
             paragraph.paragraph_format.space_before = Pt(12)
             paragraph.paragraph_format.space_after = Pt(8)
-            for run in paragraph.runs:
+            def style_heading_2(run):
                 _set_run_font(run, size_pt=15)
                 run.bold = True
                 run.font.color.rgb = RGBColor(31, 78, 121)
+
+            _add_docx_runs(paragraph, stripped[3:].strip(), run_style=style_heading_2)
             idx += 1
             continue
         if stripped.startswith("### "):
-            paragraph = doc.add_heading(stripped[4:].strip(), level=3)
+            paragraph = doc.add_heading("", level=3)
             paragraph.paragraph_format.space_before = Pt(8)
             paragraph.paragraph_format.space_after = Pt(4)
-            for run in paragraph.runs:
+            def style_heading_3(run):
                 _set_run_font(run, size_pt=12)
                 run.bold = True
                 run.font.color.rgb = RGBColor(64, 64, 64)
+
+            _add_docx_runs(paragraph, stripped[4:].strip(), run_style=style_heading_3)
             idx += 1
             continue
         if stripped.startswith("#### "):
@@ -378,10 +391,12 @@ def convert_markdown_to_docx(source_md: Path, target_docx: Path) -> tuple[bool, 
                 idx += 1
                 continue
             paragraph = doc.add_paragraph()
-            run = paragraph.add_run(target_label)
-            run.bold = True
-            _style_run(run, size_pt=11)
-            run.font.color.rgb = RGBColor(31, 78, 121)
+            def style_target_heading(run):
+                _set_run_font(run, size_pt=11)
+                run.bold = True
+                run.font.color.rgb = RGBColor(31, 78, 121)
+
+            _add_docx_runs(paragraph, target_label, run_style=style_target_heading)
             _set_cell_like_paragraph_shading(paragraph, "EAF2F8")
             paragraph.paragraph_format.space_before = Pt(6)
             paragraph.paragraph_format.space_after = Pt(3)
@@ -389,10 +404,12 @@ def convert_markdown_to_docx(source_md: Path, target_docx: Path) -> tuple[bool, 
             continue
         if stripped.startswith("##### "):
             paragraph = doc.add_paragraph()
-            run = paragraph.add_run(stripped[6:].strip())
-            run.bold = True
-            _style_run(run, size_pt=10)
-            run.font.color.rgb = RGBColor(89, 89, 89)
+            def style_sector_heading(run):
+                _set_run_font(run, size_pt=10)
+                run.bold = True
+                run.font.color.rgb = RGBColor(89, 89, 89)
+
+            _add_docx_runs(paragraph, stripped[6:].strip(), run_style=style_sector_heading)
             paragraph.paragraph_format.space_before = Pt(2)
             paragraph.paragraph_format.space_after = Pt(3)
             idx += 1

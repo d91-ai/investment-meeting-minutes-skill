@@ -13,8 +13,8 @@ Use the fastest safe path for the source risk. The default path is a single fina
 
 ## Stable Contract
 
-- Workflow after input archive: 转录 -> 校对 -> 识别 -> 编辑 -> 排版 -> 验证. Do not silently skip any step; when a step is not applicable, record `skipped_reason`, and when a step fails, record the failure reason and safest next action.
-- Source boundary: use only current-session materials as meeting-content sources. External sources may verify names, codes, terms, or public facts, but must not add meeting content.
+- Workflow after input archive: 转录 -> 校对 -> 识别 -> 联网核验 -> 编辑 -> 排版 -> 验证. Do not silently skip any step; when a step is not applicable, record `skipped_reason`, and when a step fails, record the failure reason and safest next action.
+- Source boundary: use only current-session materials as meeting-content sources. External sources must verify non-person business entities, codes, terms, and high-risk public facts before they are written as confirmed; they must not add meeting content.
 - ASR: use local SenseVoiceSmall as the primary transcript model and Paraformer-Large as auxiliary proofreading plus timestamp evidence when available. Do not switch to Whisper or another ASR. If the local ASR/timestamp chain cannot run, first diagnose and repair model cache, dependencies, device compatibility, memory, or chunking; use a text-only path only when the runtime cannot be restored and the user accepts that audio review is incomplete.
 - Final writer: Subagents may produce intermediate notes, candidate blocks, verification notes, and omission findings; they must not directly write final deliverables. Subagent dispatch follows an any-risk trigger: one qualifying risk condition is enough to trigger the relevant reviewer; multiple conditions only raise priority.
 - Run profile: prefer `fast_document` for short, clean document-only sources; use `standard` for ordinary meetings; use `strict_audio` for long audio, audio/document conflicts, or high-risk facts.
@@ -29,8 +29,8 @@ Use the fastest safe path for the source risk. The default path is a single fina
 
 ### Choose run profile
 
-- `fast_document`: use for short, clean document-only material with clear speakers and few/no uncertain entities. Skip Subagents and ASR readiness checks. Run local formatting validators before export.
-- `standard`: use for ordinary document-only or audio-plus-document work. Batch local entity/code candidate lookup first; use Subagents only for triggered risk areas.
+- `fast_document`: use for short, clean document-only material with clear speakers and few/no uncertain entities. Skip Subagents and ASR readiness checks, but do not skip the mandatory live verification pass for any non-person business entity or high-risk fact written as confirmed. Run local formatting validators before export.
+- `standard`: use for ordinary document-only or audio-plus-document work. Batch local entity/code candidate lookup first, then run mandatory live verification before confirmed writing; use Subagents only for triggered risk areas.
 - `strict_audio`: use for audio-only, long/noisy meetings, audio/document conflicts, or high-risk facts. Run the relevant readiness profile before the expensive step.
 
 Before final writing, create a process-only dispatch record. Do not write this record into the final note body. Record:
@@ -88,7 +88,9 @@ Use references only when they match the uncertainty:
 Rules:
 - Start from meeting context before choosing a company, ticker, term, customer, supplier, number, date, or event.
 - Confirm company names and stock codes before writing them as facts, following `references/verification_policy.md`. Local candidates and ASR output are clues, not proof.
-- Batch local candidate lookup before live verification when several names appear, for example `scripts/query_symbol_candidates.py --batch-file terms.txt --json`. Use `a-stock-data` live sources when available; use `scripts/query_symbol_candidates.py` only as a candidate generator.
+- Run live/network verification as a non-skippable process for non-person business entities and high-risk facts before final writing. If the live source, network, or required professional source is unavailable, do not mark the item confirmed; keep source wording, record the failure path in process notes or sidecar, and place unresolved business items in `## 二、存疑与待确认`.
+- Batch local candidate lookup before live verification when several names appear, for example `scripts/query_symbol_candidates.py --batch-file terms.txt --json`. Use `a-stock-data` live sources and reliable external sources required by `references/verification_policy.md`; use `scripts/query_symbol_candidates.py` only as a candidate generator.
+- Use this process-only verification prompt before final writing: "For each non-person business entity, ticker, term, customer/supplier, number, date, event, or investment action that will be written as confirmed, first match it to current-session source context, then verify it through at least one reliable live/network or professional external evidence path from `references/verification_policy.md`. If evidence is conflicting, insufficient, unavailable, or not unique, preserve the source wording, mark the doubtful fragment, and keep it in `doubtful_items`; do not add conclusions not present in the meeting source."
 - Build and verify `doubtful_items` with the fields, type values, person/business split, and sidecar rules in `references/verification_policy.md`. If a non-person item cannot be confirmed, keep the source wording, mark the doubtful fragment, and keep it in the list for `## 二、存疑与待确认`.
 - For audio/video or timestamped transcript sources, locate each doubtful fragment against `timestamp_index.json` before writing `## 二、存疑与待确认`. Use `HH:MM:SS-HH:MM:SS` only when the fragment matches a timestamped sentence/phrase or a short `source=sensevoice_vad_segment`, `duration_ms <= 10000` record. If the source is text/document-only or no reliable audio anchor exists, use the no-timestamp table shape and do not write a timestamp column.
 - Do not estimate ambiguity timestamps from the relative position of cleaned notes, summaries, or edited paragraphs.

@@ -87,7 +87,8 @@ FORBIDDEN_WORD_TEXT = [
     "#### ",
     "##### ",
 ]
-MEETING_TYPES = {"多人复盘会", "上市公司交流", "专家交流"}
+MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
+MEETING_TYPE_ALIASES = {"上市公司交流": "公司交流"}
 QUESTION_LINE_RE = re.compile(r"^\*\*【[^】\n]+】\*\*\s*$", re.MULTILINE)
 SINGLE_TIMESTAMP_RE = re.compile(r"^(?:\d{1,2}:[0-5]\d|\d{1,2}:[0-5]\d:[0-5]\d)$")
 VERIFICATION_REQUIRED_FIELDS = [
@@ -144,14 +145,16 @@ def validate_meeting_type_reference(markdown: str, meeting_type: str) -> list[st
     errors: list[str] = []
     if not meeting_type:
         return errors
-    if meeting_type not in MEETING_TYPES:
-        errors.append(f"会议类型只能是: {' / '.join(sorted(MEETING_TYPES))}")
+    normalized_meeting_type = MEETING_TYPE_ALIASES.get(meeting_type, meeting_type)
+    if normalized_meeting_type not in MEETING_TYPES:
+        allowed = sorted(MEETING_TYPES | set(MEETING_TYPE_ALIASES))
+        errors.append(f"会议类型只能是: {' / '.join(allowed)}")
         return errors
 
     subheadings = body_subheadings(markdown)
     questions = bold_question_lines(markdown)
     body = body_section(markdown)
-    if meeting_type == "多人复盘会":
+    if normalized_meeting_type == "多人复盘会":
         if not subheadings:
             errors.append("多人复盘会必须按发言轮次使用三级发言人标题")
         topic_headings = review_speaker_heading_topic_findings(subheadings)
@@ -162,21 +165,21 @@ def validate_meeting_type_reference(markdown: str, meeting_type: str) -> list[st
             errors.append("多人复盘会小段标题不使用 标的： 前缀，应使用【标的(代码)】标题行")
         if "后半段" in body:
             errors.append("多人复盘会同一发言人再次发言时保留同名标题，不使用（后半段）")
-    elif meeting_type == "上市公司交流":
+    elif normalized_meeting_type == "公司交流":
         title = markdown_field(markdown, "会议标题")
         if title and not title.endswith("公司交流会议"):
-            errors.append("上市公司交流的会议标题应使用 XX公司交流会议")
+            errors.append("公司交流的会议标题应使用 XX公司交流会议")
         if not metadata_field_present(markdown, "会议标的"):
-            errors.append("上市公司交流必须包含会议元信息字段: 会议标的")
+            errors.append("公司交流必须包含会议元信息字段: 会议标的")
         if not subheadings:
-            errors.append("上市公司交流必须按实际会议环节使用三级标题")
+            errors.append("公司交流必须按实际会议环节使用三级标题")
         if re.search(r"(?m)^\s*【[^】]+】", body):
-            errors.append("上市公司交流正文不使用【公司经营】【管理层回应】等额外主题标签")
+            errors.append("公司交流正文不使用【公司经营】【管理层回应】等额外主题标签")
         if re.search(r"(?m)^\*\*(?:Q|q|提问|问)[:：]", body):
-            errors.append("上市公司交流问题格式应为 **【问题】**，不使用 Q：或提问：")
+            errors.append("公司交流问题格式应为 **【问题】**，不使用 Q：或提问：")
         if "标的：" in body:
-            errors.append("上市公司交流正文不重复出现 标的： 行，标的信息只放在元信息")
-    elif meeting_type == "专家交流":
+            errors.append("公司交流正文不重复出现 标的： 行，标的信息只放在元信息")
+    elif normalized_meeting_type == "专家交流":
         if not questions:
             errors.append("专家交流必须使用加粗问题格式，例如 **【问题原文】**")
         if re.search(r"(?m)^\*\*(?:Q|q|提问|问)[:：]", body):

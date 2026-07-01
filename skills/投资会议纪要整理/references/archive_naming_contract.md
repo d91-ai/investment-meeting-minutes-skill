@@ -72,10 +72,10 @@ YYYY-MM-DD/
 Preferred final-note filename:
 
 ```text
-YYYY-MM-DD - 会议标题 - 会议类型.md
-YYYY-MM-DD - 会议标题 - 会议类型.docx
+YYYY-MM-DD - 会议系列 - 会议类型.md
+YYYY-MM-DD - 会议系列 - 会议类型.docx
 ```
 
-If the title already includes the meeting type, do not repeat the meeting type. If the filename collides, append a timestamp suffix and keep both files.
+Use `--meeting-date` when an explicit export date is needed; otherwise use the Markdown `会议日期` field, then the current date as the last fallback. The filename series comes from `会议系列`; the filename type comes from `会议类型`. If either value is missing, use the literal placeholder `会议系列` or `会议类型`. The `会议标题` field does not control the final Markdown or Word filename. If the filename collides, append a timestamp suffix and keep both files.
 
 Do not expose raw archive paths or technical archive status in the human-readable note body.

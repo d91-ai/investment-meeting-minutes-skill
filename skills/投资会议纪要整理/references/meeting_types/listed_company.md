@@ -1,6 +1,6 @@
-# 上市公司交流 Reference
+# 公司交流 Reference
 
-本文件定义 `上市公司交流` 的最终纪要格式依据。共同元信息、存疑表和 Word 导出规则仍以 `../output_contract.md` 为准。
+本文件定义 `公司交流` 的最终纪要格式依据。共同元信息、存疑表和 Word 导出规则仍以 `../output_contract.md` 为准。
 
 ## 适用范围
 

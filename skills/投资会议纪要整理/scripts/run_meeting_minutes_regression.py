@@ -21,7 +21,7 @@ from validate_meeting_minutes_contract import (  # noqa: E402
     validate_verification_sidecar,
     validate_word_contract,
 )
-from export_to_obsidian import convert_markdown_to_docx  # noqa: E402
+from export_to_obsidian import convert_markdown_to_docx, export_note  # noqa: E402
 
 
 def read_cases(path: Path) -> list[dict[str, Any]]:
@@ -49,6 +49,34 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             "errors": errors,
             "warnings": warnings,
         }
+    elif case.get("check") == "export_filename":
+        with tempfile.TemporaryDirectory(prefix="meeting-minutes-export-") as tmpdir:
+            result_export = export_note(
+                file_path,
+                Path(tmpdir),
+                str(case["meeting_date_override"]) if case.get("meeting_date_override") else None,
+            )
+            expected_stem = str(case["expected_stem"])
+            actual_stems = [result_export.md_path.stem, result_export.docx_path.stem]
+            errors = []
+            warnings = []
+            if actual_stems != [expected_stem, expected_stem]:
+                errors.append(f"导出文件名不符合预期: expected={expected_stem} actual={actual_stems}")
+            if result_export.md_path.suffix != ".md":
+                errors.append(f"Markdown 后缀错误: {result_export.md_path.name}")
+            if result_export.docx_path.suffix != ".docx":
+                errors.append(f"Word 后缀错误: {result_export.docx_path.name}")
+            if not result_export.md_created:
+                errors.append(f"Markdown 未生成: {result_export.md_message}")
+            if not result_export.docx_created:
+                errors.append(f"Word 未生成: {result_export.docx_message}")
+            result = {
+                "ok": not errors,
+                "errors": errors,
+                "warnings": warnings,
+                "md_path": str(result_export.md_path),
+                "docx_path": str(result_export.docx_path),
+            }
     else:
         markdown = file_path.read_text(encoding="utf-8")
         result = validate_contract(

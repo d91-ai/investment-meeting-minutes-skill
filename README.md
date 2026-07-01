@@ -18,9 +18,9 @@
 ## Skill 包内容
 
 - `skills/投资会议纪要整理`：基础 skill，定义输入归档、转录、校对、识别、编辑、排版和本地导出规则。
-- 会议类型规则内置在基础 skill 中：默认 `多人复盘会`；明确单家公司专场时用 `上市公司交流`；明确专家问答时用 `专家交流`。
+- 会议类型规则内置在基础 skill 中：默认 `多人复盘会`；明确单家公司专场时用 `公司交流`；明确专家问答时用 `专家交流`。
 - `references/meeting_types/review_meeting.md`：多人复盘会格式依据。
-- `references/meeting_types/listed_company.md`：上市公司交流格式依据。
+- `references/meeting_types/listed_company.md`：公司交流格式依据。
 - `references/meeting_types/expert_call.md`：专家交流格式依据。
 - `skills/meeting-minutes-sanitizer`：用于中文投研会议纪要脱敏。
 - `.codex/agents/transcript-auditor.toml`：转写、时间戳、发言边界和音频/文档冲突 subagent。

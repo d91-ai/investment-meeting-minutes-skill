@@ -15,6 +15,21 @@
       "required_terms": ["契约外逃逸标题", "sentence/phrase 级 anchor", "segment/chunk/minute 级范围"]
     },
     {
+      "name": "导出命名使用会议系列和会议类型",
+      "mode": "export_filename",
+      "check": "export_filename",
+      "file": "text_only.md",
+      "meeting_date_override": "2026-07-01",
+      "expected_stem": "2026-07-01 - 研究所周会 - 多人复盘会"
+    },
+    {
+      "name": "导出命名缺失元信息使用占位",
+      "mode": "export_filename_placeholder",
+      "check": "export_filename",
+      "file": "export_naming_missing_metadata.md",
+      "expected_stem": "2026-07-02 - 会议系列 - 会议类型"
+    },
+    {
       "name": "文本-only 样例",
       "mode": "text_only",
       "source_mode": "document",
@@ -168,11 +183,11 @@
       "required_error_terms": ["缺少样例关键锚点", "包含样例禁止锚点"]
     },
     {
-      "name": "上市公司交流类型样例",
+      "name": "公司交流类型样例",
       "mode": "meeting_type_listed_company",
       "source_mode": "document",
       "file": "listed_company.md",
-      "required_terms": ["上市公司交流", "单家公司交流", "公司经营"]
+      "required_terms": ["公司交流", "单家公司交流", "公司经营"]
     },
     {
       "name": "专家交流类型样例",

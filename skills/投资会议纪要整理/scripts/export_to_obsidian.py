@@ -80,45 +80,26 @@ def markdown_field(markdown: str, field: str, fallback: str = "") -> str:
     return match.group(1).strip() if match else fallback
 
 
-def detect_title(content: str, fallback: str) -> str:
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            return sanitize_filename(stripped.lstrip("#").strip())
-    return sanitize_filename(fallback)
-
-
 def detect_filename_title(content: str, fallback: str) -> str:
-    h1_title = detect_title(content, fallback)
-    meeting_title_raw = markdown_field(content, "会议标题", "").strip()
+    meeting_series_raw = markdown_field(content, "会议系列", "").strip()
     meeting_type_raw = markdown_field(content, "会议类型", "").strip()
-    meeting_title = sanitize_filename(meeting_title_raw) if meeting_title_raw else ""
-    meeting_type = sanitize_filename(meeting_type_raw) if meeting_type_raw else ""
-    generic_titles = {"投资会议纪要", "会议纪要", "未命名会议"}
-
-    if h1_title in generic_titles:
-        display_title = meeting_title or sanitize_filename(fallback)
-    elif h1_title.startswith("投资会议纪要｜"):
-        topic_title = h1_title.removeprefix("投资会议纪要｜").strip()
-        if meeting_title and meeting_title not in topic_title:
-            display_title = f"{meeting_title}｜{topic_title}"
-        else:
-            display_title = topic_title or meeting_title or h1_title
-    else:
-        display_title = h1_title
-
-    if meeting_type and meeting_type not in display_title:
-        display_title = f"{display_title} - {meeting_type}"
-    return sanitize_filename(display_title)
+    meeting_series = sanitize_filename(meeting_series_raw) if meeting_series_raw else "会议系列"
+    meeting_type = sanitize_filename(meeting_type_raw) if meeting_type_raw else "会议类型"
+    return sanitize_filename(f"{meeting_series} - {meeting_type}")
 
 
-def normalize_meeting_date(date_override: str | None) -> str:
-    raw = (date_override or "").strip()
-    if raw:
+def normalize_meeting_date(date_override: str | None, content: str = "") -> str:
+    raw_candidates = [
+        (date_override or "").strip(),
+        markdown_field(content, "会议日期", "").strip(),
+    ]
+    for raw in raw_candidates:
+        if not raw:
+            continue
         try:
             return datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
-            pass
+            continue
     return datetime.now().strftime("%Y-%m-%d")
 
 
@@ -497,7 +478,7 @@ def export_note(source_file: Path, export_dir: Path, date_override: str | None) 
     source_encoding_ok, source_encoding_message = validate_utf8_text_file(source_file, require_cjk=True)
     if not source_encoding_ok:
         raise UnicodeError(source_encoding_message)
-    meeting_date = normalize_meeting_date(date_override)
+    meeting_date = normalize_meeting_date(date_override, raw_content)
     title = detect_filename_title(raw_content, source_file.stem)
     filename_base = f"{meeting_date} - {title}"
     export_dir = export_dir / meeting_date

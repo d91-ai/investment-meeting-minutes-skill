@@ -1,58 +1,198 @@
 # 投资会议纪要整理 Skill
 
-这个仓库保存 Codex 使用的中文投资会议纪要整理 skill 包，用于把投资研究场景中的会议录音、转写稿、纪要草稿或音频+文字混合材料，整理成可人工复核、可本地归档的 Markdown 和 Word 会议纪要。
+本仓库保存 Codex 使用的中文投资会议纪要整理 skill 包，用于把投资研究场景中的会议录音、转写稿、纪要草稿或音频加文字材料，整理成可人工复核、可本地归档的 Markdown 和 Word 会议纪要。
 
-当前定位是 **single main workflow + deterministic validation**：默认使用最快的单主流程路径，在长录音、噪音重、多人边界不清、多标的混杂、音频/文档冲突或高风险事实较多时，由主流程完成额外自检。最终 Markdown、Word 和本地归档产物只由主流程统一生成。
+当前 `main` 分支定位是 **single main workflow + deterministic validation**：默认使用单一主流程完成归档、转录、校对、识别、联网核验、编辑、排版、验证和导出。高风险材料仍由主流程做额外自检，不再依赖 repo-scoped subagent 机制。
+
+## 适用场景
+
+- 音频会议：本地 ASR 转录后整理为正式纪要。
+- 文稿会议：从已有转写稿、聊天记录或纪要草稿生成规范纪要。
+- 音频加文稿：同时使用录音和文字材料，保留冲突和存疑。
+- 公司名、代码、客户、供应商、术语、数字或时间存在不确定时，生成可复核的存疑表和可选 verification sidecar。
+- 已整理纪要需要脱敏或 RAG 入库时，使用 `skills/meeting-minutes-sanitizer`。
+
+## 输入与输出
+
+常见输入：
+
+- 音频文件、视频转音频、已有转写稿、会议草稿、辅助参考文本。
+- 会议日期、会议标题、会议类型、会议系列。
+- 可选的 `timestamp_index.json`、verification JSON/JSONL、人工复核后的文本。
+
+主要输出：
+
+- 最终 Markdown 会议纪要。
+- 同 stem 的 Word 文档。
+- 原始输入归档副本。
+- 仅在真实存疑存在时输出的 `## 二、存疑与待确认`。
+- 可选 verification sidecar，用于审计非人名业务存疑项的核验过程。
+
+最终纪要必须包含 `## 一、发言整理`。无真实存疑时，不输出“暂无存疑”。
 
 ## 核心原则
 
-- 主流程负责结构化中间检查，例如发言整理候选、标的/代码清单、存疑核验清单、音频/文档冲突摘要和遗漏检查。
-- 主流程是最终会议纪要的唯一写作者，避免多流程直接拼接造成格式、口径和风格割裂。
-- 基础 skill 是唯一会议纪要 skill；会议类型只影响最终格式细节。
-- 主 workflow 固定为：转录 -> 校对 -> 识别 -> 编辑 -> 排版。
-- `发言整理` 默认是可复核原文纪要，不输出摘要、压缩稿或研报化改写；每段标题覆盖该段提到的全部标的，不强制一个标的一段。
-- 三类会议分别以 `references/meeting_types/` 下的 reference 作为正文格式依据。
-- 非人名存疑项统一调用 `references/verification_policy.md` 中的稳定核验 prompt。
-- Validator 检查格式、章节、表头、Word 样式、编码、样例回归，以及可选 verification 审计 artifact 的结构完整性；它不伪验证联网核验是否真实发生。
+- 终稿只由主流程生成，避免多流程拼接造成格式、口径和风格不一致。
+- `发言整理` 是可复核的按说话人整理稿，不是摘要、压缩稿或研报化改写。
+- 保留发言顺序、人称、判断边界、数字、时间点、仓位动作和条件表达。
+- 只删除纯口水词、明显 ASR 噪声、无意义重复和重复起手式。
+- 公司名、股票代码、客户、供应商、数字、日期和专业术语必须先结合会议上下文核对；无法确认的内容进入存疑表。
+- 外部来源只能用于核验名称、代码、术语和公开事实，不能补写会议中没有出现的新内容。
 
-## Skill 包内容
+## 目录结构
 
-- `skills/投资会议纪要整理`：基础 skill，定义输入归档、转录、校对、识别、编辑、排版和本地导出规则。
-- 会议类型规则内置在基础 skill 中：默认 `多人复盘会`；明确单家公司专场时用 `公司交流`；明确专家问答时用 `专家交流`。
-- `references/meeting_types/review_meeting.md`：多人复盘会格式依据。
-- `references/meeting_types/listed_company.md`：公司交流格式依据。
-- `references/meeting_types/expert_call.md`：专家交流格式依据。
-- `skills/meeting-minutes-sanitizer`：用于中文投研会议纪要脱敏。
+- `skills/投资会议纪要整理/SKILL.md`：主 workflow、输入边界、转录、校对、核验、编辑和导出规则。
+- `skills/投资会议纪要整理/references/output_contract.md`：最终 Markdown 和 Word 格式契约。
+- `skills/投资会议纪要整理/references/verification_policy.md`：公司名、代码、术语、目标归因和存疑项核验规则。
+- `skills/投资会议纪要整理/references/archive_naming_contract.md`：原始输入归档和最终文件命名规则。
+- `skills/投资会议纪要整理/references/runtime_readiness_guide.md`：本地 ASR、文稿处理和导出 readiness。
+- `skills/投资会议纪要整理/references/meeting_types/`：多人复盘会、公司交流、专家交流的正文格式依据。
+- `skills/投资会议纪要整理/references/regression_samples/`：合成回归样例和负例。
+- `skills/投资会议纪要整理/scripts/`：归档、转录、校对、查询、验证和导出脚本。
+- `skills/meeting-minutes-sanitizer`：纪要脱敏和 RAG 入库准备 skill。
 
-## 运行档位
+## 处理流程
 
-- `fast_document`：短、干净、发言人清楚、低存疑的纯文稿。文稿 -> 主流程写草稿 -> 脚本格式校验 -> 导出。
-- `standard`：普通文稿或音频+文稿。先批量本地标的候选查询；对命中风险的片段执行主流程自检和外部核验。
-- `strict_audio`：音频-only、长录音、噪音重、音频/文档冲突或高风险事实密集。执行对应 readiness profile，再进入人工关口、主流程审查和本地导出。
+1. 归档输入
+   使用 `archive_raw_inputs.py` 复制原始材料，避免直接覆盖用户文件。
 
-需要主流程额外自检的情况：长录音、噪音重、多人边界不清、音频与文档冲突、多标的混杂、名称/代码/数字/客户/供应商/术语存疑、最终成稿前需要补漏。
+2. 转录
+   音频输入默认使用本地 SenseVoiceSmall 作为主 ASR。Paraformer-Large 只作为辅助校对证据，用于公司名、代码、数字、英文缩写和专业词交叉检查；不得自动替换 SenseVoice 主转写。禁止降级使用 Whisper。
 
-## Validators
+3. 校对
+   使用 `process_transcript.py` 辅助清理明显 ASR 噪声、口水词和无意义重复，同时保留原说话人的视角、顺序和判断强度。
 
-常用检查：
+4. 识别与核验
+   使用 `query_symbol_candidates.py` 做本地证券代码候选查询。业务实体和高风险事实确认前，应结合 `a-stock-data`、公告、交易所、官网、行业资料或其他可靠来源核验。
+
+5. 编辑纪要
+   按 `output_contract.md` 和对应会议类型 reference 输出元信息、`## 一、发言整理` 和必要的存疑表。会议类型默认为 `多人复盘会`；单家公司专场用 `公司交流`；专家问答用 `专家交流`。
+
+6. 验证与导出
+   用 validator 检查 Markdown、verification sidecar、timestamp index 和 Word 结构，再用 `export_to_obsidian.py` 导出 Markdown 与 Word。最终交付不生成 PDF。
+
+## 常用命令
+
+归档原始输入：
 
 ```bash
-export INVESTMENT_MINUTES_WORKSPACE="$HOME/Documents/会议纪要整理"
-# 可选：当系统 python3 没有 python-docx 时，指定已安装文档依赖的 Python
-# export INVESTMENT_MINUTES_PYTHON="/path/to/python3"
+python3 skills/投资会议纪要整理/scripts/archive_raw_inputs.py \
+  --date 2026-07-03 \
+  --title "会议标题" \
+  path/to/audio.m4a path/to/notes.txt
+```
 
-python3 skills/投资会议纪要整理/scripts/validate_utf8_text.py README.md skills/*/SKILL.md --require-cjk --portable-skill
+检查本地 ASR 模型缓存：
+
+```bash
+python3 skills/投资会议纪要整理/scripts/transcribe_audio.py --check-model-cache
+```
+
+转录音频：
+
+```bash
+python3 skills/投资会议纪要整理/scripts/transcribe_audio.py \
+  path/to/audio.m4a \
+  --output-dir work/transcripts \
+  --output-format all
+```
+
+预处理转写稿：
+
+```bash
+python3 skills/投资会议纪要整理/scripts/process_transcript.py \
+  work/transcripts/audio.txt \
+  --output work/transcripts/audio.cleaned.txt
+```
+
+批量查询证券候选：
+
+```bash
+python3 skills/投资会议纪要整理/scripts/query_symbol_candidates.py \
+  --batch-file terms.txt \
+  --json
+```
+
+校验 Markdown：
+
+```bash
+python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py \
+  NOTE.md \
+  --source-mode document \
+  --json
+```
+
+校验音频纪要、时间戳和 verification sidecar：
+
+```bash
+python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py \
+  NOTE.md \
+  --source-mode audio \
+  --timestamp-mode reliable \
+  --require-audio-timestamps \
+  --timestamp-index timestamp_index.json \
+  --require-reliable-timestamp-index \
+  --verification NOTE.verification.json \
+  --require-verification \
+  --json
+```
+
+校验 Markdown 和 Word：
+
+```bash
+python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py \
+  NOTE.md \
+  --word NOTE.docx \
+  --json
+```
+
+导出 Markdown 和 Word：
+
+```bash
+python3 skills/投资会议纪要整理/scripts/export_to_obsidian.py \
+  NOTE.md \
+  --export-dir "$HOME/Documents/会议纪要整理/01 Projects/会议纪要" \
+  --meeting-date 2026-07-03
+```
+
+运行回归样例：
+
+```bash
 python3 skills/投资会议纪要整理/scripts/run_meeting_minutes_regression.py --json
-python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py NOTE.md --json
-python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py NOTE.md --require-term "我没有减仓" --forbid-term "发言人认为" --json
-python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py NOTE.md --verification NOTE.verification.json --require-verification --json
-python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py NOTE.md --word NOTE.docx --json
+```
+
+运行健康检查：
+
+```bash
 python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile asr --strict
 python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile document
 python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile export
 ```
 
-`validate_meeting_minutes_contract.py` 的规则是：必须有会议元信息和 `## 一、发言整理`；按 `会议类型` 检查对应 reference 的必要格式；只有存在真实存疑时才输出 `## 二、存疑与待确认`；存疑表必须使用固定表头并保留空白 `人工确认` 列；可靠音频模式要求正文存疑词紧跟合法 `存疑时间戳`；传入 `--require-term` / `--forbid-term` 时做样例级原文锚点保留和改写锚点拦截；传入 `--verification`/`--require-verification` 时检查非人名存疑项的旁路审计记录；传入 `--word` 时同时检查 Word 导出结构和存疑词样式。
+## 验证范围
+
+`validate_meeting_minutes_contract.py` 会检查：
+
+- Markdown 是否包含会议元信息和 `## 一、发言整理`。
+- 会议类型是否符合对应 reference 的正文结构。
+- 存疑表是否只在真实存疑存在时出现。
+- 音频来源、可靠时间戳来源和文稿来源的存疑表列是否正确。
+- `人工确认` 列是否保留为空。
+- `--require-term` 指定的关键原文锚点是否仍在正文中。
+- `--forbid-term` 指定的改写锚点是否未出现。
+- verification sidecar 是否包含必要字段并与非人名存疑项一致。
+- `timestamp_index.json` 是否包含可用于存疑定位的 sentence/phrase anchor 或短 VAD segment。
+- 传入 `--word` 时，Word 文档结构、元信息表、存疑表和存疑词样式是否符合契约。
+
+validator 只做结构、样例、sidecar、时间戳和 Word 样式检查；它不会伪验证联网核验是否真实发生。
+
+## 本地环境提示
+
+- Python 脚本文本读写必须显式使用 UTF-8；中文文件使用 UTF-8 without BOM 和 LF。
+- Word 导出依赖 `python-docx`。
+- ASR 首次使用前应先检查模型缓存，避免整理会议时临时下载模型。
+- `check_investment_workflow_health.py --prepare-local-dirs` 只在首次部署时显式创建本地目录；日常检查默认不创建目录。
+- 本仓库和本机 active skill 安装目录是两个面：仓库更新后，如需 Codex 立即使用新规则，还要同步到 `~/.codex/skills` 并开启新线程或重启 Codex。
 
 ## 隐私边界
 
@@ -64,7 +204,10 @@ python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health
 
 公共 fixtures 必须是合成或充分脱敏内容。
 
-## 已知限制
+## 开发与发布约束
 
-- 真实生产启用前仍需要脱敏 blind-run 数据验证。
-- Word 导出依赖 `python-docx`。
+- 不直接修改 `main`；所有变更通过功能分支和 PR 合并。
+- 不引入 LangGraph、CrewAI、AutoGen 等重型 Agent 框架。
+- 改业务规则时同步更新对应 reference、回归样例或验证说明。
+- 改输出格式时运行 Markdown 和 Word validators。
+- fixtures 必须是合成或充分脱敏内容。

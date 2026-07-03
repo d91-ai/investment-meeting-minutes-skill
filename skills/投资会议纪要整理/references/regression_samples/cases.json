@@ -1,13 +1,6 @@
 {
   "cases": [
     {
-      "name": "subagent 任一触发规则文档检查",
-      "mode": "reference_subagent_dispatch",
-      "check": "text_contains",
-      "file": "../subagent_guide.md",
-      "required_terms": ["只要满足任一高风险条件", "triggered_by", "skipped_reason", "不要等到所有条件同时满足"]
-    },
-    {
       "name": "输出合约标题逃逸与时间戳精度文档检查",
       "mode": "reference_output_contract",
       "check": "text_contains",

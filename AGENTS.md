@@ -10,5 +10,4 @@
 - Do not introduce LangGraph, CrewAI, AutoGen, or other heavy Agent frameworks for this skill package.
 - When changing business rules, update the relevant regression or eval fixture in the same change.
 - When changing output format rules, run the Markdown and Word validators.
-- Subagents must be read-only reviewers. They must not write final minutes, Word files, archive outputs, or knowledge-base sync artifacts.
-- Final Markdown may be created or modified only by the Main Orchestrator under the base skill and selected meeting-type skill.
+- Final Markdown may be created or modified only by the main workflow under the base skill and selected meeting-type reference. 最终纪要只能由主流程生成或修改。

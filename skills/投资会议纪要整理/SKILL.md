@@ -1,6 +1,6 @@
 ---
 name: investment-meeting-minutes
-description: "Use when Codex needs to turn a Chinese investment meeting recording, transcript, or mixed audio+text input into a strict Markdown meeting note with speaker segmentation, company-name correction, stock-symbol validation, source-file archiving, Subagent-assisted intermediate drafts and omission checks, and Markdown/Word export. Triggers include: 整理会议录音, 整理投资会议纪要, 把这段转录整理成纪要, 输出 Obsidian 会议纪要, 校对公司名称和股票代码, 导出 md 和 word, 结合录音与文字整理, 按发言人/版块分段."
+description: "Use when Codex needs to turn a Chinese investment meeting recording, transcript, or mixed audio+text input into a strict Markdown meeting note with speaker segmentation, company-name correction, stock-symbol validation, source-file archiving, source-fidelity checks, and Markdown/Word export. Triggers include: 整理会议录音, 整理投资会议纪要, 把这段转录整理成纪要, 输出 Obsidian 会议纪要, 校对公司名称和股票代码, 导出 md 和 word, 结合录音与文字整理, 按发言人/版块分段."
 ---
 
 # Investment Meeting Minutes
@@ -9,34 +9,31 @@ description: "Use when Codex needs to turn a Chinese investment meeting recordin
 
 Produce a strict Chinese investment meeting note from the current meeting's audio, transcript, document, or mixed materials. The final body is a speaker-by-speaker cleaned transcript: preserve each speaker's original order, viewpoint, pronouns, logic, uncertainty, and meaningful wording; only remove pure filler words, obvious ASR noise, meaningless repetitions, and repeated false starts. Validate names and stock codes before writing confirmed entities, and export the human-confirmed Markdown + Word note.
 
-Use the fastest safe path for the source risk. The default path is a single final writer with deterministic checks; enable Subagents only when the source is long, noisy, conflict-heavy, multi-target, or fact-sensitive. Write final Markdown, Word, and archive outputs only through the main workflow.
+Use the fastest safe path for the source risk. The default path is a single main workflow with deterministic checks. Write final Markdown, Word, and archive outputs only through the main workflow.
 
 ## Stable Contract
 
 - Workflow after input archive: 转录 -> 校对 -> 识别 -> 联网核验 -> 编辑 -> 排版 -> 验证. Do not silently skip any step; when a step is not applicable, record `skipped_reason`, and when a step fails, record the failure reason and safest next action.
 - Source boundary: use only current-session materials as meeting-content sources. External sources must verify non-person business entities, codes, terms, and high-risk public facts before they are written as confirmed; they must not add meeting content.
 - ASR: use local SenseVoiceSmall as the primary transcript model and Paraformer-Large as auxiliary proofreading plus timestamp evidence when available. Do not switch to Whisper or another ASR. If the local ASR/timestamp chain cannot run, first diagnose and repair model cache, dependencies, device compatibility, memory, or chunking; use a text-only path only when the runtime cannot be restored and the user accepts that audio review is incomplete.
-- Final writer: Subagents may produce intermediate notes, candidate blocks, verification notes, and omission findings; they must not directly write final deliverables. Subagent dispatch follows an any-risk trigger: one qualifying risk condition is enough to trigger the relevant reviewer; multiple conditions only raise priority.
+- Final writer: the main workflow is the only writer and reviewer for final deliverables. It must perform transcript-quality, timestamp, speaker-boundary, source-fidelity, target-attribution, doubtful-item, and omission checks before export.
 - Run profile: prefer `fast_document` for short, clean document-only sources; use `standard` for ordinary meetings; use `strict_audio` for long audio, audio/document conflicts, or high-risk facts.
 - Meeting type: default to `多人复盘会`. Use `公司交流` only for a single-company special meeting. Use `专家交流` only for expert Q&A. Do not create `其他`.
 - Output format: follow `references/output_contract.md` for shared structure, ambiguity-table columns, and Word style; follow the matching meeting-type reference for body structure: `references/meeting_types/review_meeting.md`, `references/meeting_types/listed_company.md`, or `references/meeting_types/expert_call.md`.
 - Speaker headings: identify speaker titles from current-session context when the source provides enough evidence, such as self-introduction, moderator address, agenda role, Q&A role, or stable transcript labels. Write the identified name or role as the `###` heading. If a speaker cannot be identified reliably, keep the fallback heading as `### 发言人1`, `### 发言人2`, `### 发言人3`, etc. in actual first-appearance order.
 - Doubtful items: use one internal `doubtful_items` list as the source for verification, final table rows, and any same-stem verification sidecar. Keep final table columns in `references/output_contract.md`; keep process details in `references/verification_policy.md`.
 - Fidelity: `## 一、发言整理` is a source-aligned cleaned transcript by speaker, not a content summary, abstract, rewrite, interpretation, or third-person retelling. Preserve source perspective and pronouns such as `我`、`我们`、`个人觉得`; do not rewrite them into `发言人认为`、`专家表示`、`管理层表示`、`公司表示` unless those words appear in the source. The only allowed cleanup is deleting pure filler words, obvious ASR noise, meaningless repetitions, and repeated false starts.
-- Validators: keep validation to encoding, Markdown/Word structure, and regression samples. Do not add content-direction validators, semantic-consistency hard checks, or Subagent-output validators.
+- Validators: keep validation to encoding, Markdown/Word structure, and regression samples. Do not add content-direction validators or semantic-consistency hard checks.
 
 ## Workflow
 
 ### Choose run profile
 
-- `fast_document`: use for short, clean document-only material with clear speakers and few/no uncertain entities. Skip Subagents and ASR readiness checks, but do not skip the mandatory live verification pass for any non-person business entity or high-risk fact written as confirmed. Run local formatting validators before export.
-- `standard`: use for ordinary document-only or audio-plus-document work. Batch local entity/code candidate lookup first, then run mandatory live verification before confirmed writing; use Subagents only for triggered risk areas.
+- `fast_document`: use for short, clean document-only material with clear speakers and few/no uncertain entities. Skip ASR readiness checks, but do not skip the mandatory live verification pass for any non-person business entity or high-risk fact written as confirmed. Run local formatting validators before export.
+- `standard`: use for ordinary document-only or audio-plus-document work. Batch local entity/code candidate lookup first, then run mandatory live verification before confirmed writing. Run main-workflow checks for source quality, attribution, doubtful items, and omissions before export.
 - `strict_audio`: use for audio-only, long/noisy meetings, audio/document conflicts, or high-risk facts. Run the relevant readiness profile before the expensive step.
 
-Before final writing, create a process-only dispatch record. Do not write this record into the final note body. Record:
-- `transcript_auditor`: triggered / not triggered, triggered_by list, skipped_reason when not triggered.
-- `content_integrity_reviewer`: triggered / not triggered, triggered_by list, skipped_reason when not triggered.
-- When a subagent is unavailable, record the failure and whether the main workflow completed equivalent checks.
+Before final writing, create process-only review notes when risk is non-trivial. Do not write these notes into the final note body. Record transcript-quality, timestamp, speaker-boundary, audio/document conflict, target-attribution, high-risk fact, doubtful-item, and omission findings that affect the final note.
 
 ### 0. Prepare Inputs
 
@@ -78,7 +75,7 @@ Use `scripts/process_transcript.py` when text is long, noisy, or missing clear s
 
 Build a process-only speaker map before final writing. Map raw labels such as `Speaker 1` or `发言人A` to an identified name or role only when current-session content supports it. Do not infer a personal name or role from topic expertise alone. When evidence is insufficient, keep numeric fallback labels in first-appearance order.
 
-Trigger the Transcript Auditor Subagent when any one of these conditions is true: audio is long, noise is heavy, multiple-speaker boundaries are unclear, audio and document evidence conflict, or timestamp alignment is important for doubtful-item review.
+When audio is long, noise is heavy, multiple-speaker boundaries are unclear, audio and document evidence conflict, or timestamp alignment matters for doubtful-item review, the main workflow must explicitly check transcript quality, speaker boundaries, timestamp anchors, ASR conflicts, and audio/document conflicts before final writing.
 
 ### 3. Correct names and symbols
 
@@ -97,7 +94,7 @@ Rules:
 - Derive final rows and any `.verification.json` or `.verification.jsonl` only from `doubtful_items`; if they conflict, fix the shared list and regenerate both artifacts instead of adding validator hard rules.
 - Ignore pure person-name uncertainty unless it changes an investment fact or attribution.
 
-Trigger the Content Integrity Reviewer Subagent when any one of these conditions is true: multiple targets are mixed, target attribution is complex, high-risk facts appear, non-person business doubtful items are numerous, or omission risk is high.
+When multiple targets are mixed, target attribution is complex, high-risk facts appear, non-person business doubtful items are numerous, or omission risk is high, the main workflow must explicitly check target attribution, high-risk claims, doubtful-item handling, heading coverage, and omissions before final writing.
 
 ### 4. 编辑
 
@@ -109,7 +106,7 @@ Before export, do a source-fidelity pass against the current-session transcript 
 - For each substantive paragraph, confirm it maps back to a source span from the same speaker turn.
 - Preserve first-person and speaker-perspective wording when the source uses it; do not recast it into third-person attribution.
 - Keep long answers as lightly cleaned ordered prose. Split for readability only when the source naturally changes topic; do not replace them with `主要包括`、`核心观点`、`总结来看` style summaries, and do not add connective analysis that the speaker did not say.
-- If Subagent notes are more compressed than the source, use them only as omission or risk findings and write final prose from the source span.
+- If intermediate notes are more compressed than the source, use them only as omission or risk findings and write final prose from the source span.
 - Run a heading self-check against `output_contract.md` and the selected meeting-type reference. The final body must not contain contract-escape headings such as `发言片段`、`未归类`、`主题整理`、`内容摘要`、`观点汇总`; 多人复盘会 must not use a theme name as a fake speaker heading.
 
 ### 5. 排版
@@ -133,7 +130,6 @@ PDF input is not a baseline parsing capability. Archive PDF files only as attach
 - Archive/export naming: `references/archive_naming_contract.md`.
 - Runtime readiness: `references/runtime_readiness_guide.md`.
 - Name/code/entity proofreading, evidence boundaries, target attribution, and doubtful-item verification prompt: `references/verification_policy.md`.
-- Subagent workflow and failure handling: `references/subagent_guide.md`.
 
 ## Resources
 

@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 from pathlib import Path
 
-DEFAULT_ARCHIVE_DIR = Path("/Users/kumaai/Documents/Codex/workspace/投资纪要工作流/04 Archive/测试用")
+DEFAULT_WORKSPACE_ROOT = (
+    Path(os.environ["INVESTMENT_MINUTES_WORKSPACE"]).expanduser()
+    if os.environ.get("INVESTMENT_MINUTES_WORKSPACE")
+    else Path.home() / "Documents/会议纪要整理"
+)
+DEFAULT_ARCHIVE_DIR = DEFAULT_WORKSPACE_ROOT / "04 Archive/测试用"
 
 
 def detect_date(name: str) -> str:

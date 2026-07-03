@@ -6,13 +6,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-DEFAULT_FINAL_ROOT = Path("/Users/kumaai/Documents/Codex/workspace/投资纪要工作流/01 Projects/会议纪要")
+DEFAULT_WORKSPACE_ROOT = (
+    Path(os.environ["INVESTMENT_MINUTES_WORKSPACE"]).expanduser()
+    if os.environ.get("INVESTMENT_MINUTES_WORKSPACE")
+    else Path.home() / "Documents/会议纪要整理"
+)
+DEFAULT_FINAL_ROOT = DEFAULT_WORKSPACE_ROOT / "01 Projects/会议纪要"
 
 
 def markdown_field(markdown: str, field: str, fallback: str = "") -> str:
@@ -44,26 +50,27 @@ def split_final_note(markdown: str) -> list[dict[str, Any]]:
     body = markdown[body_start:doubt_start if doubt_start >= 0 else len(markdown)] if body_start >= 0 else markdown
     segments: list[dict[str, Any]] = []
     current_speaker = "未标注发言人"
-    current_heading = ""
+    current_target = ""
+    current_board = ""
     buffer: list[str] = []
 
+    def heading_text(line: str, prefix: str) -> str:
+        value = line.removeprefix(prefix).strip()
+        if value.startswith("【") and "】" in value:
+            return value[1 : value.find("】")].strip()
+        return value
+
     def flush() -> None:
-        nonlocal buffer, current_heading
+        nonlocal buffer
         text = "\n".join(buffer).strip()
         if not text:
             return
-        board = ""
-        target = "-"
-        match = re.match(r"【([^｜】]+)(?:｜([^】]+))?】", current_heading)
-        if match:
-            board = match.group(1).strip()
-            target = (match.group(2) or "-").strip()
         segments.append(
             {
                 "speaker": current_speaker,
-                "heading": current_heading,
-                "board": board,
-                "target": target,
+                "heading": current_target,
+                "board": current_board,
+                "target": current_target or "-",
                 "text": text,
                 "numbers": number_tokens(text),
                 "has_doubt": "**" in text,
@@ -76,17 +83,27 @@ def split_final_note(markdown: str) -> list[dict[str, Any]]:
         if line.startswith("### "):
             flush()
             current_speaker = line[4:].strip() or current_speaker
-            current_heading = ""
+            current_target = ""
+            current_board = ""
+            continue
+        if line.startswith("#### "):
+            flush()
+            current_target = heading_text(line, "#### ")
+            current_board = ""
+            continue
+        if line.startswith("##### "):
+            flush()
+            current_board = heading_text(line, "##### ")
             continue
         if line.startswith("【") and "】" in line:
             flush()
             close = line.find("】")
-            current_heading = line[: close + 1].strip()
+            current_target = line[1:close].strip()
             rest = line[close + 1 :].strip()
             if rest:
                 buffer.append(rest)
             continue
-        if line.strip() and not line.startswith("## "):
+        if line.strip() and line.strip() != "---" and not line.startswith("## "):
             buffer.append(line)
     flush()
     return segments
@@ -183,12 +200,13 @@ def generate_artifacts(
     final_note_path: Path,
     *,
     output_dir: Path | None = None,
+    final_root: Path | None = None,
     require_final_root: bool = True,
 ) -> dict[str, Any]:
     path = final_note_path.expanduser().resolve()
-    final_root = DEFAULT_FINAL_ROOT.resolve()
-    if require_final_root and final_root not in path.parents and path.parent != final_root:
-        raise ValueError(f"final note must be under {final_root}")
+    resolved_final_root = (final_root or DEFAULT_FINAL_ROOT).expanduser().resolve()
+    if require_final_root and resolved_final_root not in path.parents and path.parent != resolved_final_root:
+        raise ValueError(f"final note must be under {resolved_final_root}")
     markdown = path.read_text(encoding="utf-8")
     segments = split_final_note(markdown)
     generated_at = datetime.now().isoformat(timespec="seconds")
@@ -227,11 +245,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="从人工确认后的终稿生成结构化摘要和标的表格")
     parser.add_argument("final_note", help="Obsidian 正式归档 Markdown 路径")
     parser.add_argument("--output-dir", default="", help="默认写入终稿同目录 .derived/")
+    parser.add_argument("--final-root", default=str(DEFAULT_FINAL_ROOT), help="正式纪要根目录；默认从 INVESTMENT_MINUTES_WORKSPACE 推导")
+    parser.add_argument("--no-final-root-check", action="store_true", help="跳过终稿必须位于正式纪要根目录下的保护检查")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     args = parser.parse_args()
     result = generate_artifacts(
         Path(args.final_note),
         output_dir=Path(args.output_dir) if args.output_dir else None,
+        final_root=Path(args.final_root),
+        require_final_root=not args.no_final_root_check,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

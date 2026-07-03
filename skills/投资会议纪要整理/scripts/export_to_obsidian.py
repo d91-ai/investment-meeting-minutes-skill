@@ -6,19 +6,24 @@ Export a finalized meeting note to the user's Obsidian workflow as Markdown + Wo
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
-import subprocess
 import sys
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_EXPORT_DIR = Path("/Users/kumaai/Documents/Codex/workspace/投资纪要工作流/01 Projects/会议纪要")
-DEFAULT_REMOTE_DIR = "gdrive:投资纪要工作流存档/投资纪要工作流"
+DEFAULT_WORKSPACE_ROOT = (
+    Path(os.environ["INVESTMENT_MINUTES_WORKSPACE"]).expanduser()
+    if os.environ.get("INVESTMENT_MINUTES_WORKSPACE")
+    else Path.home() / "Documents/会议纪要整理"
+)
+DEFAULT_EXPORT_DIR = DEFAULT_WORKSPACE_ROOT / "01 Projects/会议纪要"
 INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]+'
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+METADATA_TABLE_FIELDS = {"会议日期", "整理时间", "会议标题", "会议类型", "会议系列", "会议标的"}
 
 
 def validate_utf8_text_file(path: Path, *, require_cjk: bool = False) -> tuple[bool, str]:
@@ -61,8 +66,6 @@ class ExportResult:
     docx_path: Path
     docx_created: bool
     docx_message: str
-    sync_created: bool
-    sync_message: str
 
 
 def sanitize_filename(name: str) -> str:
@@ -77,45 +80,26 @@ def markdown_field(markdown: str, field: str, fallback: str = "") -> str:
     return match.group(1).strip() if match else fallback
 
 
-def detect_title(content: str, fallback: str) -> str:
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            return sanitize_filename(stripped.lstrip("#").strip())
-    return sanitize_filename(fallback)
-
-
 def detect_filename_title(content: str, fallback: str) -> str:
-    h1_title = detect_title(content, fallback)
-    meeting_title_raw = markdown_field(content, "会议标题", "").strip()
+    meeting_series_raw = markdown_field(content, "会议系列", "").strip()
     meeting_type_raw = markdown_field(content, "会议类型", "").strip()
-    meeting_title = sanitize_filename(meeting_title_raw) if meeting_title_raw else ""
-    meeting_type = sanitize_filename(meeting_type_raw) if meeting_type_raw else ""
-    generic_titles = {"投资会议纪要", "会议纪要", "未命名会议"}
-
-    if h1_title in generic_titles:
-        display_title = meeting_title or sanitize_filename(fallback)
-    elif h1_title.startswith("投资会议纪要｜"):
-        topic_title = h1_title.removeprefix("投资会议纪要｜").strip()
-        if meeting_title and meeting_title not in topic_title:
-            display_title = f"{meeting_title}｜{topic_title}"
-        else:
-            display_title = topic_title or meeting_title or h1_title
-    else:
-        display_title = h1_title
-
-    if meeting_type and meeting_type not in display_title:
-        display_title = f"{display_title} - {meeting_type}"
-    return sanitize_filename(display_title)
+    meeting_series = sanitize_filename(meeting_series_raw) if meeting_series_raw else "会议系列"
+    meeting_type = sanitize_filename(meeting_type_raw) if meeting_type_raw else "会议类型"
+    return sanitize_filename(f"{meeting_series} - {meeting_type}")
 
 
-def normalize_meeting_date(date_override: str | None) -> str:
-    raw = (date_override or "").strip()
-    if raw:
+def normalize_meeting_date(date_override: str | None, content: str = "") -> str:
+    raw_candidates = [
+        (date_override or "").strip(),
+        markdown_field(content, "会议日期", "").strip(),
+    ]
+    for raw in raw_candidates:
+        if not raw:
+            continue
         try:
             return datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
-            pass
+            continue
     return datetime.now().strftime("%Y-%m-%d")
 
 
@@ -164,19 +148,36 @@ def is_separator_row(cells: list[str]) -> bool:
     return all(cell and set(cell) <= {"-", ":", " "} for cell in cells)
 
 
-def _add_docx_runs(paragraph, text: str) -> None:
+def parse_metadata_line(line: str) -> tuple[str, str] | None:
+    match = re.match(r"^\*\*([^*\n]+)\*\*[:：]\s*(.*?)\s*$", line.strip())
+    if not match:
+        return None
+    label = match.group(1).strip()
+    if label not in METADATA_TABLE_FIELDS:
+        return None
+    return label, match.group(2).strip()
+
+
+def _add_docx_runs(paragraph, text: str, *, run_style=None) -> None:
+    def add_run(chunk: str, *, strong: bool = False):
+        run = paragraph.add_run(chunk)
+        _style_run(run)
+        if run_style is not None:
+            run_style(run)
+        if strong:
+            run.bold = True
+            run.underline = True
+        return run
+
     cursor = 0
     for match in re.finditer(r"\*\*(.+?)\*\*", text):
         start, end = match.span()
         if start > cursor:
-            _style_run(paragraph.add_run(text[cursor:start]))
-        run = paragraph.add_run(match.group(1))
-        run.bold = True
-        run.underline = True
-        _style_run(run)
+            add_run(text[cursor:start])
+        add_run(match.group(1), strong=True)
         cursor = end
     if cursor < len(text):
-        _style_run(paragraph.add_run(text[cursor:]))
+        add_run(text[cursor:])
 
 
 def _set_run_font(run, font_name: str = "PingFang SC", size_pt: int | None = None) -> None:
@@ -271,6 +272,29 @@ def _format_table(table) -> None:
                 _set_cell_shading(cell, "F6F8FB")
 
 
+def _format_metadata_table(table) -> None:
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.shared import Pt, RGBColor
+
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+    for row_idx, row in enumerate(table.rows):
+        for col_idx, cell in enumerate(row.cells):
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            for paragraph in cell.paragraphs:
+                paragraph.paragraph_format.space_after = Pt(0)
+                paragraph.paragraph_format.line_spacing = 1.05
+                for run in paragraph.runs:
+                    _set_run_font(run, size_pt=9)
+                    if col_idx == 0:
+                        run.bold = True
+                        run.font.color.rgb = RGBColor(255, 255, 255)
+            if col_idx == 0:
+                _set_cell_shading(cell, "1F4E79")
+            elif row_idx % 2 == 1:
+                _set_cell_shading(cell, "F6F8FB")
+
+
 def convert_markdown_to_docx(source_md: Path, target_docx: Path) -> tuple[bool, str]:
     try:
         from docx import Document
@@ -307,34 +331,87 @@ def convert_markdown_to_docx(source_md: Path, target_docx: Path) -> tuple[bool, 
             continue
 
         if stripped.startswith("# "):
-            paragraph = doc.add_heading(stripped[2:].strip(), level=1)
+            paragraph = doc.add_heading("", level=1)
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             paragraph.paragraph_format.space_after = Pt(14)
-            for run in paragraph.runs:
+            def style_heading_1(run):
                 _set_run_font(run, size_pt=18)
                 run.bold = True
                 run.font.color.rgb = RGBColor(31, 78, 121)
+
+            _add_docx_runs(paragraph, stripped[2:].strip(), run_style=style_heading_1)
             idx += 1
             continue
         if stripped.startswith("## "):
-            paragraph = doc.add_heading(stripped[3:].strip(), level=2)
+            paragraph = doc.add_heading("", level=2)
             paragraph.paragraph_format.space_before = Pt(12)
             paragraph.paragraph_format.space_after = Pt(8)
-            for run in paragraph.runs:
+            def style_heading_2(run):
                 _set_run_font(run, size_pt=15)
                 run.bold = True
                 run.font.color.rgb = RGBColor(31, 78, 121)
+
+            _add_docx_runs(paragraph, stripped[3:].strip(), run_style=style_heading_2)
             idx += 1
             continue
         if stripped.startswith("### "):
-            paragraph = doc.add_heading(stripped[4:].strip(), level=3)
+            paragraph = doc.add_heading("", level=3)
             paragraph.paragraph_format.space_before = Pt(8)
             paragraph.paragraph_format.space_after = Pt(4)
-            for run in paragraph.runs:
+            def style_heading_3(run):
                 _set_run_font(run, size_pt=12)
                 run.bold = True
                 run.font.color.rgb = RGBColor(64, 64, 64)
+
+            _add_docx_runs(paragraph, stripped[4:].strip(), run_style=style_heading_3)
             idx += 1
+            continue
+        if stripped.startswith("#### "):
+            target_label = stripped[5:].strip()
+            if re.fullmatch(r"【\s*】", target_label):
+                idx += 1
+                continue
+            paragraph = doc.add_paragraph()
+            def style_target_heading(run):
+                _set_run_font(run, size_pt=11)
+                run.bold = True
+                run.font.color.rgb = RGBColor(31, 78, 121)
+
+            _add_docx_runs(paragraph, target_label, run_style=style_target_heading)
+            _set_cell_like_paragraph_shading(paragraph, "EAF2F8")
+            paragraph.paragraph_format.space_before = Pt(6)
+            paragraph.paragraph_format.space_after = Pt(3)
+            idx += 1
+            continue
+        if stripped.startswith("##### "):
+            paragraph = doc.add_paragraph()
+            def style_sector_heading(run):
+                _set_run_font(run, size_pt=10)
+                run.bold = True
+                run.font.color.rgb = RGBColor(89, 89, 89)
+
+            _add_docx_runs(paragraph, stripped[6:].strip(), run_style=style_sector_heading)
+            paragraph.paragraph_format.space_before = Pt(2)
+            paragraph.paragraph_format.space_after = Pt(3)
+            idx += 1
+            continue
+
+        metadata_rows: list[tuple[str, str]] = []
+        probe = idx
+        while probe < len(lines):
+            parsed = parse_metadata_line(lines[probe].strip())
+            if not parsed:
+                break
+            metadata_rows.append(parsed)
+            probe += 1
+        if metadata_rows:
+            table = doc.add_table(rows=len(metadata_rows), cols=2)
+            table.style = "Table Grid"
+            for row_idx, (label, value) in enumerate(metadata_rows):
+                _add_docx_runs(table.rows[row_idx].cells[0].paragraphs[0], label)
+                _add_docx_runs(table.rows[row_idx].cells[1].paragraphs[0], value)
+            _format_metadata_table(table)
+            idx = probe
             continue
 
         if re.match(r"^\*\*[^*]+\*\*：", stripped):
@@ -396,47 +473,12 @@ def convert_markdown_to_docx(source_md: Path, target_docx: Path) -> tuple[bool, 
     return True, "ok"
 
 
-def sync_vault_to_gdrive(local_dir: Path, remote_dir: str | None = None) -> tuple[bool, str]:
-    sync_script = Path(__file__).with_name("sync_obsidian_to_gdrive.py")
-    if not sync_script.exists():
-        return False, f"同步脚本不存在: {sync_script}"
-
-    log_file = Path("/Users/kumaai/Library/Logs/kumaai-sync/investment-workflow-rclone-launch.log")
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        handle = log_file.open("a", encoding="utf-8")
-        command = [sys.executable, str(sync_script), "--local-dir", str(local_dir)]
-        if remote_dir:
-            command.extend(["--remote-dir", remote_dir])
-        subprocess.Popen(
-            command,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except Exception as exc:
-        return False, f"Google Drive 后台同步启动失败: {exc}"
-    target = remote_dir or DEFAULT_REMOTE_DIR
-    return True, f"已触发 Google Drive 后台同步: {local_dir} -> {target}"
-
-
-def organize_archive_before_sync() -> tuple[bool, str]:
-    organizer = Path(__file__).with_name("organize_archive_by_date.py")
-    if not organizer.exists():
-        return False, f"归档整理脚本不存在: {organizer}"
-    result = subprocess.run([sys.executable, str(organizer)], text=True, capture_output=True)
-    message = (result.stdout or result.stderr or "").strip()
-    if result.returncode != 0:
-        return False, message or "归档整理失败"
-    return True, message or "归档整理完成"
-
-
-def export_note(source_file: Path, export_dir: Path, date_override: str | None, *, sync: bool = True) -> ExportResult:
+def export_note(source_file: Path, export_dir: Path, date_override: str | None) -> ExportResult:
     raw_content = source_file.read_text(encoding="utf-8")
     source_encoding_ok, source_encoding_message = validate_utf8_text_file(source_file, require_cjk=True)
     if not source_encoding_ok:
         raise UnicodeError(source_encoding_message)
-    meeting_date = normalize_meeting_date(date_override)
+    meeting_date = normalize_meeting_date(date_override, raw_content)
     title = detect_filename_title(raw_content, source_file.stem)
     filename_base = f"{meeting_date} - {title}"
     export_dir = export_dir / meeting_date
@@ -455,16 +497,6 @@ def export_note(source_file: Path, export_dir: Path, date_override: str | None, 
     docx_ok, docx_message = convert_markdown_to_docx(docx_source, docx_path)
     if docx_ok:
         docx_ok, docx_message = validate_docx_utf8(docx_path, require_cjk=True)
-    sync_ok = False
-    sync_message = "跳过同步：Markdown 或 Word 未全部生成"
-    if md_ok and docx_ok and sync:
-        archive_ok, archive_message = organize_archive_before_sync()
-        sync_remote_dir = f"{DEFAULT_REMOTE_DIR}/01 Projects/会议纪要/{meeting_date}"
-        sync_ok, sync_message = sync_vault_to_gdrive(export_dir, sync_remote_dir)
-        if not archive_ok:
-            sync_message = f"{sync_message}; 归档整理未完成: {archive_message}"
-    elif md_ok and docx_ok:
-        sync_message = "跳过同步：--no-sync"
 
     return ExportResult(
         md_path=md_path,
@@ -473,8 +505,6 @@ def export_note(source_file: Path, export_dir: Path, date_override: str | None, 
         docx_path=docx_path,
         docx_created=docx_ok,
         docx_message=docx_message,
-        sync_created=sync_ok,
-        sync_message=sync_message,
     )
 
 
@@ -483,7 +513,6 @@ def main() -> int:
     parser.add_argument("input_file", help="已整理完成的 Markdown 文件")
     parser.add_argument("--export-dir", default=str(DEFAULT_EXPORT_DIR), help=f"导出目录，默认 {DEFAULT_EXPORT_DIR}")
     parser.add_argument("--meeting-date", help="覆盖系统日期，格式 YYYY-MM-DD")
-    parser.add_argument("--no-sync", action="store_true", help="只生成本地 Markdown+Word，不触发归档整理或 Google Drive 同步")
     args = parser.parse_args()
 
     source_file = Path(args.input_file).expanduser().resolve()
@@ -492,7 +521,7 @@ def main() -> int:
         return 1
 
     export_dir = Path(args.export_dir).expanduser().resolve()
-    result = export_note(source_file, export_dir, args.meeting_date, sync=not args.no_sync)
+    result = export_note(source_file, export_dir, args.meeting_date)
 
     if result.md_created:
         print(f"Markdown: {result.md_path}")
@@ -502,10 +531,6 @@ def main() -> int:
         print(f"Word: {result.docx_path}")
     else:
         print(f"Word: 未生成 ({result.docx_message})")
-    if result.sync_created:
-        print(f"Google Drive: {result.sync_message}")
-    else:
-        print(f"Google Drive: 未同步 ({result.sync_message})")
     return 0
 
 

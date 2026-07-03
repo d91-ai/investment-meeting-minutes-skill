@@ -1,14 +1,16 @@
 # Archive Naming Contract
 
-Use this file when archiving raw meeting inputs or exporting confirmed meeting notes. The naming contract is deterministic so local runs, Dify runs, Google Drive sync, and later manual review use the same paths.
+Use this file when archiving raw meeting inputs or exporting confirmed meeting notes. The naming contract is deterministic so local runs and later manual review use the same paths.
 
 ## Raw Input Archive
 
 Archive root:
 
 ```text
-/Users/kumaai/Documents/Codex/workspace/投资纪要工作流/00 Inbox/会议原始记录
+$INVESTMENT_MINUTES_WORKSPACE/00 Inbox/会议原始记录
 ```
+
+If `INVESTMENT_MINUTES_WORKSPACE` is not set, local scripts default to `Path.home() / "Documents/会议纪要整理"`. Use `--archive-root` for one-off overrides.
 
 Folder pattern:
 
@@ -56,8 +58,10 @@ Rules:
 Default final-note root:
 
 ```text
-/Users/kumaai/Documents/Codex/workspace/投资纪要工作流/01 Projects/会议纪要
+$INVESTMENT_MINUTES_WORKSPACE/01 Projects/会议纪要
 ```
+
+Use `--export-dir` for one-off overrides.
 
 Final-note folder:
 
@@ -68,10 +72,10 @@ YYYY-MM-DD/
 Preferred final-note filename:
 
 ```text
-YYYY-MM-DD - 会议标题 - 会议类型.md
-YYYY-MM-DD - 会议标题 - 会议类型.docx
+YYYY-MM-DD - 会议系列 - 会议类型.md
+YYYY-MM-DD - 会议系列 - 会议类型.docx
 ```
 
-If the title already includes the meeting type, do not repeat the meeting type. If the filename collides, append a timestamp suffix and keep both files.
+Use `--meeting-date` when an explicit export date is needed; otherwise use the Markdown `会议日期` field, then the current date as the last fallback. The filename series comes from `会议系列`; the filename type comes from `会议类型`. If either value is missing, use the literal placeholder `会议系列` or `会议类型`. The `会议标题` field does not control the final Markdown or Word filename. If the filename collides, append a timestamp suffix and keep both files.
 
 Do not expose raw archive paths or technical archive status in the human-readable note body.

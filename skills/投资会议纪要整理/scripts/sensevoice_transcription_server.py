@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Tiny local HTTP bridge for Dify -> SenseVoice transcription."""
+"""Tiny local HTTP bridge for SenseVoice transcription."""
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import os
@@ -18,7 +19,6 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 SCRIPT_DIR = Path(__file__).resolve().parent
 TRANSCRIBE_SCRIPT = SCRIPT_DIR / "transcribe_audio.py"
-LOG_DIR = Path("/Users/kumaai/Library/Logs/kumaai-sync")
 DEFAULT_PRIMARY_ENGINE = "sensevoice"
 DEFAULT_PRIMARY_MODEL = "iic/SenseVoiceSmall"
 DEFAULT_AUXILIARY_ENGINE = "paraformer"
@@ -27,7 +27,7 @@ DEFAULT_MODEL_CACHE = os.environ.get(
     "SENSEVOICE_MODEL_CACHE",
     os.environ.get(
         "FUNASR_MODEL_CACHE",
-        str(Path.home() / ".cache/modelscope/hub"),
+        str(Path.home() / "Documents/Codex/asr-model-cache"),
     ),
 )
 DEFAULT_TRANSCRIBE_PYTHON = os.environ.get("SENSEVOICE_PYTHON", "")
@@ -244,7 +244,7 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
 
         filename = _clean_filename(file_item.filename)
         suffix = Path(filename).suffix or ".audio"
-        with tempfile.TemporaryDirectory(prefix="sensevoice-dify-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="sensevoice-local-") as tmp:
             tmp_dir = Path(tmp)
             audio_path = tmp_dir / f"input{suffix}"
             audio_path.write_bytes(file_item.file.read())
@@ -289,6 +289,7 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
                 "sentence_info": timestamp_segments,
                 "timestamp_index": primary_json.get("timestamp_index") or [],
                 "timestamp_index_path": primary_json.get("timestamp_index_path") or "",
+                "timestamp_index_source": primary_json.get("timestamp_index_source") or "",
                 "auxiliary_engine": primary_json.get("auxiliary_engine") or "",
                 "auxiliary_model": primary_json.get("auxiliary_model") or "",
                 "auxiliary_text": primary_json.get("auxiliary_text") or "",
@@ -309,8 +310,13 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    host = os.environ.get("SENSEVOICE_BRIDGE_HOST", DEFAULT_HOST)
-    port = int(os.environ.get("SENSEVOICE_BRIDGE_PORT", str(DEFAULT_PORT)))
+    parser = argparse.ArgumentParser(description="启动本地 SenseVoice 转写 HTTP bridge")
+    parser.add_argument("--host", default=os.environ.get("SENSEVOICE_BRIDGE_HOST", DEFAULT_HOST))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("SENSEVOICE_BRIDGE_PORT", str(DEFAULT_PORT))))
+    args = parser.parse_args()
+
+    host = args.host
+    port = args.port
     server = ThreadingHTTPServer((host, port), SenseVoiceHandler)
     print(f"SenseVoice bridge listening on http://{host}:{port}", flush=True)
     server.serve_forever()

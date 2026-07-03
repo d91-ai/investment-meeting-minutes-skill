@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
@@ -14,7 +15,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-DEFAULT_ARCHIVE_ROOT = Path("/Users/kumaai/Documents/Codex/workspace/投资纪要工作流/00 Inbox/会议原始记录")
+DEFAULT_WORKSPACE_ROOT = (
+    Path(os.environ["INVESTMENT_MINUTES_WORKSPACE"]).expanduser()
+    if os.environ.get("INVESTMENT_MINUTES_WORKSPACE")
+    else Path.home() / "Documents/会议纪要整理"
+)
+DEFAULT_ARCHIVE_ROOT = DEFAULT_WORKSPACE_ROOT / "00 Inbox/会议原始记录"
 INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]+'
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TYPE_LABELS = {
@@ -22,7 +28,7 @@ TYPE_LABELS = {
     ".doc": "文稿",
     ".txt": "文稿",
     ".md": "文稿",
-    ".pdf": "文稿",
+    ".pdf": "附件",
     ".mp3": "录音",
     ".m4a": "录音",
     ".wav": "录音",
@@ -178,7 +184,7 @@ def main() -> int:
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"), help="归档日期，格式 YYYY-MM-DD")
     parser.add_argument("--title", help="会议标题，用于生成规范归档文件名")
     parser.add_argument("--dry-run", action="store_true", help="只预览目标路径，不复制文件")
-    parser.add_argument("--json", action="store_true", help="输出 JSON，便于 Dify/自动化调用")
+    parser.add_argument("--json", action="store_true", help="输出 JSON，便于自动化调用")
     args = parser.parse_args()
 
     try:

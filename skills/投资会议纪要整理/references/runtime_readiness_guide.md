@@ -1,89 +1,123 @@
-# Runtime Readiness Guide
+# 运行环境 Readiness 指南
 
-Use this file before running audio transcription, Dify service smoke tests, or production-like meeting imports.
+首次在本机使用、迁移到新机器后，或执行耗时较高的音频、文档、导出任务前，先按本指南检查本地环境。
 
-## Runtime Rule
+## 运行原则
 
-Runtime execution must not download models, install packages, or silently switch engines. Preparation is a separate deployment step.
+正式处理会议任务时，不应临时下载模型、安装依赖或静默切换引擎。依赖安装、模型下载和服务配置属于部署准备步骤，必须和单次会议处理分开。
 
-Allowed during a live meeting job:
+会议任务中允许：
 
-- Use already-installed Python packages.
-- Use already-cached ASR models.
-- Use already-configured local services.
-- Continue from user-provided text when audio transcription cannot run, while reporting the missing capability.
+- 使用已经安装好的 Python 依赖。
+- 使用已经缓存好的 ASR 模型。
+- 使用已经配置好的本地服务。
+- 音频转写无法运行时，暂停处理并修复本地 ASR 运行环境，再回到正常转写流程。
+- 当前工作时段无法恢复运行环境且用户接受音频复核不完整时，才改为仅根据用户提供的文字继续。
 
-Not allowed during a live meeting job:
+会议任务中不允许：
 
-- Download SenseVoice models.
-- Install Python packages on demand.
-- Switch from SenseVoice to Whisper or another ASR.
-- Estimate timestamps from cleaned-note text position.
-- Pretend Word, Dify, or Google Drive sync succeeded when the step failed.
+- 现场下载 SenseVoice 模型。
+- 现场安装 Python 包。
+- 从 SenseVoice 静默切换到 Whisper 或其他 ASR。
+- 根据清洗后纪要的位置估算时间戳。
+- 在 Word 导出或本地归档失败时声称已经成功。
 
-## Readiness Profiles
+## Readiness Profile
 
-Use the narrowest readiness profile that matches the next expensive step:
+使用和下一步动作匹配的最小检查范围：
 
 ```bash
 python3 scripts/check_investment_workflow_health.py --profile asr --strict
+python3 scripts/check_investment_workflow_health.py --profile document
 python3 scripts/check_investment_workflow_health.py --profile export
-python3 scripts/check_investment_workflow_health.py --profile dify
 python3 scripts/check_investment_workflow_health.py --profile full --strict
 ```
 
-Profile intent:
+各 profile 含义：
 
-- `asr`: check only local transcription prerequisites and the SenseVoice service/cache. Use before audio transcription.
-- `export`: check local archive/export paths, Word dependency, and rclone availability/log status. Use before final Markdown + Word export.
-- `dify`: check Dify, review/export bridges, workflow output contract, sync mapping, and access-control plumbing. Use before production-like Dify imports.
-- `full`: run the broad machine health audit. Use for deployment validation, not for every meeting note.
+- `asr`：只检查本地转写前置条件、SenseVoice/Paraformer 服务和模型缓存。音频转写前使用。
+- `document`：检查 UTF-8 文本处理、DOCX 解析、本地输入/临时/输出目录权限。文档密集任务前使用。
+- `export`：检查本地 Markdown validator、`python-docx`、Word 表格/样式生成依赖和本地输出目录。最终 Markdown + Word 导出前使用。
+- `full`：运行全部本地基础检查。用于部署验收，不建议每次会议纪要都跑。
 
-Strict ASR/full mode should fail if required local runtime assets are missing:
+`asr` / `full` 的 strict 模式在缺少必要本地资源时应失败：
 
 - `funasr`
 - `modelscope`
 - `soundfile`
 - `librosa`
 - `docx`
-- local SenseVoice model cache
-- local Paraformer auxiliary model cache
-- the model cache path reported by the running SenseVoice service
-- review/export bridge health endpoints
-- SenseVoice transcription bridge health endpoint
-- Obsidian archive/output paths
+- 本地 SenseVoice 模型缓存
+- 本地 Paraformer 辅助模型缓存
+- 运行中的 SenseVoice 服务上报的模型缓存路径
+- SenseVoice 转写 bridge 健康检查接口
+- 本地输入、临时、输出路径
 
-The maintained audio workflow is SenseVoice as the primary transcript plus Paraformer as auxiliary proofreading evidence. Paraformer output must not automatically replace the SenseVoice transcript. Extra ASR engines, diarization stacks, or unrelated segmentation paths are outside the current reusable skill contract.
+当前维护的音频工作流是：SenseVoice 作为主转写来源，Paraformer 只作为辅助校对和时间戳证据。`timestamp_index.json` 可由脚本在 SenseVoice 与 Paraformer 可用时间戳 anchor 间选择，并记录 `timestamp_index_source`。Paraformer 结果不得自动替换 SenseVoice 主转写。额外 ASR 引擎、说话人分离、无关分段路径不属于当前基础 skill 合约，只有用户明确要求时才启用。
 
-For a narrow ASR cache check:
+只检查 ASR 缓存时使用：
 
 ```bash
 python3 scripts/transcribe_audio.py --check-model-cache
 ```
 
-This command only reports cache status. It must not download missing files.
+该命令只报告缓存状态，不应下载缺失文件。
 
-## Deployment Preparation
+## 本地目录策略
 
-If strict mode reports missing packages or models, fix the deployment before live use. Any download or package installation belongs in a manual deployment/preparation step, not inside the meeting-processing run.
+所有默认业务目录从 `INVESTMENT_MINUTES_WORKSPACE` 推导。未设置时，本地脚本默认使用：
 
-Record the final model cache path and Python environment path in the local service configuration or LaunchAgent. Do not vendor model weights, virtualenvs, Python wheels, private tokens, or local caches into the reusable skill package.
+```bash
+Path.home() / "Documents/会议纪要整理"
+```
 
-The skill package should contain:
+建议在本机 shell 或启动脚本中显式设置：
 
-- rules and prompts
-- deterministic scripts
-- references and templates
-- regression samples
-- health checks
-- optional example manifests without secrets
+```bash
+export INVESTMENT_MINUTES_WORKSPACE="$HOME/Documents/会议纪要整理"
+```
 
-The deployment environment should contain:
+readiness 默认只检查目录，不自动创建目录。若目录不存在，检查应失败并提示设置 `INVESTMENT_MINUTES_WORKSPACE` 或先创建目录，避免误写到用户不期望的位置。
 
-- downloaded ASR model caches
-- Python virtual environments
-- platform-specific binaries
-- private Dify, rclone, and Google Drive configuration
-- local logs and runtime state
+首次部署且确认目标 workspace 无误时，可显式创建本地目录：
 
-If a runtime asset manifest is needed, generate it from the deployment environment and keep it outside the reusable skill package unless it is a redacted example.
+```bash
+python3 scripts/check_investment_workflow_health.py --profile document --prepare-local-dirs
+python3 scripts/check_investment_workflow_health.py --profile export --prepare-local-dirs
+```
+
+`--prepare-local-dirs` 只用于本地部署准备，不应在普通会议处理过程中默认启用。
+
+## 部署准备
+
+如果 strict 模式报告依赖或模型缺失，应先修复部署环境，再处理正式会议。任何下载或安装都应作为人工部署步骤执行，不应藏在会议处理脚本里。
+
+本地路径和 Python 选择：
+
+- 设置 `INVESTMENT_MINUTES_WORKSPACE` 作为会议纪要工作流根目录；原始输入和最终输出目录都从该根目录推导。
+- 当 Markdown/Word 检查需要使用非系统默认 `python3` 时，设置 `INVESTMENT_MINUTES_PYTHON`。
+- 当 ASR 检查需要使用独立转写运行时时，设置 `SENSEVOICE_PYTHON`。
+- 模型缓存优先使用 `SENSEVOICE_MODEL_CACHE`；未设置时使用 `FUNASR_MODEL_CACHE`，再退回 `$HOME/Documents/Codex/asr-model-cache`。
+- 日志和访问控制等用户级配置应使用 `$HOME/...`、环境变量或 CLI 参数，不应写入 reusable artifact 的私有绝对路径。
+
+skill 包内应保留：
+
+- 规则和 prompt。
+- 确定性脚本。
+- reference 和模板。
+- regression 样例。
+- health check。
+- 不含密钥的可选示例配置。
+
+部署环境中保存：
+
+- 已下载的 ASR 模型缓存。
+- Python 虚拟环境。
+- 平台相关二进制。
+- 本地日志和运行状态。
+
+如需 runtime asset manifest，应从部署环境生成，并放在 reusable skill package 之外；除非只是脱敏示例，否则不要提交。
+
+## PDF 边界
+
+PDF 不属于基础正文解析能力。用户提供 PDF 时，默认只作为原始附件归档；若会议内容必须来自 PDF，应要求用户另行提供可读文本、DOCX、TXT 或 Markdown，再进入文稿整理流程。

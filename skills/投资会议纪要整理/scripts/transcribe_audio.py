@@ -16,7 +16,10 @@ from pathlib import Path
 
 DEFAULT_SENSEVOICE_MODEL = "iic/SenseVoiceSmall"
 DEFAULT_PARAFORMER_MODEL = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+DEFAULT_VAD_MODEL = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 DEFAULT_LOCAL_CACHE = Path.home() / "Documents/Codex/asr-model-cache"
+DEFAULT_AUDIO_CHUNK_SECONDS = 60
+MAX_RELIABLE_VAD_SEGMENT_MS = 10000
 MODEL_ALIASES = {
     "iic/SenseVoiceSmall": ("modelscope", "models/iic/SenseVoiceSmall"),
     "SenseVoiceSmall": ("modelscope", "models/iic/SenseVoiceSmall"),
@@ -32,6 +35,14 @@ MODEL_ALIASES = {
         "modelscope",
         "models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
     ),
+    DEFAULT_VAD_MODEL: (
+        "modelscope",
+        "models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    ),
+    "fsmn-vad": (
+        "modelscope",
+        "models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    ),
 }
 REQUIRED_MODEL_FILES = {
     "iic/SenseVoiceSmall": ("config.yaml", "model.pt"),
@@ -39,6 +50,8 @@ REQUIRED_MODEL_FILES = {
     DEFAULT_PARAFORMER_MODEL: ("config.yaml", "model.pt"),
     "Paraformer-Large": ("config.yaml", "model.pt"),
     "paraformer": ("config.yaml", "model.pt"),
+    DEFAULT_VAD_MODEL: ("config.yaml", "model.pt"),
+    "fsmn-vad": ("config.yaml", "model.pt"),
 }
 SENSEVOICE_TEXT_FORMATS = {"txt", "json", "all"}
 
@@ -148,6 +161,7 @@ def _model_cache_report() -> dict[str, object]:
         "models": {
             "sensevoice": _model_cache_status(DEFAULT_SENSEVOICE_MODEL),
             "paraformer": _model_cache_status(DEFAULT_PARAFORMER_MODEL),
+            "vad": _model_cache_status(DEFAULT_VAD_MODEL),
         },
     }
 
@@ -179,6 +193,125 @@ def _ensure_ffmpeg_for_current_process() -> None:
     env = _ensure_ffmpeg_in_path(dict(os.environ))
     if env.get("PATH") != os.environ.get("PATH"):
         os.environ["PATH"] = env["PATH"]
+
+
+def _audio_file_chunks(input_file: Path, *, chunk_seconds: int = DEFAULT_AUDIO_CHUNK_SECONDS) -> tuple[tempfile.TemporaryDirectory[str], list[Path]]:
+    """Create file-level chunks so long recordings are never sent to FunASR at once."""
+    temp_dir = tempfile.TemporaryDirectory(prefix="sensevoice-chunks-")
+    chunk_dir = Path(temp_dir.name)
+    output_pattern = chunk_dir / "chunk_%05d.wav"
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        temp_dir.cleanup()
+        raise RuntimeError("ffmpeg unavailable for audio chunking")
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(input_file),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+        "-reset_timestamps",
+        "1",
+        str(output_pattern),
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True)
+    chunks = sorted(chunk_dir.glob("chunk_*.wav"))
+    if completed.returncode != 0 or not chunks:
+        error = (completed.stderr or completed.stdout or "ffmpeg did not produce audio chunks").strip()
+        temp_dir.cleanup()
+        raise RuntimeError(error)
+    return temp_dir, chunks
+
+
+def _parse_milliseconds(value: object) -> int | None:
+    try:
+        ms = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    if ms < 0:
+        return None
+    return ms
+
+
+def _extract_vad_segments(result: object) -> list[tuple[int, int]]:
+    """Extract global fsmn-vad millisecond ranges from FunASR output."""
+    chunks = result if isinstance(result, list) else [result]
+    segments: list[tuple[int, int]] = []
+    for chunk in chunks:
+        values: object
+        if isinstance(chunk, dict):
+            values = chunk.get("value") or chunk.get("segments") or chunk.get("timestamp") or []
+        else:
+            values = chunk
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            pair = _timestamp_pair_ms(item)
+            if pair is None:
+                continue
+            start_ms = _parse_milliseconds(pair[0])
+            end_ms = _parse_milliseconds(pair[1])
+            if start_ms is None or end_ms is None or end_ms <= start_ms:
+                continue
+            segments.append((start_ms, end_ms))
+    return segments
+
+
+def _split_vad_segments_for_reliable_timestamps(
+    segments: list[tuple[int, int]],
+    *,
+    max_duration_ms: int = MAX_RELIABLE_VAD_SEGMENT_MS,
+) -> list[tuple[int, int]]:
+    reliable_segments: list[tuple[int, int]] = []
+    for start_ms, end_ms in segments:
+        cursor = start_ms
+        while cursor < end_ms:
+            split_end_ms = min(cursor + max_duration_ms, end_ms)
+            if split_end_ms > cursor:
+                reliable_segments.append((cursor, split_end_ms))
+            cursor = split_end_ms
+    return reliable_segments
+
+
+def _audio_segment_to_wav(input_file: Path, output_file: Path, start_ms: int, end_ms: int) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg unavailable for VAD segment slicing")
+    duration_ms = end_ms - start_ms
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{start_ms / 1000:.3f}",
+        "-i",
+        str(input_file),
+        "-t",
+        f"{duration_ms / 1000:.3f}",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(output_file),
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True)
+    if completed.returncode != 0 or not output_file.exists():
+        error = (completed.stderr or completed.stdout or "ffmpeg did not produce VAD segment").strip()
+        raise RuntimeError(error)
 
 
 def _clean_sensevoice_text(text: str) -> str:
@@ -249,6 +382,30 @@ def _split_sentence_spans(text: str) -> list[tuple[int, int, str]]:
     return spans or [(0, len(text), text)] if text else []
 
 
+def _offset_sentence_times(
+    sentences: list[dict[str, object]],
+    *,
+    offset_ms: int,
+    chunk_index: int,
+) -> list[dict[str, object]]:
+    adjusted: list[dict[str, object]] = []
+    for item in sentences:
+        copied = dict(item)
+        for key in ("start_ms", "end_ms"):
+            value = copied.get(key, "")
+            if str(value).strip() == "":
+                continue
+            try:
+                copied[key] = int(float(value)) + offset_ms
+            except (TypeError, ValueError):
+                copied[key] = value
+        copied["start"] = _ms_to_timestamp(copied.get("start_ms", ""))
+        copied["end"] = _ms_to_timestamp(copied.get("end_ms", ""))
+        copied["chunk_index"] = chunk_index
+        adjusted.append(copied)
+    return adjusted
+
+
 def _segment_from_time_range(
     *,
     text: str,
@@ -256,6 +413,7 @@ def _segment_from_time_range(
     end_ms: object,
     speaker: object = "",
     source: str,
+    precision: str | None = None,
 ) -> dict[str, object]:
     return {
         "speaker": _speaker_label(speaker) if str(speaker or "").strip() else "",
@@ -266,7 +424,23 @@ def _segment_from_time_range(
         "end": _ms_to_timestamp(end_ms),
         "text": text,
         "source": source,
+        "precision": precision or _infer_timestamp_precision(source, start_ms, end_ms),
     }
+
+
+def _infer_timestamp_precision(source: object, start_ms: object = "", end_ms: object = "") -> str:
+    if str(start_ms).strip() == "" or str(end_ms).strip() == "":
+        return "unavailable"
+    normalized = str(source or "").strip().lower()
+    if "sentence" in normalized:
+        return "sentence"
+    if "phrase" in normalized:
+        return "phrase"
+    if "chunk" in normalized:
+        return "chunk"
+    if "segment" in normalized:
+        return "segment"
+    return "sentence"
 
 
 def _extract_sentence_info(result: object) -> list[dict[str, object]]:
@@ -289,6 +463,7 @@ def _extract_sentence_info(result: object) -> list[dict[str, object]]:
                     end_ms=item.get("end", ""),
                     speaker=item.get("spk", ""),
                     source="sentence_info",
+                    precision="sentence",
                 )
             )
         if chunk_sentences:
@@ -313,7 +488,8 @@ def _extract_sentence_info(result: object) -> list[dict[str, object]]:
                             text=sentence,
                             start_ms=start_ms,
                             end_ms=end_ms,
-                            source="timestamp",
+                            source="timestamp_sentence",
+                            precision="sentence",
                         )
                     )
             else:
@@ -324,7 +500,8 @@ def _extract_sentence_info(result: object) -> list[dict[str, object]]:
                         text=text,
                         start_ms=start_ms,
                         end_ms=end_ms,
-                        source="timestamp",
+                        source="timestamp_segment",
+                        precision="segment",
                     )
                 )
             continue
@@ -336,6 +513,7 @@ def _extract_sentence_info(result: object) -> list[dict[str, object]]:
                     start_ms=chunk.get("start_ms", ""),
                     end_ms=chunk.get("end_ms", ""),
                     source="chunk",
+                    precision="chunk",
                 )
             )
     return sentences
@@ -353,7 +531,7 @@ def _format_speaker_transcript(sentences: list[dict[str, object]]) -> str:
     return "\n".join(line for line in lines if line).strip()
 
 
-def _build_timestamp_index(sentences: list[dict[str, object]]) -> list[dict[str, object]]:
+def _build_timestamp_index(sentences: list[dict[str, object]], *, source_prefix: str = "sensevoice") -> list[dict[str, object]]:
     index: list[dict[str, object]] = []
     for offset, item in enumerate(sentences):
         text = str(item.get("text") or "").strip()
@@ -362,7 +540,7 @@ def _build_timestamp_index(sentences: list[dict[str, object]]) -> list[dict[str,
         start_ms = item.get("start_ms", "")
         end_ms = item.get("end_ms", "")
         source = str(item.get("source") or "sensevoice").strip() or "sensevoice"
-        has_precise_time = str(start_ms).strip() != "" and str(end_ms).strip() != ""
+        precision = str(item.get("precision") or _infer_timestamp_precision(source, start_ms, end_ms)).strip()
         index.append(
             {
                 "start": item.get("start") or _ms_to_timestamp(start_ms),
@@ -372,12 +550,21 @@ def _build_timestamp_index(sentences: list[dict[str, object]]) -> list[dict[str,
                 "chunk_index": item.get("chunk_index", 0),
                 "text": text,
                 "speaker": item.get("speaker", ""),
-                "source": source if source.startswith("sensevoice") else f"sensevoice_{source}",
-                "precision": "sentence" if has_precise_time else "segment",
+                "source": source if source.startswith(source_prefix) else f"{source_prefix}_{source}",
+                "precision": precision,
                 "index": offset,
             }
         )
     return index
+
+
+def _timestamp_index_has_usable_time(index: list[dict[str, object]]) -> bool:
+    for item in index:
+        if str(item.get("start_ms") or "").strip() and str(item.get("end_ms") or "").strip():
+            return True
+        if str(item.get("start") or "").strip() and str(item.get("end") or "").strip():
+            return True
+    return False
 
 
 def _text_diff_preview(primary_text: str, auxiliary_text: str, *, limit: int = 120) -> str:
@@ -433,11 +620,29 @@ def _run_paraformer_auxiliary(
         model = AutoModel(
             model=model_ref,
             trust_remote_code=True,
-            device=_select_device("auto"),
+            device=_select_device("cpu"),
             disable_update=True,
         )
-        result = model.generate(input=str(input_file), batch_size_s=60)
-        text = _extract_model_text(result)
+        chunk_temp_dir, chunks = _audio_file_chunks(input_file)
+        chunk_texts: list[str] = []
+        sentence_info: list[dict[str, object]] = []
+        try:
+            for chunk_index, chunk_path in enumerate(chunks):
+                result = model.generate(input=str(chunk_path), batch_size_s=60, sentence_timestamp=True)
+                chunk_text = _extract_model_text(result)
+                if chunk_text:
+                    chunk_texts.append(chunk_text)
+                sentence_info.extend(
+                    _offset_sentence_times(
+                        _extract_sentence_info(result),
+                        offset_ms=chunk_index * DEFAULT_AUDIO_CHUNK_SECONDS * 1000,
+                        chunk_index=chunk_index,
+                    )
+                )
+        finally:
+            chunk_temp_dir.cleanup()
+        text = "\n".join(item for item in chunk_texts if item).strip()
+        timestamp_index = _build_timestamp_index(sentence_info, source_prefix="paraformer")
     except Exception as exc:  # noqa: BLE001
         return {
             "engine": "paraformer",
@@ -452,7 +657,94 @@ def _run_paraformer_auxiliary(
         "model": model_name,
         "ok": True,
         "text": text,
-        "status": "Paraformer 辅助转写完成；仅作为校对证据，不自动覆盖 SenseVoice 主转写。",
+        "timestamp_detected": _timestamp_index_has_usable_time(timestamp_index),
+        "sentence_info": sentence_info,
+        "timestamp_index": timestamp_index,
+        "status": "Paraformer 辅助转写完成；仅作为校对和时间戳证据，不自动覆盖 SenseVoice 主转写。",
+    }
+
+
+def _run_sensevoice_vad_segments(
+    input_file: Path,
+    sensevoice_model: object,
+    vad_model: str,
+    language: str,
+    allow_remote_model_lookup: bool,
+) -> dict[str, object]:
+    from funasr import AutoModel  # type: ignore
+
+    vad_ref = _resolve_model_ref(vad_model, allow_remote_model_lookup=allow_remote_model_lookup)
+    vad = AutoModel(
+        model=vad_ref,
+        trust_remote_code=True,
+        device="cpu",
+        disable_update=True,
+    )
+    vad_result = vad.generate(input=str(input_file))
+    raw_segments = _extract_vad_segments(vad_result)
+    if not raw_segments:
+        raise RuntimeError("完整音频 VAD 未返回有效 segment")
+    segments = _split_vad_segments_for_reliable_timestamps(raw_segments)
+    if not segments:
+        raise RuntimeError("完整音频 VAD 未返回可用于可靠时间戳的 segment")
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="sensevoice-vad-segments-")
+    segment_dir = Path(temp_dir.name)
+    records: list[dict[str, object]] = []
+    raw_results: list[dict[str, object]] = []
+    try:
+        for segment_index, (start_ms, end_ms) in enumerate(segments):
+            segment_path = segment_dir / f"segment_{segment_index:05d}.wav"
+            _audio_segment_to_wav(input_file, segment_path, start_ms, end_ms)
+            segment_result = sensevoice_model.generate(
+                input=str(segment_path),
+                language=language,
+                use_itn=True,
+                batch_size_s=60,
+                sentence_timestamp=True,
+            )
+            text = _extract_model_text(segment_result)
+            raw_results.append(
+                {
+                    "segment_index": segment_index,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "duration_ms": end_ms - start_ms,
+                    "file": str(segment_path),
+                    "result": segment_result,
+                }
+            )
+            if not text:
+                continue
+            records.append(
+                {
+                    "start": _ms_to_timestamp(start_ms),
+                    "end": _ms_to_timestamp(end_ms),
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "duration_ms": end_ms - start_ms,
+                    "chunk_index": segment_index,
+                    "text": text,
+                    "speaker": "",
+                    "source": "sensevoice_vad_segment",
+                    "precision": "segment",
+                    "index": segment_index,
+                }
+            )
+    finally:
+        temp_dir.cleanup()
+
+    if not records:
+        raise RuntimeError("SenseVoice VAD segment 转写未返回有效文本")
+    return {
+        "ok": True,
+        "text": "\n".join(str(item.get("text") or "").strip() for item in records if item.get("text")).strip(),
+        "timestamp_index": records,
+        "sentence_info": records,
+        "raw": raw_results,
+        "vad_result": vad_result,
+        "vad_segment_count": len(raw_segments),
+        "sensevoice_segment_count": len(segments),
     }
 
 
@@ -500,32 +792,59 @@ def _run_sensevoice(
             raise
 
     generate_kwargs: dict[str, object] = {
-        "input": str(input_file),
         "language": language,
         "use_itn": True,
         "batch_size_s": 60,
         "sentence_timestamp": True,
     }
-    result = model.generate(**generate_kwargs)
-
-    speaker_sentences = _extract_sentence_info(result)
-    output_text = _format_speaker_transcript(speaker_sentences) or _extract_model_text(result)
-    timestamp_index = _build_timestamp_index(speaker_sentences)
-    if not timestamp_index and output_text:
-        timestamp_index = [
-            {
-                "start": "",
-                "end": "",
-                "start_ms": "",
-                "end_ms": "",
-                "chunk_index": 0,
-                "text": output_text,
-                "speaker": "",
-                "source": "sensevoice",
-                "precision": "unavailable",
-                "index": 0,
-            }
-        ]
+    result: list[dict[str, object]] = []
+    speaker_sentences: list[dict[str, object]] = []
+    output_text = ""
+    sensevoice_timestamp_index: list[dict[str, object]] = []
+    timestamp_index_source = ""
+    sensevoice_vad_status = ""
+    try:
+        vad_payload = _run_sensevoice_vad_segments(
+            input_file=input_file,
+            sensevoice_model=model,
+            vad_model=DEFAULT_VAD_MODEL,
+            language=language,
+            allow_remote_model_lookup=allow_remote_model_lookup,
+        )
+        output_text = str(vad_payload.get("text") or "").strip()
+        speaker_sentences = (
+            vad_payload.get("sentence_info") if isinstance(vad_payload.get("sentence_info"), list) else []
+        )
+        sensevoice_timestamp_index = (
+            vad_payload.get("timestamp_index") if isinstance(vad_payload.get("timestamp_index"), list) else []
+        )
+        raw_results = vad_payload.get("raw") if isinstance(vad_payload.get("raw"), list) else []
+        result.extend(raw_results)
+        timestamp_index_source = "sensevoice_vad_segment"
+        sensevoice_vad_status = "完整音频 VAD segment + SenseVoice 分段转写完成。"
+    except Exception as exc:  # noqa: BLE001
+        sensevoice_vad_status = f"SenseVoice VAD segment 时间戳链路未完成，已转入 60 秒纯文本兜底: {exc}"
+        print(sensevoice_vad_status, file=sys.stderr)
+        chunk_temp_dir, chunks = _audio_file_chunks(input_file)
+        chunk_texts: list[str] = []
+        try:
+            for chunk_index, chunk_path in enumerate(chunks):
+                chunk_kwargs = dict(generate_kwargs)
+                chunk_kwargs["input"] = str(chunk_path)
+                chunk_result = model.generate(**chunk_kwargs)
+                result.append(
+                    {
+                        "chunk_index": chunk_index,
+                        "file": str(chunk_path),
+                        "result": chunk_result,
+                    }
+                )
+                chunk_text = _extract_model_text(chunk_result)
+                if chunk_text:
+                    chunk_texts.append(chunk_text)
+        finally:
+            chunk_temp_dir.cleanup()
+        output_text = "\n".join(chunk_texts).strip()
     auxiliary: dict[str, object] = {
         "engine": "",
         "model": "",
@@ -544,11 +863,28 @@ def _run_sensevoice(
             return 1
 
     stem = input_file.stem
+    paraformer_timestamp_index = (
+        auxiliary.get("timestamp_index") if isinstance(auxiliary.get("timestamp_index"), list) else []
+    )
+    timestamp_index = sensevoice_timestamp_index
+    if (
+        not timestamp_index
+        and paraformer_timestamp_index
+        and _timestamp_index_has_usable_time(paraformer_timestamp_index)
+    ):
+        timestamp_index = paraformer_timestamp_index
+        timestamp_index_source = "paraformer"
+
     if output_format in {"txt", "all"}:
         (output_dir / f"{stem}.txt").write_text(output_text + "\n", encoding="utf-8")
         if auxiliary.get("ok") and auxiliary.get("text"):
             (output_dir / f"{stem}.paraformer.txt").write_text(
                 str(auxiliary.get("text")).strip() + "\n",
+                encoding="utf-8",
+            )
+        if paraformer_timestamp_index:
+            (output_dir / f"{stem}.paraformer.timestamp_index.json").write_text(
+                json.dumps(paraformer_timestamp_index, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",
             )
     if timestamp_index:
@@ -564,11 +900,16 @@ def _run_sensevoice(
             "input": str(input_file),
             "text": output_text,
             "model_cache": _model_cache_report(),
-            "timestamp_detected": bool(speaker_sentences),
+            "timestamp_detected": _timestamp_index_has_usable_time(timestamp_index),
             "speakers": sorted({str(item.get("speaker")) for item in speaker_sentences if item.get("speaker")}),
             "sentence_info": speaker_sentences,
             "timestamp_index": timestamp_index,
             "timestamp_index_path": str(output_dir / f"{stem}.timestamp_index.json") if timestamp_index else "",
+            "timestamp_index_source": timestamp_index_source,
+            "sensevoice_timestamp_index": sensevoice_timestamp_index,
+            "sensevoice_vad_status": sensevoice_vad_status,
+            "paraformer_timestamp_detected": bool(auxiliary.get("timestamp_detected")),
+            "paraformer_timestamp_index": paraformer_timestamp_index,
             "auxiliary_engine": auxiliary.get("engine") or "",
             "auxiliary_model": auxiliary.get("model") or "",
             "auxiliary_text": auxiliary.get("text") or "",
@@ -669,11 +1010,14 @@ def main() -> int:
         models = report.get("models", {})
         sensevoice = models.get("sensevoice") if isinstance(models, dict) else {}
         paraformer = models.get("paraformer") if isinstance(models, dict) else {}
+        vad = models.get("vad") if isinstance(models, dict) else {}
         if (
             isinstance(sensevoice, dict)
             and sensevoice.get("complete")
             and isinstance(paraformer, dict)
             and paraformer.get("complete")
+            and isinstance(vad, dict)
+            and vad.get("complete")
         ):
             return 0
         return 1

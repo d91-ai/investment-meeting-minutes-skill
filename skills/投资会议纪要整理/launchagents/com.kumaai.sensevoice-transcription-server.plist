@@ -8,7 +8,7 @@
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>exec "${HOME}/.codex/skills/投资会议纪要整理/scripts/start_sensevoice_transcription_server.sh"</string>
+    <string>exec "${HOME}/.codex/skills/investment-meeting-minutes/scripts/start_sensevoice_transcription_server.sh"</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

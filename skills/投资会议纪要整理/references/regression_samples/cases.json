@@ -5,7 +5,7 @@
       "mode": "reference_output_contract",
       "check": "text_contains",
       "file": "../output_contract.md",
-      "required_terms": ["契约外逃逸标题", "sentence/phrase 级 anchor", "segment/chunk/minute 级范围"]
+      "required_terms": ["契约外逃逸标题", "sentence/phrase 级 anchor", "segment/chunk/minute 级范围", "音频转录为主源", "先写板块行"]
     },
     {
       "name": "导出命名使用会议系列和会议类型",
@@ -54,7 +54,7 @@
       "mode": "audio_text",
       "file": "audio_text.md",
       "require_audio_timestamps": true,
-      "required_terms": ["光模块", "800G", "存疑：英伟达供货节奏"]
+      "required_terms": ["光模块", "800G", "我还是觉得", "我不想只写成订单好转", "存疑：英伟达供货节奏"]
     },
     {
       "name": "音频无可靠时间戳样例",
@@ -126,7 +126,7 @@
       "mode": "review_missing_heading_warning",
       "source_mode": "document",
       "file": "review_missing_heading_warning.md",
-      "required_warning_terms": ["缺少相邻标的标题"],
+      "required_warning_terms": ["缺少相邻板块标题"],
       "required_terms": ["不应该阻断导出"]
     },
     {

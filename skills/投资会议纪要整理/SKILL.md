@@ -14,12 +14,13 @@ Use the fastest safe path for the source risk. The default path is a single main
 ## Stable Contract
 
 - Workflow after input archive: 转录 -> 校对 -> 识别 -> 联网核验 -> 编辑 -> 排版 -> 验证. Do not silently skip any step; when a step is not applicable, record `skipped_reason`, and when a step fails, record the failure reason and safest next action.
-- Source boundary: use only current-session materials as meeting-content sources. External sources must verify non-person business entities, codes, terms, and high-risk public facts before they are written as confirmed; they must not add meeting content.
+- Source boundary: use only current-session materials as meeting-content sources. In `audio_plus_document`, the original audio and its SenseVoice-based `aligned_transcript` are the primary content source; text/documents are cross-check material for speaker labels, doubtful wording, omissions, and conflicts, not a replacement body source. External sources must verify non-person business entities, codes, terms, and high-risk public facts before they are written as confirmed; they must not add meeting content.
 - ASR: use local SenseVoiceSmall as the primary transcript model and Paraformer-Large as auxiliary proofreading plus timestamp evidence when available. Do not switch to Whisper or another ASR. If the local ASR/timestamp chain cannot run, first diagnose and repair model cache, dependencies, device compatibility, memory, or chunking; use a text-only path only when the runtime cannot be restored and the user accepts that audio review is incomplete.
 - Final writer: the main workflow is the only writer and reviewer for final deliverables. It must perform transcript-quality, timestamp, speaker-boundary, source-fidelity, target-attribution, doubtful-item, and omission checks before export.
-- Run profile: prefer `fast_document` for short, clean document-only sources; use `standard` for ordinary meetings; use `strict_audio` for long audio, audio/document conflicts, or high-risk facts.
+- Run profile: prefer `fast_document` for short, clean document-only sources; use `standard` for ordinary document-only or ordinary audio-plus-document meetings; use `strict_audio` for audio-only, long audio, audio/document conflicts, or high-risk facts. For audio-plus-document meetings, `standard` still starts from audio transcription.
 - Meeting type: default to `多人复盘会`. Use `公司交流` only for a single-company special meeting. Use `专家交流` only for expert Q&A. Do not create `其他`.
 - Output format: follow `references/output_contract.md` for shared structure, ambiguity-table columns, and Word style; follow the matching meeting-type reference for body structure: `references/meeting_types/review_meeting.md`, `references/meeting_types/listed_company.md`, or `references/meeting_types/expert_call.md`.
+- Review-meeting subsection headings: write the sector line first, then the target line: `#### 【一级板块｜细分板块】` followed by `##### 【标的(代码)】`. If no explicit securities target exists, keep the target line empty as `##### 【】`.
 - Speaker headings: identify speaker titles from current-session context when the source provides enough evidence, such as self-introduction, moderator address, agenda role, Q&A role, or stable transcript labels. Write the identified name or role as the `###` heading. If a speaker cannot be identified reliably, keep the fallback heading as `### 发言人1`, `### 发言人2`, `### 发言人3`, etc. in actual first-appearance order.
 - Doubtful items: use one internal `doubtful_items` list as the source for verification, final table rows, and any same-stem verification sidecar. Keep final table columns in `references/output_contract.md`; keep process details in `references/verification_policy.md`.
 - Fidelity: `## 一、发言整理` is a source-aligned cleaned transcript by speaker, not a content summary, abstract, rewrite, interpretation, or third-person retelling. Preserve source perspective and pronouns such as `我`、`我们`、`个人觉得`; do not rewrite them into `发言人认为`、`专家表示`、`管理层表示`、`公司表示` unless those words appear in the source. The only allowed cleanup is deleting pure filler words, obvious ASR noise, meaningless repetitions, and repeated false starts.
@@ -30,7 +31,7 @@ Use the fastest safe path for the source risk. The default path is a single main
 ### Choose run profile
 
 - `fast_document`: use for short, clean document-only material with clear speakers and few/no uncertain entities. Skip ASR readiness checks, but do not skip the mandatory live verification pass for any non-person business entity or high-risk fact written as confirmed. Run local formatting validators before export.
-- `standard`: use for ordinary document-only or audio-plus-document work. Batch local entity/code candidate lookup first, then run mandatory live verification before confirmed writing. Run main-workflow checks for source quality, attribution, doubtful items, and omissions before export.
+- `standard`: use for ordinary document-only or audio-plus-document work. For audio-plus-document work, transcribe audio first, build the SenseVoice-based `aligned_transcript`, then use text/documents to cross-check speaker labels, missing clauses, doubtful terms, and conflicts. Batch local entity/code candidate lookup first, then run mandatory live verification before confirmed writing. Run main-workflow checks for source quality, attribution, doubtful items, and omissions before export.
 - `strict_audio`: use for audio-only, long/noisy meetings, audio/document conflicts, or high-risk facts. Run the relevant readiness profile before the expensive step.
 
 Before final writing, create process-only review notes when risk is non-trivial. Do not write these notes into the final note body. Record transcript-quality, timestamp, speaker-boundary, audio/document conflict, target-attribution, high-risk fact, doubtful-item, and omission findings that affect the final note.
@@ -42,7 +43,7 @@ Archive raw files before transcription or writing. Use `scripts/archive_raw_inpu
 Handle source modes:
 - `audio_only`: archive, then transcribe with SenseVoice.
 - `document_only`: archive, then arrange speaker turns from the provided text/document without summarizing, rewriting, or changing viewpoint.
-- `audio_plus_document`: archive both; use both as evidence and keep conflicts visible.
+- `audio_plus_document`: archive both; transcribe audio first and write from the audio-derived `aligned_transcript`; use text/documents only as cross-check material for speaker identity, term correction, omission detection, and conflict review. If document wording and audio transcription disagree, keep the audio wording unless audio is unclear and the document provides a same-session corroboration; unresolved conflicts stay in process notes or `doubtful_items`.
 
 Keep Chinese text files and generated Markdown/TXT/JSON/YAML as UTF-8 without BOM. In Python text I/O, pass `encoding="utf-8"`. If UTF-8 decoding fails or replacement characters appear, stop and report the affected file.
 
@@ -77,6 +78,8 @@ Build a process-only speaker map before final writing. Map raw labels such as `S
 
 When audio is long, noise is heavy, multiple-speaker boundaries are unclear, audio and document evidence conflict, or timestamp alignment matters for doubtful-item review, the main workflow must explicitly check transcript quality, speaker boundaries, timestamp anchors, ASR conflicts, and audio/document conflicts before final writing.
 
+Before final writing, run a source-restoration pass on the working transcript: compare each cleaned turn with its source span, restore omitted substantive clauses, and keep examples, reasons, hedge words, conditions, numbers, time points, actions, and speaker uncertainty unless they are clearly filler or ASR noise. If an intermediate draft is shorter or more polished than the source span, treat it as a checklist for omissions only and rewrite the paragraph from the source span.
+
 ### 3. Correct names and symbols
 
 Use references only when they match the uncertainty:
@@ -104,6 +107,7 @@ Preserve actual speech order, speaker perspective, original logic, uncertainty, 
 
 Before export, do a source-fidelity pass against the current-session transcript or document:
 - For each substantive paragraph, confirm it maps back to a source span from the same speaker turn.
+- For `audio_plus_document`, map final body paragraphs back to the audio-derived `aligned_transcript` first; use the document only to cross-check omissions, unclear words, speaker labels, and conflicts.
 - Preserve first-person and speaker-perspective wording when the source uses it; do not recast it into third-person attribution.
 - Keep long answers as lightly cleaned ordered prose. Split for readability only when the source naturally changes topic; do not replace them with `主要包括`、`核心观点`、`总结来看` style summaries, and do not add connective analysis that the speaker did not say.
 - If intermediate notes are more compressed than the source, use them only as omission or risk findings and write final prose from the source span.

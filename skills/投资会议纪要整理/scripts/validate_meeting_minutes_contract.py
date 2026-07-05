@@ -162,7 +162,7 @@ def validate_meeting_type_reference(markdown: str, meeting_type: str) -> list[st
             preview = "；".join(topic_headings[:4])
             errors.append(f"发言人标题不是标的或主题标题: {preview}")
         if "标的：" in body:
-            errors.append("多人复盘会小段标题不使用 标的： 前缀，应使用【标的(代码)】标题行")
+            errors.append("多人复盘会小段标题不使用 标的： 前缀，应使用【板块】标题行和【标的(代码)】标题行")
         if "后半段" in body:
             errors.append("多人复盘会同一发言人再次发言时保留同名标题，不使用（后半段）")
     elif normalized_meeting_type == "公司交流":
@@ -223,32 +223,32 @@ def review_meeting_heading_warnings(markdown: str, meeting_type: str) -> list[st
 
     warnings: list[str] = []
     current_speaker = ""
-    has_target_heading = False
     has_sector_heading = False
+    has_target_heading = False
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line or line == "---" or line.startswith("|"):
             continue
         if line.startswith("### "):
             current_speaker = line.removeprefix("### ").strip()
-            has_target_heading = False
             has_sector_heading = False
+            has_target_heading = False
             continue
         if line.startswith("#### "):
-            has_target_heading = True
-            has_sector_heading = False
+            has_sector_heading = True
+            has_target_heading = False
             continue
         if line.startswith("##### "):
-            has_sector_heading = True
+            has_target_heading = True
             continue
         if line.startswith("#"):
             continue
         speaker_hint = f"{current_speaker}：" if current_speaker else ""
         preview = line[:50]
-        if not has_target_heading:
-            warnings.append(f"多人复盘会正文段落缺少相邻标的标题，建议复核: {speaker_hint}{preview}")
-        elif not has_sector_heading:
+        if not has_sector_heading:
             warnings.append(f"多人复盘会正文段落缺少相邻板块标题，建议复核: {speaker_hint}{preview}")
+        elif not has_target_heading:
+            warnings.append(f"多人复盘会正文段落缺少相邻标的标题，建议复核: {speaker_hint}{preview}")
         if len(warnings) >= 4:
             break
     return warnings

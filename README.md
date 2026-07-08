@@ -10,7 +10,7 @@
 - 文稿会议：从已有转写稿、聊天记录或纪要草稿生成规范纪要。
 - 音频加文稿：同时使用录音和文字材料，保留冲突和存疑。
 - 公司名、代码、客户、供应商、术语、数字或时间存在不确定时，生成可复核的存疑表和可选 verification sidecar。
-- 已整理纪要需要脱敏或 RAG 入库时，使用 `skills/meeting-minutes-sanitizer`。
+- 已整理纪要需要脱敏或 RAG 入库时，使用独立仓库 `d91-ai/minute-sanitization-skill`。
 
 ## 输入与输出
 
@@ -49,7 +49,7 @@
 - `skills/投资会议纪要整理/references/meeting_types/`：多人复盘会、公司交流、专家交流的正文格式依据。
 - `skills/投资会议纪要整理/references/regression_samples/`：合成回归样例和负例。
 - `skills/投资会议纪要整理/scripts/`：归档、转录、校对、查询、验证和导出脚本。
-- `skills/meeting-minutes-sanitizer`：纪要脱敏和 RAG 入库准备 skill。
+- 纪要脱敏和 RAG 入库准备 skill 已迁移到独立仓库 `d91-ai/minute-sanitization-skill`。
 
 ## 处理流程
 

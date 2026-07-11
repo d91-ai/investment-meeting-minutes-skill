@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""Build deterministic MAS specialist task bundles for meeting minutes."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import uuid
+from pathlib import Path
+from typing import Any
+
+from validate_mas_artifacts import DOUBTFUL_REQUIRED_FIELDS, FORBIDDEN_FINAL_FIELDS, REQUIRED_FIELDS
+
+RUN_PROFILES = {"fast_document", "standard", "strict_audio"}
+SOURCE_MODES = {"document_only", "audio_only", "audio_plus_document"}
+MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
+SOURCE_SELECTION_STATUSES = {"not_applicable", "not_compared", "compared_clear", "conflict", "uncertain"}
+
+AUDIO_RISKS = {
+    "audio_input",
+    "long_audio",
+    "noisy_audio",
+    "unclear_speaker_boundaries",
+    "timestamp_alignment",
+    "strict_audio",
+}
+SOURCE_RECONCILIATION_RISKS = {
+    "audio_plus_document",
+    "source_conflict",
+    "primary_source_uncertain",
+}
+ENTITY_RISKS = {
+    "entity_verification",
+    "high_risk_facts",
+    "many_doubtful_items",
+    "company_codes",
+    "customers_suppliers",
+    "numbers_dates",
+}
+TARGET_RISKS = {
+    "target_attribution",
+    "multi_target",
+    "mixed_targets",
+    "positive_negative_views",
+}
+FIDELITY_RISKS = {
+    "fidelity_review",
+    "omission_risk",
+    "summary_compression",
+    "third_person_rewrite",
+    "prior_user_feedback",
+}
+
+ROLE_SPECS: dict[str, dict[str, Any]] = {
+    "transcript_audit": {
+        "role": "Transcript Auditor",
+        "dispatch_phase": "pre_draft",
+        "objective": "Audit ASR quality, speaker boundaries, timestamp anchors, and ASR conflicts.",
+        "inputs": [
+            "raw audio metadata",
+            "SenseVoice transcript",
+            "Paraformer auxiliary differences",
+            "timestamp_index",
+        ],
+        "checks": [
+            "ASR noise",
+            "long segment anomalies",
+            "speaker-boundary ambiguity",
+            "SenseVoice/Paraformer conflict",
+            "timestamp anchor reliability",
+        ],
+    },
+    "source_reconciliation": {
+        "role": "Source Reconciler",
+        "dispatch_phase": "pre_draft",
+        "objective": "Select and justify the primary body source from same-session materials.",
+        "inputs": [
+            "audio-derived aligned_transcript",
+            "provided document or transcript",
+            "same-session user corrections",
+            "source quality notes",
+        ],
+        "checks": [
+            "coverage",
+            "speaker order",
+            "verbatimness",
+            "timestamp evidence",
+            "omissions",
+            "source conflicts",
+        ],
+    },
+    "entity_verification_report": {
+        "role": "Entity Verifier",
+        "dispatch_phase": "pre_draft",
+        "objective": "Verify non-person business entities and update doubtful_items proposals.",
+        "inputs": [
+            "current-session source context",
+            "entity candidates",
+            "local code candidates",
+            "external evidence paths",
+        ],
+        "checks": [
+            "company names",
+            "stock codes",
+            "customers and suppliers",
+            "numbers and dates",
+            "industry terms",
+            "public high-risk facts",
+        ],
+        "secondary_artifacts": ["doubtful_items"],
+    },
+    "target_attribution_review": {
+        "role": "Target Attribution Reviewer",
+        "dispatch_phase": "draft_review",
+        "objective": "Review target headings, sector grouping, and positive/negative attribution.",
+        "inputs": [
+            "review-meeting draft body",
+            "source spans",
+            "entity verification status",
+        ],
+        "checks": [
+            "wrong grouping",
+            "missing positive targets",
+            "incidental targets in heading",
+            "negative targets in target line",
+            "non-source companies",
+        ],
+    },
+    "fidelity_review": {
+        "role": "Fidelity Reviewer",
+        "dispatch_phase": "draft_review",
+        "objective": "Review whether draft prose preserves source order, pronouns, and substance.",
+        "inputs": [
+            "draft Markdown",
+            "source spans",
+            "source_reconciliation",
+        ],
+        "checks": [
+            "summary compression",
+            "third-person rewrite",
+            "omitted reasons or numbers",
+            "merged speaker turns",
+            "speaker-order drift",
+        ],
+    },
+    "export_manifest": {
+        "role": "Contract Verifier",
+        "dispatch_phase": "final_verification",
+        "objective": "Verify encoding, Markdown contract, sidecar consistency, export status, and regressions.",
+        "inputs": [
+            "final Markdown",
+            "verification sidecar",
+            "timestamp_index",
+            "export logs",
+            "validator outputs",
+        ],
+        "checks": [
+            "UTF-8",
+            "Markdown contract",
+            "doubtful table",
+            "timestamp_index",
+            "verification sidecar",
+            "regression result",
+        ],
+    },
+}
+
+DISPATCH_PHASES: dict[str, dict[str, str]] = {
+    "pre_draft": {
+        "when": "After current-session source materials are prepared and before final-note drafting.",
+        "materials": "Audio/transcript/document excerpts, timestamp indexes, entity candidates, and source-quality notes relevant to the assigned role.",
+    },
+    "draft_review": {
+        "when": "After the main workflow has a draft and before final validation.",
+        "materials": "Draft Markdown excerpts plus source spans and validated process artifacts required by the assigned role.",
+    },
+    "final_verification": {
+        "when": "After final Markdown, sidecars, export logs, and validator outputs exist.",
+        "materials": "Final Markdown path, verification sidecar path, timestamp index, export logs, and validator/regression results.",
+    },
+}
+
+PHASE_ORDER = {phase: index for index, phase in enumerate(DISPATCH_PHASES)}
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, payload: Any) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
+def normalized_flags(flags: Any) -> list[str]:
+    if flags is None:
+        return []
+    if not isinstance(flags, list):
+        raise ValueError("risk_flags 必须是 JSON array")
+    return sorted({str(flag).strip() for flag in flags if str(flag).strip()})
+
+
+def validate_choice(name: str, value: str, allowed: set[str]) -> None:
+    if value not in allowed:
+        allowed_text = ", ".join(sorted(allowed))
+        raise ValueError(f"{name} 必须是以下之一: {allowed_text}")
+
+
+def normalized_source_selection_status(source_mode: str, value: Any) -> str:
+    status = str(value or "").strip()
+    if not status:
+        return "not_compared" if source_mode == "audio_plus_document" else "not_applicable"
+    validate_choice("source_selection_status", status, SOURCE_SELECTION_STATUSES)
+    if source_mode == "audio_plus_document" and status == "not_applicable":
+        return "not_compared"
+    if source_mode != "audio_plus_document" and status != "not_applicable":
+        raise ValueError("source_selection_status 仅适用于 audio_plus_document；其他 source_mode 请使用 not_applicable")
+    return status
+
+
+def infer_risk_flags(
+    run_profile: str,
+    source_mode: str,
+    risk_flags: list[str],
+    source_selection_status: str = "not_applicable",
+) -> list[str]:
+    risks = set(risk_flags)
+    if source_mode == "audio_only":
+        risks.update({"audio_input", "timestamp_alignment"})
+    if source_mode == "audio_plus_document":
+        if source_selection_status in {"not_compared", "uncertain"}:
+            risks.add("primary_source_uncertain")
+        elif source_selection_status == "conflict":
+            risks.update({"primary_source_uncertain", "source_conflict"})
+    if run_profile == "strict_audio":
+        risks.update({"audio_input", "strict_audio", "long_audio", "timestamp_alignment", "omission_risk"})
+    return sorted(risks)
+
+
+def should_use_mas(
+    run_profile: str,
+    source_mode: str,
+    risk_flags: list[str],
+    source_selection_status: str = "not_applicable",
+) -> bool:
+    risks = set(infer_risk_flags(run_profile, source_mode, risk_flags, source_selection_status))
+    if run_profile == "fast_document" and not risks:
+        return False
+    return bool(risks)
+
+
+def select_expected_artifacts(
+    run_profile: str,
+    source_mode: str,
+    meeting_type: str,
+    risk_flags: list[str],
+    source_selection_status: str = "not_applicable",
+) -> list[str]:
+    risks = set(infer_risk_flags(run_profile, source_mode, risk_flags, source_selection_status))
+    if not should_use_mas(run_profile, source_mode, risk_flags, source_selection_status):
+        return []
+
+    artifacts = {"source_manifest", "entity_verification_report", "doubtful_items", "fidelity_review", "export_manifest"}
+    if risks & AUDIO_RISKS or source_mode == "audio_plus_document":
+        artifacts.add("transcript_audit")
+    if source_mode == "audio_plus_document" or risks & SOURCE_RECONCILIATION_RISKS:
+        artifacts.add("source_reconciliation")
+    if risks & TARGET_RISKS or (meeting_type == "多人复盘会" and run_profile == "strict_audio"):
+        artifacts.add("target_attribution_review")
+    if risks & ENTITY_RISKS:
+        artifacts.add("entity_verification_report")
+        artifacts.add("doubtful_items")
+    if risks & FIDELITY_RISKS:
+        artifacts.add("fidelity_review")
+    return sorted(artifacts)
+
+
+def output_shape_for(
+    artifact_type: str,
+    secondary_artifacts: list[str],
+    identity: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    identity = identity or {}
+    if secondary_artifacts:
+        shape: dict[str, Any] = {
+            **identity,
+            "artifacts": {
+                artifact_type: {field: "<value>" for field in REQUIRED_FIELDS[artifact_type]},
+            }
+        }
+        for secondary in secondary_artifacts:
+            if secondary == "doubtful_items":
+                shape["artifacts"][secondary] = [{field: "<value>" for field in DOUBTFUL_REQUIRED_FIELDS}]
+        return shape
+    return {
+        **identity,
+        "artifact_type": artifact_type,
+        "artifact": {field: "<value>" for field in REQUIRED_FIELDS[artifact_type]},
+    }
+
+
+def prompt_for_task(artifact_type: str, spec: dict[str, Any], run_profile: str, source_mode: str) -> str:
+    required_fields = REQUIRED_FIELDS[artifact_type]
+    secondary = [str(item) for item in spec.get("secondary_artifacts", [])]
+    lines = [
+        "Use $investment-meeting-minutes for this process-only specialist task.",
+        f"Role: {spec['role']}.",
+        f"Run profile: {run_profile}; source mode: {source_mode}.",
+        f"Objective: {spec['objective']}",
+        "Do not write, modify, assemble, or export final Markdown.",
+        "Do not modify repository files or meeting-note files; return the requested process artifact only.",
+        "Use only current-session meeting materials as meeting-content evidence.",
+        "External sources may verify names, codes, terms, and public facts only.",
+        "Return only JSON. Do not include prose outside JSON.",
+        f"Primary artifact: {artifact_type}.",
+        f"Required fields: {', '.join(required_fields)}.",
+    ]
+    if "doubtful_items" in secondary:
+        lines.append(f"Also return doubtful_items with fields: {', '.join(DOUBTFUL_REQUIRED_FIELDS)}.")
+    if artifact_type == "transcript_audit":
+        lines.append("Set recommended_action to exactly one of: continue, repair_transcript, request_user.")
+        lines.append("Do not use continue when quality_flags, speaker_boundary_findings, or conflicts are non-empty.")
+    elif artifact_type == "source_reconciliation":
+        lines.append("When manual_review_required=false, primary_body_source and primary_source_reason must be non-empty.")
+    elif artifact_type == "entity_verification_report":
+        lines.append("Every items entry must appear in exactly one of confirmed_items or unresolved_items.")
+        lines.append("Do not copy local_candidate_paths into external_evidence_paths.")
+    elif artifact_type == "export_manifest":
+        lines.append("Return markdown_sha256 for markdown_path and set main_actions_verified as a boolean.")
+        lines.append("validators_run must contain objects with non-empty name and boolean ok; regression_result must contain boolean ok.")
+        lines.append("Set export_status to exactly one of: passed, failed, blocked.")
+    lines.append(f"Forbidden final-output fields: {', '.join(sorted(FORBIDDEN_FINAL_FIELDS))}.")
+    lines.append("If evidence is insufficient or conflicting, mark the item unresolved instead of guessing.")
+    return "\n".join(lines)
+
+
+def task_file_name(index: int, task: dict[str, Any]) -> str:
+    artifact_type = str(task["artifact_type"])
+    return f"{index:02d}-{artifact_type}.prompt.md"
+
+
+def prompt_markdown(bundle: dict[str, Any], task: dict[str, Any]) -> str:
+    artifact_type = str(task["artifact_type"])
+    dispatch_phase = str(task["dispatch_phase"])
+    phase = DISPATCH_PHASES[dispatch_phase]
+    output_shape = json.dumps(task["expected_output_shape"], ensure_ascii=False, indent=2)
+    return "\n".join(
+        [
+            f"# MAS Specialist Task: {task['role']}",
+            "",
+            "Use this as the exact prompt for one Codex subagent when subagents are available.",
+            "The main workflow remains the only final-note writer and final decision owner.",
+            "",
+            "## Run Context",
+            "",
+            f"- run_profile: `{bundle['run_profile']}`",
+            f"- source_mode: `{bundle['source_mode']}`",
+            f"- meeting_type: `{bundle['meeting_type']}`",
+            f"- artifact_type: `{artifact_type}`",
+            f"- dispatch_phase: `{dispatch_phase}`",
+            f"- run_id: `{bundle.get('run_id', '')}`",
+            f"- task_id: `{task.get('task_id', '')}`",
+            f"- artifact_owner: `{task.get('role', '')}`",
+            f"- phase_timing: {phase['when']}",
+            "",
+            "## Material Handoff",
+            "",
+            "The main workflow must attach only the role-relevant current-session materials for this subagent.",
+            f"Expected material class: {phase['materials']}",
+            "Do not use this prompt alone as meeting-content evidence.",
+            "Do not request or inspect unrelated repository files.",
+            "",
+            "## Prompt",
+            "",
+            "```text",
+            str(task["prompt"]),
+            "```",
+            "",
+            "## Expected JSON Shape",
+            "",
+            "```json",
+            output_shape,
+            "```",
+            "",
+        ]
+    )
+
+
+def build_task(artifact_type: str, run_profile: str, source_mode: str) -> dict[str, Any]:
+    spec = ROLE_SPECS[artifact_type]
+    secondary_artifacts = [str(item) for item in spec.get("secondary_artifacts", [])]
+    dispatch_phase = str(spec["dispatch_phase"])
+    task = {
+        "role": spec["role"],
+        "artifact_type": artifact_type,
+        "dispatch_phase": dispatch_phase,
+        "secondary_artifacts": secondary_artifacts,
+        "objective": spec["objective"],
+        "inputs": spec["inputs"],
+        "checks": spec["checks"],
+        "required_fields": REQUIRED_FIELDS[artifact_type],
+        "forbidden_final_fields": sorted(FORBIDDEN_FINAL_FIELDS),
+        "expected_output_shape": output_shape_for(artifact_type, secondary_artifacts),
+        "prompt": prompt_for_task(artifact_type, spec, run_profile, source_mode),
+        "material_handoff": DISPATCH_PHASES[dispatch_phase]["materials"],
+    }
+    if "doubtful_items" in secondary_artifacts:
+        task["secondary_required_fields"] = {"doubtful_items": DOUBTFUL_REQUIRED_FIELDS}
+    return task
+
+
+def bind_dispatch_identity(bundle: dict[str, Any]) -> dict[str, Any]:
+    bound = copy.deepcopy(bundle)
+    run_id = str(bound.get("run_id") or uuid.uuid4().hex)
+    bound["run_id"] = run_id
+    for index, task in enumerate(bound.get("tasks", []), start=1):
+        if not isinstance(task, dict):
+            continue
+        artifact_type = str(task.get("artifact_type") or "")
+        task_id = str(task.get("task_id") or f"{run_id}:{index:02d}:{artifact_type}")
+        dispatch_phase = str(task.get("dispatch_phase") or "")
+        owner = str(task.get("role") or "")
+        task.update(
+            {
+                "run_id": run_id,
+                "task_id": task_id,
+                "artifact_owner": owner,
+                "expected_output_shape": output_shape_for(
+                    artifact_type,
+                    [str(item) for item in task.get("secondary_artifacts", [])],
+                    identity={
+                        "run_id": run_id,
+                        "task_id": task_id,
+                        "dispatch_phase": dispatch_phase,
+                        "artifact_owner": owner,
+                    },
+                ),
+            }
+        )
+    return bound
+
+
+def dispatch_protocol() -> dict[str, Any]:
+    return {
+        "runtime": "codex_subagent_optional",
+        "dispatch": "Spawn one read-only/process-only subagent per generated task file only when that task's dispatch_phase is ready; otherwise use the prompts as a manual checklist.",
+        "parallelism": "Tasks in the same dispatch_phase may run in parallel after the main workflow has prepared role-relevant current-session materials.",
+        "phases": DISPATCH_PHASES,
+        "return_contract": "Each subagent returns only the requested JSON artifact. The main workflow validates and consumes artifacts.",
+        "main_workflow_after_return": [
+            "run_mas_phase_operator.py",
+            "create_mas_source_manifest.py",
+            "ingest_mas_artifact.py",
+            "collect_mas_artifacts.py",
+            "plan_mas_next_action.py",
+            "validate_mas_artifacts.py",
+            "summarize_mas_decisions.py",
+            "revise or mark doubtful only through the main workflow",
+            "run final Markdown validators",
+        ],
+    }
+
+
+def artifact_owners(expected_artifacts: list[str]) -> dict[str, str]:
+    owners: dict[str, str] = {}
+    for artifact in expected_artifacts:
+        if artifact == "source_manifest":
+            owners[artifact] = "Main Orchestrator"
+        elif artifact == "doubtful_items":
+            owners[artifact] = "Entity Verifier proposes; Main Orchestrator decides"
+        elif artifact in ROLE_SPECS:
+            owners[artifact] = str(ROLE_SPECS[artifact]["role"])
+        else:
+            owners[artifact] = "Main Orchestrator"
+    return owners
+
+
+def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
+    run_profile = str(request.get("run_profile") or "standard")
+    source_mode = str(request.get("source_mode") or "document_only")
+    meeting_type = str(request.get("meeting_type") or "多人复盘会")
+    validate_choice("run_profile", run_profile, RUN_PROFILES)
+    validate_choice("source_mode", source_mode, SOURCE_MODES)
+    validate_choice("meeting_type", meeting_type, MEETING_TYPES)
+
+    risk_flags = normalized_flags(request.get("risk_flags", request.get("risks", [])))
+    source_selection_status = normalized_source_selection_status(source_mode, request.get("source_selection_status"))
+    inferred_risks = infer_risk_flags(run_profile, source_mode, risk_flags, source_selection_status)
+    expected_artifacts = select_expected_artifacts(
+        run_profile,
+        source_mode,
+        meeting_type,
+        risk_flags,
+        source_selection_status,
+    )
+    task_artifacts = [
+        artifact
+        for artifact in expected_artifacts
+        if artifact not in {"source_manifest", "doubtful_items"}
+    ]
+    tasks = sorted(
+        (build_task(artifact, run_profile, source_mode) for artifact in task_artifacts),
+        key=lambda task: (PHASE_ORDER[str(task["dispatch_phase"])], str(task["artifact_type"])),
+    )
+
+    return {
+        "schema_version": "1.0",
+        "run_profile": run_profile,
+        "source_mode": source_mode,
+        "source_selection_status": source_selection_status,
+        "meeting_type": meeting_type,
+        "mas_required": should_use_mas(run_profile, source_mode, risk_flags, source_selection_status),
+        "risk_flags": inferred_risks,
+        "materials": request.get("materials", []),
+        "main_orchestrator": {
+            "final_writer_only": True,
+            "must_not_delegate": [
+                "final Markdown writing",
+                "archive/export side effects",
+                "final user-facing delivery wording",
+                "conflict decisions that require user confirmation",
+            ],
+            "decision_outputs": ["automatic_pass", "automatic_doubtful", "repair_required", "request_user"],
+        },
+        "expected_artifacts": expected_artifacts,
+        "artifact_owners": artifact_owners(expected_artifacts),
+        "dispatch_protocol": dispatch_protocol(),
+        "tasks": tasks,
+        "validation": {
+            "artifact_validator": "scripts/validate_mas_artifacts.py",
+            "required_artifacts": expected_artifacts,
+        },
+    }
+
+
+def validate_bundle(bundle: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    expected_artifacts = bundle.get("expected_artifacts")
+    tasks = bundle.get("tasks")
+    if bundle.get("schema_version") != "1.0":
+        errors.append("MAS task bundle schema_version 必须是 1.0")
+    if not isinstance(expected_artifacts, list):
+        errors.append("MAS task bundle expected_artifacts 必须是 JSON array")
+        expected_artifacts = []
+    if not isinstance(tasks, list):
+        errors.append("MAS task bundle tasks 必须是 JSON array")
+        tasks = []
+    dispatch = bundle.get("dispatch_protocol")
+    if bundle.get("mas_required") and not isinstance(dispatch, dict):
+        errors.append("MAS task bundle dispatch_protocol 必须是 JSON object")
+    owners = bundle.get("artifact_owners")
+    if expected_artifacts and not isinstance(owners, dict):
+        errors.append("MAS task bundle artifact_owners 必须是 JSON object")
+        owners = {}
+    if bundle.get("mas_required") and not tasks:
+        errors.append("MAS task bundle 启用 MAS 时必须包含 specialist tasks")
+    for artifact in expected_artifacts:
+        if str(artifact) not in owners:
+            errors.append(f"MAS task bundle artifact_owners 缺少 owner: {artifact}")
+
+    expected_set = {str(item) for item in expected_artifacts}
+    for task in tasks:
+        if not isinstance(task, dict):
+            errors.append("MAS task bundle task 必须是 JSON object")
+            continue
+        artifact_type = str(task.get("artifact_type") or "")
+        if artifact_type not in ROLE_SPECS:
+            errors.append(f"未知 MAS task artifact_type: {artifact_type}")
+        if artifact_type not in expected_set:
+            errors.append(f"task artifact_type 不在 expected_artifacts 中: {artifact_type}")
+        required_fields = task.get("required_fields")
+        if artifact_type in REQUIRED_FIELDS and required_fields != REQUIRED_FIELDS[artifact_type]:
+            errors.append(f"{artifact_type} task required_fields 与 artifact schema 不一致")
+        dispatch_phase = str(task.get("dispatch_phase") or "")
+        if dispatch_phase not in DISPATCH_PHASES:
+            errors.append(f"{artifact_type} task dispatch_phase 不合法: {dispatch_phase}")
+        if not task.get("material_handoff"):
+            errors.append(f"{artifact_type} task 缺少 material_handoff")
+        prompt = str(task.get("prompt") or "")
+        if "Do not write, modify, assemble, or export final Markdown." not in prompt:
+            errors.append(f"{artifact_type} task prompt 缺少终稿写作边界")
+        if "Return only JSON" not in prompt:
+            errors.append(f"{artifact_type} task prompt 缺少 JSON-only 输出要求")
+        if "Do not modify repository files or meeting-note files" not in prompt:
+            errors.append(f"{artifact_type} task prompt 缺少文件写入边界")
+    return errors
+
+
+def write_dispatch_files(bundle: dict[str, Any], task_dir: Path) -> dict[str, Any]:
+    task_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = task_dir / "artifacts"
+    if artifact_dir.exists() and any(artifact_dir.glob("*.json")):
+        raise ValueError(
+            "task_dir already contains artifact JSON files; use a fresh dispatch directory "
+            "or finish/repair the existing MAS run before generating a new bundle"
+        )
+    bundle = bind_dispatch_identity(bundle)
+    bundle_path = task_dir / "mas_task_bundle.json"
+    write_json(bundle_path, bundle)
+
+    task_files: list[dict[str, str]] = []
+    for index, task in enumerate(bundle.get("tasks", []), start=1):
+        if not isinstance(task, dict):
+            continue
+        task_path = task_dir / task_file_name(index, task)
+        write_text(task_path, prompt_markdown(bundle, task))
+        task_files.append(
+            {
+                "role": str(task.get("role") or ""),
+                "run_id": str(bundle.get("run_id") or ""),
+                "task_id": str(task.get("task_id") or ""),
+                "artifact_owner": str(task.get("artifact_owner") or task.get("role") or ""),
+                "artifact_type": str(task.get("artifact_type") or ""),
+                "dispatch_phase": str(task.get("dispatch_phase") or ""),
+                "secondary_artifacts": [str(item) for item in task.get("secondary_artifacts", [])],
+                "path": task_path.name,
+            }
+        )
+
+    manifest = {
+        "schema_version": "1.0",
+        "run_id": str(bundle.get("run_id") or ""),
+        "bundle_file": bundle_path.name,
+        "mas_required": bool(bundle.get("mas_required")),
+        "task_count": len(task_files),
+        "task_files": task_files,
+        "dispatch_phases": DISPATCH_PHASES,
+        "artifact_collection": {
+            "artifact_dir": "artifacts",
+            "collector": "scripts/collect_mas_artifacts.py",
+            "summary_file": "mas_run_summary.json",
+            "combined_artifacts_file": "mas_artifacts_collected.json",
+        },
+        "artifact_owners": bundle.get("artifact_owners", {}),
+        "dispatch_protocol": bundle.get("dispatch_protocol", {}),
+        "validation": bundle.get("validation", {}),
+    }
+    manifest_path = task_dir / "dispatch_manifest.json"
+    write_json(manifest_path, manifest)
+    return {
+        "task_dir": str(task_dir),
+        "bundle_file": str(bundle_path),
+        "manifest_file": str(manifest_path),
+        "task_files": [str(task_dir / item["path"]) for item in task_files],
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="生成 MAS specialist task bundle")
+    parser.add_argument("--request-json", help="包含 run_profile/source_mode/risk_flags 的 JSON 请求")
+    parser.add_argument("--run-profile", choices=sorted(RUN_PROFILES), default=None)
+    parser.add_argument("--source-mode", choices=sorted(SOURCE_MODES), default=None)
+    parser.add_argument("--meeting-type", choices=sorted(MEETING_TYPES), default=None)
+    parser.add_argument("--risk", action="append", default=[], help="风险标记，可重复")
+    parser.add_argument("--out", help="写入 JSON 文件；默认输出到 stdout")
+    parser.add_argument("--task-dir", help="写入 Codex-ready subagent prompt 文件和 dispatch manifest")
+    args = parser.parse_args()
+
+    try:
+        request: dict[str, Any] = {}
+        if args.request_json:
+            payload = read_json(Path(args.request_json))
+            if not isinstance(payload, dict):
+                raise ValueError("request-json 顶层必须是 JSON object")
+            request.update(payload)
+        if args.run_profile:
+            request["run_profile"] = args.run_profile
+        if args.source_mode:
+            request["source_mode"] = args.source_mode
+        if args.meeting_type:
+            request["meeting_type"] = args.meeting_type
+        if args.risk:
+            request["risk_flags"] = normalized_flags(request.get("risk_flags", [])) + normalized_flags(args.risk)
+
+        bundle = build_bundle_from_request(request)
+        errors = validate_bundle(bundle)
+        if errors:
+            print(json.dumps({"ok": False, "errors": errors}, ensure_ascii=False, indent=2))
+            return 1
+        dispatch_files: dict[str, Any] | None = None
+        if args.task_dir:
+            dispatch_files = write_dispatch_files(bundle, Path(args.task_dir))
+        output_payload = dict(bundle)
+        if dispatch_files:
+            output_payload["dispatch_files"] = dispatch_files
+        if args.out:
+            write_json(Path(args.out), output_payload)
+        if not args.out:
+            print(json.dumps(output_payload, ensure_ascii=False, indent=2))
+        return 0
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        print(json.dumps({"ok": False, "errors": [f"MAS task bundle 生成失败: {exc}"]}, ensure_ascii=False, indent=2))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

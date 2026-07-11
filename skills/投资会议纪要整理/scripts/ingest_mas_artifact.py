@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from collect_mas_artifacts import PHASE_ORDER
-from validate_mas_artifacts import artifact_mapping, read_json, validate_dispatch_identity, validate_payload
+from validate_mas_artifacts import (
+    MAIN_OWNED_ARTIFACTS,
+    artifact_mapping,
+    read_json,
+    validate_dispatch_identity,
+    validate_payload,
+)
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -111,6 +117,11 @@ def ingest_mas_artifact(
             errors.append(str(error))
     warnings = [str(warning) for warning in validation.get("warnings", [])]
     artifact_types = sorted(str(artifact_type) for artifact_type in artifacts)
+    main_owned_types = sorted(set(artifact_types) & MAIN_OWNED_ARTIFACTS)
+    if main_owned_types:
+        errors.append(
+            "subagent ingest 不接受 Main Orchestrator 自有 artifact: " + ", ".join(main_owned_types)
+        )
     written_artifacts: list[dict[str, str]] = []
     repair_history_file = ""
     ingest_status = "written"

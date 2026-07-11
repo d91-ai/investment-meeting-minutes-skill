@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from build_mas_task_bundle import build_bundle_from_request, validate_bundle, write_dispatch_files
-from collect_mas_artifacts import collect_mas_run, required_artifacts_for_phase
+from collect_mas_artifacts import collect_mas_run, merge_artifact_files, required_artifacts_for_phase
 from record_mas_main_actions import record_main_actions
 from validate_mas_artifacts import file_sha256
 
@@ -28,16 +28,75 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def synthetic_final_markdown(artifacts: dict[str, Any]) -> str:
+    doubtful_items = artifacts.get("doubtful_items")
+    first = (
+        doubtful_items[0]
+        if isinstance(doubtful_items, list) and doubtful_items and isinstance(doubtful_items[0], dict)
+        else None
+    )
+    lines = [
+        "# 投资会议纪要｜合成 MAS dry-run",
+        "",
+        "**会议日期**：2026-07-11",
+        "**整理时间**：2026-07-11",
+        "**会议标题**：合成 MAS dry-run 会议",
+        "**会议类型**：多人复盘会",
+        "**会议系列**：合成回归",
+        "",
+        "---",
+        "",
+        "## 一、发言整理",
+        "",
+        "### 发言人1",
+        "",
+        "#### 【科技｜合成回归】",
+        "",
+    ]
+    if first is None:
+        lines.append("我按当前会话原文保留这段合成回归内容。")
+    else:
+        raw = str(first.get("原始表述") or "合成存疑词").replace("|", "\\|")
+        current = str(first.get("当前判断") or "待人工确认").replace("|", "\\|")
+        candidate = str(first.get("候选项") or "").replace("|", "\\|")
+        lines.extend(
+            [
+                f"我在当前会话中提到 **{raw}**，需要保留原始存疑。",
+                "",
+                "## 二、存疑与待确认",
+                "",
+                "| 原始表述 | 当前判断 | 候选项 | 人工确认 |",
+                "| --- | --- | --- | --- |",
+                f"| {raw} | {current} | {candidate} | |",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def synthetic_verification_payload(artifacts: dict[str, Any]) -> dict[str, Any]:
+    doubtful_items = artifacts.get("doubtful_items")
+    records = [
+        copy.deepcopy(item)
+        for item in doubtful_items
+        if isinstance(doubtful_items, list)
+        and isinstance(item, dict)
+        and item.get("是否需要 sidecar") is True
+    ] if isinstance(doubtful_items, list) else []
+    return {"records": records}
+
+
 def can_overwrite_task_dir(task_dir: Path) -> bool:
     resolved = task_dir.expanduser().resolve()
     temp_root = Path(tempfile.gettempdir()).resolve()
-    if (resolved / DRY_RUN_MARKER).exists():
-        return True
     if temp_root not in resolved.parents and resolved != temp_root:
         return False
     if not resolved.name.startswith("mas-"):
         return False
-    return (resolved / "mas_task_bundle.json").exists() or (resolved / "dispatch_manifest.json").exists()
+    return (
+        (resolved / DRY_RUN_MARKER).exists()
+        or (resolved / "mas_task_bundle.json").exists()
+        or (resolved / "dispatch_manifest.json").exists()
+    )
 
 
 def load_fixture_artifacts(path: Path) -> dict[str, Any]:
@@ -125,23 +184,10 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
     bundle = bound_bundle
     artifact_dir = task_dir / "artifacts"
     synthetic_markdown = task_dir / "synthetic-final.md"
-    synthetic_markdown.write_text("# Synthetic MAS final\n\nvalidated fixture content\n", encoding="utf-8")
+    synthetic_markdown.write_text(synthetic_final_markdown(fixture_artifacts), encoding="utf-8")
     write_json(
         task_dir / "synthetic.verification.json",
-        {
-            "records": [
-                {
-                    "原始表述": "某某科技",
-                    "存疑类型": "公司或证券标的",
-                    "当前判断": "待人工确认",
-                    "候选项": "候选科技(000001.SZ)",
-                    "是否需要 sidecar": True,
-                    "上下文依据": "synthetic dry-run",
-                    "检索/证据路径": "exchange_disclosure",
-                    "最终处理": "正文保留存疑标记",
-                }
-            ]
-        },
+        synthetic_verification_payload(fixture_artifacts),
     )
     emitted_artifacts: set[str] = set()
     artifact_files: list[dict[str, str]] = []
@@ -209,9 +255,14 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
     combined_path = task_dir / "mas_artifacts_collected.json"
 
     collector_ok = all(bool(phase.get("collector_ok")) for phase in phase_results) and bool(final_summary.get("ok"))
-    combined_payload: dict[str, Any] = {
-        "artifacts": {key: fixture_artifacts[key] for key in sorted(emitted_artifacts)}
-    }
+    source_paths = [
+        Path(str(item.get("path") or ""))
+        for item in final_summary.get("artifact_sources", [])
+        if isinstance(item, dict) and item.get("path")
+    ]
+    combined_artifacts, _, combined_errors, _ = merge_artifact_files(source_paths)
+    errors.extend(combined_errors)
+    combined_payload: dict[str, Any] = {"artifacts": combined_artifacts}
     if errors or not collector_ok:
         combined_payload.update(
             {

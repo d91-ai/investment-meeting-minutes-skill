@@ -72,12 +72,10 @@ MAS 手动 walkthrough 使用唯一临时目录，不作为一次性全绿 valid
 
 ```bash
 MAS_DISPATCH="$(mktemp -d /tmp/mas-dispatch.XXXXXX)"
-python3 skills/投资会议纪要整理/scripts/build_mas_task_bundle.py --request-json skills/投资会议纪要整理/references/regression_samples/mas_task_request_audio_plus_document.json --task-dir "$MAS_DISPATCH"
-python3 skills/投资会议纪要整理/scripts/create_mas_source_manifest.py --request-json skills/投资会议纪要整理/references/regression_samples/mas_task_request_audio_plus_document.json --task-dir "$MAS_DISPATCH" --json
-python3 skills/投资会议纪要整理/scripts/ingest_mas_artifact.py skills/投资会议纪要整理/references/regression_samples/mas_subagent_return_source_reconciliation_valid.json --task-dir "$MAS_DISPATCH" --through-phase pre_draft --json
-python3 skills/投资会议纪要整理/scripts/collect_mas_artifacts.py "$MAS_DISPATCH" --through-phase pre_draft --out "$MAS_DISPATCH/mas_run_summary.json" --combined-out "$MAS_DISPATCH/mas_artifacts_collected.json" --json
-python3 skills/投资会议纪要整理/scripts/plan_mas_next_action.py --summary-json "$MAS_DISPATCH/mas_run_summary.json" --json
+python3 skills/投资会议纪要整理/scripts/run_mas_phase_operator.py --request-json skills/投资会议纪要整理/references/regression_samples/mas_task_request_audio_plus_document.json --task-dir "$MAS_DISPATCH" --through-phase pre_draft --auto-source-manifest --json
 ```
+
+首轮 operator 会生成绑定当前 `run_id`/`task_id` 的 prompt 和派发清单，并停在待收集 specialist 返回的状态。不要把仓库内固定 fixture 直接当成这次 run 的返回值；subagent 必须按本次 prompt 的 identity 返回，再用 `run_mas_phase_operator.py --task-dir "$MAS_DISPATCH" --return-json RETURN.json --through-phase pre_draft --json` 继续。
 
 `create_mas_source_manifest.py` 生成主流程自有 `source_manifest` artifact，默认只记录材料清单和未确认归档状态；真实归档状态仍由主流程确认。
 

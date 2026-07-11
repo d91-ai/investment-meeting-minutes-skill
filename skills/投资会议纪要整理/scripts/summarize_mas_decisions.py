@@ -10,7 +10,7 @@ from typing import Any
 
 from validate_mas_artifacts import artifact_mapping, read_json, validate_payload
 
-REQUEST_USER_MARKERS = ("请求人工", "请求用户", "用户确认")
+REQUEST_USER_PREFIXES = ("请求人工确认", "请求用户确认", "需人工确认", "需用户确认")
 
 
 def as_list(value: Any) -> list[Any]:
@@ -25,12 +25,17 @@ def has_items(value: Any) -> bool:
     return bool(as_list(value))
 
 
-def text_contains_marker(value: Any, markers: tuple[str, ...] = REQUEST_USER_MARKERS) -> bool:
-    if isinstance(value, dict):
-        return any(text_contains_marker(child, markers) for child in value.values())
-    if isinstance(value, list):
-        return any(text_contains_marker(child, markers) for child in value)
-    return any(marker in str(value) for marker in markers)
+def doubtful_items_request_user(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        for field in ("当前判断", "最终处理"):
+            text = str(item.get(field) or "").strip()
+            if text.startswith(REQUEST_USER_PREFIXES):
+                return True
+    return False
 
 
 def add_action(actions: list[str], action: str) -> None:
@@ -134,7 +139,7 @@ def summarize_payload(payload: Any, required_artifacts: list[str] | None = None)
     if has_items(doubtful_items):
         reasons.append("doubtful_items_present")
         add_action(actions, "derive_final_doubtful_table_from_doubtful_items")
-        if text_contains_marker(doubtful_items):
+        if doubtful_items_request_user(doubtful_items):
             request_user = True
             reasons.append("doubtful_items_request_user_confirmation")
             add_action(actions, "ask_user_only_for_flagged_doubtful_items")
@@ -194,10 +199,10 @@ def summarize_payload(payload: Any, required_artifacts: list[str] | None = None)
             add_action(actions, "repair_export_or_validator_failure")
             repair_required = True
 
-    if request_user:
-        decision = "request_user"
-    elif repair_required:
+    if repair_required:
         decision = "repair_required"
+    elif request_user:
+        decision = "request_user"
     elif reasons:
         decision = "automatic_doubtful"
     else:

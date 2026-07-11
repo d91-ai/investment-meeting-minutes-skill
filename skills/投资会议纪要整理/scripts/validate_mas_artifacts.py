@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import re
+import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 REQUIRED_FIELDS: dict[str, list[str]] = {
     "source_manifest": [
@@ -94,6 +97,7 @@ DOUBTFUL_REQUIRED_FIELDS = [
     "最终处理",
 ]
 ALLOWED_DOUBTFUL_TYPES = {"人名", "说话人身份", "公司或证券标的", "行业术语", "数字或时间", "其他业务事实"}
+NON_BUSINESS_DOUBTFUL_TYPES = {"人名", "说话人身份"}
 FORBIDDEN_FINAL_FIELDS = {"final_markdown", "markdown_body", "final_note", "final_body"}
 BOOLEAN_FIELD_RULES: dict[str, list[str]] = {
     "source_manifest": ["archive_allowed"],
@@ -153,11 +157,77 @@ STRING_FIELD_RULES: dict[str, list[str]] = {
         "source_artifact_digest",
     ],
 }
+OBJECT_FIELD_RULES: dict[str, list[str]] = {
+    "entity_verification_report": ["confirmed_item_evidence_paths"],
+    "export_manifest": ["regression_result"],
+}
+POSITIVE_INTEGER_FIELD_RULES: dict[str, list[str]] = {
+    "target_attribution_review": ["segments_reviewed"],
+    "fidelity_review": ["paragraphs_reviewed"],
+}
 TRANSCRIPT_ACTIONS = {"continue", "repair_transcript", "request_user"}
 EXPORT_STATUSES = {"passed", "failed", "blocked"}
+SOURCE_MODES = {"document_only", "audio_only", "audio_plus_document"}
+ARCHIVE_STATUSES = {"not_started", "completed", "skipped", "skipped_for_fixture", "failed"}
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-EXTERNAL_SOURCE_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{1,120}$")
+PUBLIC_SOURCE_IDS = {
+    "a_stock_data_live",
+    "cninfo",
+    "company_website",
+    "exchange_disclosure",
+    "professional_database",
+    "regulatory_disclosure",
+}
+REQUIRED_VALIDATOR_NAMES = {"validate_utf8_text.py", "validate_meeting_minutes_contract.py"}
+REGRESSION_VALIDATOR_NAME = "run_meeting_minutes_regression.py"
 MAIN_OWNED_ARTIFACTS = {"source_manifest", "main_action_receipt"}
+SENSITIVE_QUERY_KEYS = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "awsaccesskeyid",
+    "bearer",
+    "client_secret",
+    "credential",
+    "credentials",
+    "key",
+    "googleaccessid",
+    "jwt",
+    "password",
+    "passwd",
+    "private_key",
+    "pwd",
+    "secret",
+    "session",
+    "sessionid",
+    "sig",
+    "signature",
+    "token",
+}
+SENSITIVE_QUERY_SUFFIXES = (
+    "auth",
+    "credential",
+    "credentials",
+    "jwt",
+    "key",
+    "password",
+    "passwd",
+    "secret",
+    "session",
+    "sig",
+    "signature",
+    "token",
+)
+SENSITIVE_QUERY_COMPACT_KEYS = {
+    re.sub(r"[^a-z0-9]", "", key.lower())
+    for key in SENSITIVE_QUERY_KEYS
+} | {
+    "awsaccesskeyid",
+    "googleaccessid",
+    "xgoogsignature",
+}
 
 
 def has_items(value: Any) -> bool:
@@ -174,6 +244,51 @@ def as_list(value: Any) -> list[Any]:
     if value in (None, ""):
         return []
     return [value]
+
+
+def is_public_evidence_url(value: str) -> bool:
+    if any(char.isspace() for char in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return False
+    hostname = parsed.hostname.lower().rstrip(".")
+    if hostname == "localhost" or hostname.endswith((".localhost", ".local", ".internal", ".lan")):
+        return False
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            address = ipaddress.ip_address(socket.inet_aton(hostname))
+        except OSError:
+            address = None
+    if address is not None and any(
+        (
+            address.is_private,
+            address.is_loopback,
+            address.is_link_local,
+            address.is_multicast,
+            address.is_reserved,
+            address.is_unspecified,
+        )
+    ):
+        return False
+    raw_query_keys = {key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    for raw_key in raw_query_keys:
+        camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", raw_key)
+        normalized = re.sub(r"[^a-z0-9]+", "_", camel_split.lower()).strip("_")
+        compact = re.sub(r"[^a-z0-9]", "", raw_key.lower())
+        if (
+            normalized in SENSITIVE_QUERY_KEYS
+            or compact in SENSITIVE_QUERY_COMPACT_KEYS
+            or normalized.startswith(("x_amz_", "x_goog_"))
+            or normalized.endswith(tuple(f"_{suffix}" for suffix in SENSITIVE_QUERY_SUFFIXES))
+        ):
+            return False
+    return True
 
 
 def read_json(path: Path) -> Any:
@@ -260,8 +375,16 @@ def validate_dispatch_identity(
         expected_task_ids = {f"{expected_run_id}:main:{artifact_type}" for artifact_type in artifact_types}
         if len(expected_task_ids) != 1 or task_id not in expected_task_ids:
             errors.append("Main-owned MAS artifact task_id 与当前 run/artifact 不匹配")
-        if dispatch_phase not in {"pre_draft", "draft_review"}:
-            errors.append("Main-owned MAS artifact dispatch_phase 不合法")
+        expected_phase_by_type = {
+            "source_manifest": "pre_draft",
+            "main_action_receipt": "draft_review",
+        }
+        expected_phases = {expected_phase_by_type[artifact_type] for artifact_type in artifact_types}
+        if len(expected_phases) != 1 or dispatch_phase not in expected_phases:
+            errors.append(
+                "Main-owned MAS artifact dispatch_phase 不匹配: "
+                f"expected={sorted(expected_phases)} actual={dispatch_phase}"
+            )
         if through_phase and phase_order:
             if dispatch_phase not in phase_order or through_phase not in phase_order:
                 errors.append("Main-owned MAS artifact phase 无法与 through_phase 比较")
@@ -438,6 +561,38 @@ def validate_field_types(artifact_type: str, artifact: Any) -> list[str]:
     for field in STRING_FIELD_RULES.get(artifact_type, []):
         if field in artifact and not isinstance(artifact[field], str):
             errors.append(f"{artifact_type}.{field} 必须是 string")
+    for field in OBJECT_FIELD_RULES.get(artifact_type, []):
+        if field in artifact and not isinstance(artifact[field], dict):
+            errors.append(f"{artifact_type}.{field} 必须是 JSON object")
+    for field in POSITIVE_INTEGER_FIELD_RULES.get(artifact_type, []):
+        value = artifact.get(field)
+        if field in artifact and (
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        ):
+            errors.append(f"{artifact_type}.{field} 必须是正整数")
+    return errors
+
+
+def validate_source_manifest(artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    errors: list[str] = []
+    if artifact.get("source_mode") not in SOURCE_MODES:
+        errors.append("source_manifest.source_mode 必须是固定枚举值")
+    if artifact.get("archive_status") not in ARCHIVE_STATUSES:
+        errors.append("source_manifest.archive_status 必须是固定枚举值")
+    if artifact.get("archive_allowed") is False and artifact.get("archive_status") == "completed":
+        errors.append("source_manifest archive_allowed=false 时不得报告 archive_status=completed")
+    materials = artifact.get("materials")
+    if isinstance(materials, list):
+        if not materials:
+            errors.append("source_manifest.materials 不得为空")
+        for index, material in enumerate(materials, start=1):
+            if not isinstance(material, dict):
+                errors.append(f"source_manifest.materials 第 {index} 项必须是 JSON object")
+                continue
+            if not str(material.get("kind") or "").strip() or not str(material.get("name") or "").strip():
+                errors.append(f"source_manifest.materials 第 {index} 项必须包含非空 kind 和 name")
     return errors
 
 
@@ -452,6 +607,10 @@ def validate_transcript_audit(artifact: Any) -> list[str]:
         ]
     else:
         errors = []
+    if not str(artifact.get("asr_primary") or "").strip():
+        errors.append("transcript_audit.asr_primary 不得为空")
+    if not str(artifact.get("timestamp_index_status") or "").strip():
+        errors.append("transcript_audit.timestamp_index_status 不得为空")
     if action == "continue" and (
         has_items(artifact.get("quality_flags"))
         or has_items(artifact.get("speaker_boundary_findings"))
@@ -520,10 +679,10 @@ def validate_entity_verification_report(artifact: Any) -> list[str]:
             + ", ".join(sorted(reused_evidence))
         )
     for evidence in sorted(external_evidence_paths):
-        is_url = evidence.startswith(("http://", "https://")) and " " not in evidence
-        if not is_url and not EXTERNAL_SOURCE_ID.fullmatch(evidence):
+        is_url = is_public_evidence_url(evidence)
+        if not is_url and evidence not in PUBLIC_SOURCE_IDS:
             errors.append(
-                "entity_verification_report external_evidence_paths 必须是 http(s) URL 或公开 source ID: "
+                "entity_verification_report external_evidence_paths 必须是公开 HTTPS URL 或公开 source ID（受支持枚举）: "
                 + evidence
             )
     if has_items(artifact.get("confirmed_items")) and not has_items(artifact.get("external_evidence_paths")):
@@ -569,9 +728,26 @@ def validate_export_manifest(artifact: Any) -> list[str]:
         for item in validators
     ):
         errors.append("export_manifest.validators_run 每项必须包含非空 name 和 boolean ok")
+    else:
+        validator_names = {str(item.get("name") or "").strip() for item in validators}
+        missing_validators = sorted(REQUIRED_VALIDATOR_NAMES - validator_names)
+        unknown_validators = sorted(validator_names - REQUIRED_VALIDATOR_NAMES)
+        if missing_validators:
+            errors.append("export_manifest.validators_run 缺少必需 validator: " + ", ".join(missing_validators))
+        if unknown_validators:
+            errors.append("export_manifest.validators_run 包含未知 validator: " + ", ".join(unknown_validators))
     regression = artifact.get("regression_result")
     if not isinstance(regression, dict) or not isinstance(regression.get("ok"), bool):
         errors.append("export_manifest.regression_result 必须包含 boolean ok")
+    elif (
+        regression.get("name") != REGRESSION_VALIDATOR_NAME
+        or not isinstance(regression.get("case_count"), int)
+        or isinstance(regression.get("case_count"), bool)
+        or int(regression.get("case_count")) <= 0
+    ):
+        errors.append(
+            "export_manifest.regression_result 必须包含 name=run_meeting_minutes_regression.py 和正整数 case_count"
+        )
     if artifact.get("export_status") not in EXPORT_STATUSES:
         errors.append("export_manifest.export_status 必须是以下之一: " + ", ".join(sorted(EXPORT_STATUSES)))
     return errors
@@ -611,11 +787,58 @@ def validate_doubtful_items(value: Any) -> list[str]:
         if doubtful_type not in ALLOWED_DOUBTFUL_TYPES:
             allowed = ", ".join(sorted(ALLOWED_DOUBTFUL_TYPES))
             errors.append(f"doubtful_items 第 {index + 1} 条存疑类型必须为固定枚举值: {allowed}")
+        sidecar_value = item.get("是否需要 sidecar")
+        if not isinstance(sidecar_value, bool):
+            errors.append(f"doubtful_items 第 {index + 1} 条是否需要 sidecar 必须是 boolean")
+        elif doubtful_type in NON_BUSINESS_DOUBTFUL_TYPES and sidecar_value:
+            errors.append(f"doubtful_items 第 {index + 1} 条人名或说话人身份不得进入 sidecar")
+        elif doubtful_type in ALLOWED_DOUBTFUL_TYPES - NON_BUSINESS_DOUBTFUL_TYPES and not sidecar_value:
+            errors.append(f"doubtful_items 第 {index + 1} 条非人名业务存疑必须进入 sidecar")
+        for field in DOUBTFUL_REQUIRED_FIELDS:
+            if field == "是否需要 sidecar":
+                continue
+            if field in item and not isinstance(item[field], str):
+                errors.append(f"doubtful_items 第 {index + 1} 条 {field} 必须是 string")
+        for field in ("原始表述", "当前判断", "上下文依据", "检索/证据路径", "最终处理"):
+            if isinstance(item.get(field), str) and not item[field].strip():
+                errors.append(f"doubtful_items 第 {index + 1} 条 {field} 不得为空")
+    return errors
+
+
+def validate_cross_artifact_consistency(artifacts: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    doubtful_items = artifacts.get("doubtful_items")
+    doubtful_raw = {
+        str(item.get("原始表述") or "").strip()
+        for item in doubtful_items
+        if isinstance(doubtful_items, list) and isinstance(item, dict) and str(item.get("原始表述") or "").strip()
+    } if isinstance(doubtful_items, list) else set()
+    entity_report = artifacts.get("entity_verification_report")
+    if isinstance(entity_report, dict) and "doubtful_items" in artifacts:
+        unresolved = {
+            str(item).strip()
+            for item in as_list(entity_report.get("unresolved_items"))
+            if str(item).strip()
+        }
+        missing = sorted(unresolved - doubtful_raw)
+        if missing:
+            errors.append("entity_verification_report.unresolved_items 缺少对应 doubtful_items: " + ", ".join(missing))
+    export_manifest = artifacts.get("export_manifest")
+    if isinstance(export_manifest, dict) and "doubtful_items" in artifacts:
+        known_unverified = {
+            str(item).strip()
+            for item in as_list(export_manifest.get("known_unverified_parts"))
+            if str(item).strip()
+        }
+        missing = sorted(known_unverified - doubtful_raw)
+        if missing:
+            errors.append("export_manifest.known_unverified_parts 缺少对应 doubtful_items: " + ", ".join(missing))
     return errors
 
 
 def validate_payload(payload: Any, required_artifacts: list[str] | None = None) -> dict[str, Any]:
     artifacts, errors = artifact_mapping(payload)
+    errors.extend(forbidden_field_errors(payload, "payload"))
     warnings: list[str] = []
     required_artifacts = required_artifacts or []
 
@@ -630,7 +853,9 @@ def validate_payload(payload: Any, required_artifacts: list[str] | None = None) 
         elif artifact_type in REQUIRED_FIELDS:
             errors.extend(validate_required_fields(artifact_type, artifact))
             errors.extend(validate_field_types(artifact_type, artifact))
-            if artifact_type == "transcript_audit":
+            if artifact_type == "source_manifest":
+                errors.extend(validate_source_manifest(artifact))
+            elif artifact_type == "transcript_audit":
                 errors.extend(validate_transcript_audit(artifact))
             elif artifact_type == "source_reconciliation":
                 errors.extend(validate_source_reconciliation(artifact))
@@ -642,7 +867,7 @@ def validate_payload(payload: Any, required_artifacts: list[str] | None = None) 
                 errors.extend(validate_main_action_receipt(artifact))
         else:
             errors.append(f"未知 MAS artifact 类型: {artifact_type}")
-        errors.extend(forbidden_field_errors(artifact, path))
+    errors.extend(validate_cross_artifact_consistency(artifacts))
 
     return {
         "ok": not errors,

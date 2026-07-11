@@ -4,11 +4,22 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import errno
+import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
+import threading
+import time
+import types
+import warnings as py_warnings
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
@@ -36,11 +47,24 @@ from collect_mas_artifacts import collect_mas_run  # noqa: E402
 from ingest_mas_artifact import ingest_mas_artifact_file  # noqa: E402
 from plan_mas_next_action import plan_from_summary  # noqa: E402
 from run_mas_phase_operator import run_mas_phase_operator  # noqa: E402
-from run_mas_dry_run import run_mas_dry_run  # noqa: E402
+from run_mas_dry_run import (  # noqa: E402
+    run_mas_dry_run,
+    synthetic_final_markdown,
+    synthetic_verification_payload,
+)
 from record_mas_main_actions import record_main_actions  # noqa: E402
+from archive_raw_inputs import archive_files  # noqa: E402
 from export_to_obsidian import export_note  # noqa: E402
+import archive_raw_inputs as archive_module  # noqa: E402
+import export_to_obsidian as export_module  # noqa: E402
 from process_transcript import build_output, detect_segments  # noqa: E402
-from sensevoice_transcription_server import MultipartForm, UploadedFormFile, require_audio_form_file  # noqa: E402
+from sensevoice_transcription_server import (  # noqa: E402
+    MultipartForm,
+    UploadedFormFile,
+    _run_transcribe as run_sensevoice_subprocess,
+    require_audio_form_file,
+)
+import transcribe_audio as transcribe_audio_module  # noqa: E402
 
 
 def read_cases(path: Path) -> list[dict[str, Any]]:
@@ -192,6 +216,150 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 "warnings": warnings,
                 "md_path": md_path,
             }
+    elif case.get("check") == "export_concurrent":
+        with tempfile.TemporaryDirectory(prefix="meeting-minutes-export-concurrent-") as tmpdir:
+            errors = []
+            warnings = []
+            count = int(case.get("count") or 8)
+            with ThreadPoolExecutor(max_workers=count) as executor:
+                exports = list(
+                    executor.map(
+                        lambda _: export_note(file_path, Path(tmpdir), str(case.get("meeting_date_override") or "")),
+                        range(count),
+                    )
+                )
+            paths = [item.md_path for item in exports]
+            if not all(item.md_created for item in exports):
+                errors.append("并发导出存在未成功结果")
+            if len(set(paths)) != count:
+                errors.append(f"并发导出路径不唯一: expected={count} actual={len(set(paths))}")
+            source_bytes = file_path.read_bytes()
+            for path in paths:
+                if not path.is_file() or path.read_bytes() != source_bytes:
+                    errors.append(f"并发导出文件缺失或内容不一致: {path}")
+            if list(Path(tmpdir).rglob("*.part")):
+                errors.append("并发导出后残留隐藏 part 文件")
+            result = {
+                "ok": not errors,
+                "errors": errors,
+                "warnings": warnings,
+                "export_count": count,
+                "unique_path_count": len(set(paths)),
+            }
+    elif case.get("check") == "export_part_cleanup_failure":
+        errors = []
+        warnings = []
+        with tempfile.TemporaryDirectory(prefix="meeting-minutes-export-cleanup-") as tmpdir:
+            original_unlink = Path.unlink
+
+            def fail_part_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+                if path.suffix == ".part":
+                    raise PermissionError("synthetic part cleanup failure")
+                original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", fail_part_unlink), py_warnings.catch_warnings(record=True) as caught:
+                py_warnings.simplefilter("always")
+                exported = export_note(file_path, Path(tmpdir), str(case.get("meeting_date_override") or ""))
+            if not exported.md_created or not exported.md_path.is_file():
+                errors.append("part 清理失败不应反转已完成的 Markdown 发布")
+            elif exported.md_path.read_bytes() != file_path.read_bytes():
+                errors.append("part 清理失败后的 Markdown 内容不完整")
+            part_files = list(Path(tmpdir).rglob("*.part"))
+            if not part_files or not any("part 文件清理失败" in str(item.message) for item in caught):
+                errors.append("part 清理失败缺少明确告警或故障注入未生效")
+            for part_file in part_files:
+                original_unlink(part_file, missing_ok=True)
+        result = {"ok": not errors, "errors": errors, "warnings": warnings}
+    elif case.get("check") == "archive_part_cleanup_failure":
+        errors = []
+        warnings = []
+        with tempfile.TemporaryDirectory(prefix="meeting-minutes-archive-cleanup-") as tmpdir:
+            original_unlink = Path.unlink
+
+            def fail_part_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+                if path.suffix == ".part":
+                    raise PermissionError("synthetic part cleanup failure")
+                original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", fail_part_unlink), py_warnings.catch_warnings(record=True) as caught:
+                py_warnings.simplefilter("always")
+                archived = archive_files(
+                    [file_path],
+                    Path(tmpdir),
+                    str(case.get("archive_date") or "2026-07-01"),
+                    str(case.get("meeting_title") or "合成归档"),
+                )
+            if len(archived) != 1 or not archived[0].is_file():
+                errors.append("part 清理失败不应反转已完成的原始文件归档")
+            elif archived[0].read_bytes() != file_path.read_bytes():
+                errors.append("part 清理失败后的归档内容不完整")
+            part_files = list(Path(tmpdir).rglob("*.part"))
+            if not part_files or not any("part 文件清理失败" in str(item.message) for item in caught):
+                errors.append("归档 part 清理失败缺少明确告警或故障注入未生效")
+            for part_file in part_files:
+                original_unlink(part_file, missing_ok=True)
+        result = {"ok": not errors, "errors": errors, "warnings": warnings}
+    elif case.get("check") == "atomic_publish_unsupported":
+        errors = []
+        warnings = []
+        unsupported = OSError(errno.EOPNOTSUPP, "synthetic hard-link unsupported")
+        with tempfile.TemporaryDirectory(prefix="meeting-minutes-atomic-unsupported-") as tmpdir:
+            export_dir = Path(tmpdir) / "export"
+            archive_dir = Path(tmpdir) / "archive"
+            with patch.object(export_module.os, "link", side_effect=unsupported):
+                exported = export_note(file_path, export_dir, str(case.get("meeting_date_override") or ""))
+            if exported.md_created or "不支持安全的原子无覆盖发布" not in exported.md_message:
+                errors.append("不支持 hard-link 时 Markdown 导出未明确 fail closed")
+            if list(export_dir.rglob("*.md")) or list(export_dir.rglob("*.part")):
+                errors.append("Markdown 原子发布失败后残留 final 或 part 文件")
+            archive_error = ""
+            try:
+                with patch.object(archive_module.os, "link", side_effect=unsupported):
+                    archive_files(
+                        [file_path],
+                        archive_dir,
+                        str(case.get("archive_date") or "2026-07-01"),
+                        str(case.get("meeting_title") or "合成归档"),
+                    )
+            except OSError as exc:
+                archive_error = str(exc)
+            if "不支持安全的原子无覆盖归档" not in archive_error:
+                errors.append("不支持 hard-link 时原始文件归档未明确 fail closed")
+            if list(archive_dir.rglob("*.md")) or list(archive_dir.rglob("*.part")):
+                errors.append("原始文件原子归档失败后残留 final 或 part 文件")
+        result = {"ok": not errors, "errors": errors, "warnings": warnings}
+    elif case.get("check") == "archive_concurrent":
+        with tempfile.TemporaryDirectory(prefix="meeting-minutes-archive-concurrent-") as tmpdir:
+            errors = []
+            count = int(case.get("count") or 8)
+            with ThreadPoolExecutor(max_workers=count) as executor:
+                archived_batches = list(
+                    executor.map(
+                        lambda _: archive_files(
+                            [file_path],
+                            Path(tmpdir),
+                            str(case.get("archive_date") or "2026-07-01"),
+                            str(case.get("meeting_title") or "synthetic concurrent archive"),
+                        ),
+                        range(count),
+                    )
+                )
+            paths = [batch[0] for batch in archived_batches]
+            if len(set(paths)) != count:
+                errors.append(f"并发归档路径不唯一: expected={count} actual={len(set(paths))}")
+            source_bytes = file_path.read_bytes()
+            for path in paths:
+                if not path.is_file() or path.read_bytes() != source_bytes:
+                    errors.append(f"并发归档文件缺失或内容不一致: {path}")
+            if list(Path(tmpdir).rglob("*.part")):
+                errors.append("并发归档后残留隐藏 part 文件")
+            result = {
+                "ok": not errors,
+                "errors": errors,
+                "warnings": [],
+                "archive_count": count,
+                "unique_path_count": len(set(paths)),
+            }
     elif case.get("check") == "process_transcript":
         input_text = str(case.get("input_text") or "")
         errors = []
@@ -233,6 +401,225 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             "errors": errors,
             "warnings": warnings,
         }
+    elif case.get("check") == "sensevoice_empty_result":
+        with tempfile.TemporaryDirectory(prefix="sensevoice-empty-result-") as tmpdir:
+            ok, text, error = run_sensevoice_subprocess(
+                [sys.executable, "-c", "pass"],
+                Path(tmpdir),
+                "input",
+                timeout=5,
+            )
+        errors = []
+        if ok or text or "without usable text" not in error:
+            errors.append(f"SenseVoice bridge 未拒绝空转写: ok={ok} text={text!r} error={error!r}")
+        result = {"ok": not errors, "errors": errors, "warnings": []}
+    elif case.get("check") == "sensevoice_managed_outputs":
+        errors = []
+        with tempfile.TemporaryDirectory(prefix="sensevoice-managed-outputs-") as tmpdir:
+            output_dir = Path(tmpdir) / "out"
+            output_dir.mkdir()
+            input_file = Path(tmpdir) / "input.wav"
+            input_file.write_bytes(b"synthetic")
+            managed_paths = [
+                output_dir / f"input{suffix}"
+                for suffix in transcribe_audio_module.SENSEVOICE_MANAGED_OUTPUT_SUFFIXES
+            ]
+            for path in managed_paths:
+                path.write_text("OLD OUTPUT\n", encoding="utf-8")
+            fake_funasr = types.ModuleType("funasr")
+            fake_funasr.AutoModel = lambda **_: object()  # type: ignore[attr-defined]
+            shared_patches = (
+                patch.dict(sys.modules, {"funasr": fake_funasr}),
+                patch.object(transcribe_audio_module, "_ensure_ffmpeg_for_current_process", lambda: None),
+                patch.object(
+                    transcribe_audio_module,
+                    "_resolve_model_ref",
+                    lambda model_name, **_: model_name,
+                ),
+                patch.object(transcribe_audio_module, "_select_device", lambda _: "cpu"),
+            )
+            with shared_patches[0], shared_patches[1], shared_patches[2], shared_patches[3], patch.object(
+                transcribe_audio_module,
+                "_run_sensevoice_vad_segments",
+                return_value={"text": "", "sentence_info": [], "timestamp_index": [], "raw": []},
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                empty_code = transcribe_audio_module._run_sensevoice(
+                    input_file,
+                    output_dir,
+                    "iic/SenseVoiceSmall",
+                    "zh",
+                    "all",
+                    False,
+                    False,
+                    "none",
+                    "",
+                    False,
+                )
+            if empty_code != 1 or any(path.read_text(encoding="utf-8") != "OLD OUTPUT\n" for path in managed_paths):
+                errors.append("SenseVoice 空结果失败后未保留上一轮完整输出")
+
+            for path in managed_paths:
+                path.write_text("OLD OUTPUT\n", encoding="utf-8")
+            with patch.dict(sys.modules, {"funasr": fake_funasr}), patch.object(
+                transcribe_audio_module,
+                "_ensure_ffmpeg_for_current_process",
+                lambda: None,
+            ), patch.object(
+                transcribe_audio_module,
+                "_resolve_model_ref",
+                lambda model_name, **_: model_name,
+            ), patch.object(
+                transcribe_audio_module,
+                "_select_device",
+                lambda _: "cpu",
+            ), patch.object(
+                transcribe_audio_module,
+                "_run_sensevoice_vad_segments",
+                return_value={"text": "新转写", "sentence_info": [], "timestamp_index": [], "raw": []},
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                success_code = transcribe_audio_module._run_sensevoice(
+                    input_file,
+                    output_dir,
+                    "iic/SenseVoiceSmall",
+                    "zh",
+                    "all",
+                    False,
+                    False,
+                    "none",
+                    "",
+                    False,
+                )
+            expected_present = {output_dir / "input.txt", output_dir / "input.json"}
+            expected_absent = set(managed_paths) - expected_present
+            if (
+                success_code != 0
+                or any(not path.is_file() for path in expected_present)
+                or any(path.exists() for path in expected_absent)
+                or (output_dir / "input.txt").read_text(encoding="utf-8").strip() != "新转写"
+            ):
+                errors.append("SenseVoice 成功结果未清除本轮未产生的旧 side outputs")
+        result = {"ok": not errors, "errors": errors, "warnings": []}
+    elif case.get("check") == "sensevoice_output_transaction":
+        errors = []
+        with tempfile.TemporaryDirectory(prefix="sensevoice-output-transaction-") as tmpdir:
+            output_dir = Path(tmpdir)
+            stem = "input"
+            old_contents = {
+                suffix: f"OLD {suffix}\n"
+                for suffix in transcribe_audio_module.SENSEVOICE_MANAGED_OUTPUT_SUFFIXES
+            }
+            for suffix, content in old_contents.items():
+                (output_dir / f"{stem}{suffix}").write_text(content, encoding="utf-8")
+            original_replace = os.replace
+
+            def fail_second_publish(source: Any, destination: Any) -> None:
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if source_path.parent.name == "stage" and destination_path.name == f"{stem}.json":
+                    raise OSError("synthetic commit failure")
+                original_replace(source, destination)
+
+            try:
+                with patch.object(transcribe_audio_module.os, "replace", fail_second_publish):
+                    transcribe_audio_module._commit_sensevoice_outputs(
+                        output_dir,
+                        stem,
+                        {".txt": "NEW TXT\n", ".json": "NEW JSON\n"},
+                    )
+            except OSError:
+                pass
+            else:
+                errors.append("SenseVoice 事务提交故障注入未触发")
+            for suffix, content in old_contents.items():
+                path = output_dir / f"{stem}{suffix}"
+                if not path.is_file() or path.read_text(encoding="utf-8") != content:
+                    errors.append(f"SenseVoice 提交失败后未恢复旧输出: {suffix}")
+            if list(output_dir.glob(f".{stem}.sensevoice-txn-*")):
+                errors.append("SenseVoice 提交失败后残留 transaction 目录")
+
+            child_code = "\n".join(
+                [
+                    "import os, sys",
+                    "from pathlib import Path",
+                    "import transcribe_audio as target",
+                    "output_dir = Path(sys.argv[1])",
+                    "stem = sys.argv[2]",
+                    "original_replace = target.os.replace",
+                    "def abrupt_replace(source, destination):",
+                    "    original_replace(source, destination)",
+                    "    if Path(source).parent.name == 'stage':",
+                    "        os._exit(77)",
+                    "target.os.replace = abrupt_replace",
+                    "target._commit_sensevoice_outputs(output_dir, stem, {'.txt': 'CRASH TXT\\n', '.json': 'CRASH JSON\\n'})",
+                ]
+            )
+            child_env = os.environ.copy()
+            child_env["PYTHONPATH"] = str(SCRIPT_DIR)
+            crashed = subprocess.run(
+                [sys.executable, "-c", child_code, str(output_dir), stem],
+                capture_output=True,
+                text=True,
+                env=child_env,
+                timeout=10,
+            )
+            if crashed.returncode != 77:
+                errors.append(
+                    f"SenseVoice abrupt-exit 故障注入未按预期退出: returncode={crashed.returncode} stderr={crashed.stderr}"
+                )
+            with transcribe_audio_module._sensevoice_stem_lock(output_dir, stem):
+                transcribe_audio_module._recover_sensevoice_transactions(output_dir, stem)
+            for suffix, content in old_contents.items():
+                path = output_dir / f"{stem}{suffix}"
+                if not path.is_file() or path.read_text(encoding="utf-8") != content:
+                    errors.append(f"SenseVoice abrupt-exit 恢复后旧输出不完整: {suffix}")
+            if list(output_dir.glob(f".{stem}.sensevoice-txn-*")):
+                errors.append("SenseVoice abrupt-exit 恢复后残留 transaction 目录")
+
+            victim_stem = "foobar"
+            metachar_stem = "foo*"
+            for suffix, content in old_contents.items():
+                (output_dir / f"{victim_stem}{suffix}").write_text(content, encoding="utf-8")
+            victim_crash = subprocess.run(
+                [sys.executable, "-c", child_code, str(output_dir), victim_stem],
+                capture_output=True,
+                text=True,
+                env=child_env,
+                timeout=10,
+            )
+            if victim_crash.returncode != 77:
+                errors.append("SenseVoice metachar stem 隔离故障注入未按预期退出")
+            with transcribe_audio_module._sensevoice_stem_lock(output_dir, metachar_stem):
+                transcribe_audio_module._recover_sensevoice_transactions(output_dir, metachar_stem)
+            if not list(output_dir.glob(f".{victim_stem}.sensevoice-txn-*")):
+                errors.append("含 glob 元字符的 stem 错误消费了其他 stem 的遗留事务")
+            if any((output_dir / f"{metachar_stem}{suffix}").exists() for suffix in old_contents):
+                errors.append("含 glob 元字符的 stem 错误生成了跨 stem 恢复输出")
+            with transcribe_audio_module._sensevoice_stem_lock(output_dir, victim_stem):
+                transcribe_audio_module._recover_sensevoice_transactions(output_dir, victim_stem)
+            for suffix, content in old_contents.items():
+                path = output_dir / f"{victim_stem}{suffix}"
+                if not path.is_file() or path.read_text(encoding="utf-8") != content:
+                    errors.append(f"SenseVoice metachar stem 隔离后 victim 恢复失败: {suffix}")
+
+            active = 0
+            max_active = 0
+            counter_lock = threading.Lock()
+
+            def lock_probe() -> None:
+                nonlocal active, max_active
+                with transcribe_audio_module._sensevoice_stem_lock(output_dir, stem):
+                    with counter_lock:
+                        active += 1
+                        max_active = max(max_active, active)
+                    time.sleep(0.02)
+                    with counter_lock:
+                        active -= 1
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                list(executor.map(lambda _: lock_probe(), range(2)))
+            if max_active != 1:
+                errors.append(f"同 stem SenseVoice 运行未串行化: max_active={max_active}")
+        result = {"ok": not errors, "errors": errors, "warnings": []}
     elif case.get("check") == "mas_artifacts":
         result = validate_mas_artifacts_file(
             file_path,
@@ -327,6 +714,18 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             "artifact_owners": artifact_owners,
             "roles": roles,
         }
+    elif case.get("check") == "mas_task_bundle_reject":
+        request_payload = json.loads(file_path.read_text(encoding="utf-8"))
+        errors = []
+        try:
+            build_mas_task_bundle_from_request(request_payload)
+        except ValueError as exc:
+            errors.append(str(exc))
+        result = {
+            "ok": not errors,
+            "errors": errors,
+            "warnings": [],
+        }
     elif case.get("check") == "mas_task_dispatch_files":
         request_payload = json.loads(file_path.read_text(encoding="utf-8"))
         if not isinstance(request_payload, dict):
@@ -338,6 +737,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             dispatch_result = write_mas_dispatch_files(bundle, Path(tmpdir))
             manifest_path = Path(dispatch_result["manifest_file"])
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            bound_bundle = json.loads(Path(dispatch_result["bundle_file"]).read_text(encoding="utf-8"))
             task_files = [Path(path) for path in dispatch_result["task_files"]]
             if manifest.get("schema_version") != "1.0":
                 errors.append(f"dispatch_manifest schema_version 不符合预期: {manifest.get('schema_version')}")
@@ -371,12 +771,46 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                     errors.append(f"缺少 MAS dispatch task file: {filename}")
             combined_task_text = "\n".join(path.read_text(encoding="utf-8") for path in task_files)
             manifest_text = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+            for task in bound_bundle.get("tasks", []):
+                if not isinstance(task, dict):
+                    continue
+                shape_result = validate_mas_artifacts_payload(task.get("expected_output_shape"))
+                if not shape_result.get("ok"):
+                    errors.append(
+                        f"MAS task expected_output_shape 无法通过自身 schema: {task.get('artifact_type')}: "
+                        + "; ".join(str(item) for item in shape_result.get("errors", []))
+                    )
+            expected_primary = str(case.get("expect_source_reconciliation_primary") or "")
+            if expected_primary:
+                source_tasks = [
+                    task
+                    for task in bound_bundle.get("tasks", [])
+                    if isinstance(task, dict) and task.get("artifact_type") == "source_reconciliation"
+                ]
+                actual_primary = ""
+                if len(source_tasks) == 1:
+                    shape = source_tasks[0].get("expected_output_shape")
+                    if isinstance(shape, dict):
+                        artifact = shape.get("artifact")
+                        if isinstance(artifact, dict):
+                            actual_primary = str(artifact.get("primary_body_source") or "")
+                if actual_primary != expected_primary:
+                    errors.append(
+                        "MAS source_reconciliation expected_output_shape 主源不符合 source_mode: "
+                        f"expected={expected_primary} actual={actual_primary}"
+                    )
             for term in [str(term) for term in case.get("required_terms", [])]:
                 if term not in combined_task_text and term not in manifest_text:
                     errors.append(f"MAS dispatch files 缺少文本锚点: {term}")
             for term in [str(term) for term in case.get("forbidden_terms", [])]:
                 if term in combined_task_text or term in manifest_text:
                     errors.append(f"MAS dispatch files 包含禁止锚点: {term}")
+            if case.get("check_overwrite_prompt_cleanup"):
+                stale_prompt = Path(tmpdir) / "99-stale.prompt.md"
+                stale_prompt.write_text("stale prompt\n", encoding="utf-8")
+                write_mas_dispatch_files(bundle, Path(tmpdir), overwrite_prompts=True)
+                if stale_prompt.exists():
+                    errors.append("MAS dispatch 显式覆盖后未清理旧 prompt")
             result = {
                 "ok": not errors,
                 "errors": errors,
@@ -473,27 +907,17 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             write_mas_dispatch_files(bundle, task_dir)
             _, dispatch_manifest = dispatch_context(task_dir)
             synthetic_markdown = task_dir / "synthetic-final.md"
-            synthetic_markdown.write_text("# Synthetic MAS regression final\n", encoding="utf-8")
+            synthetic_markdown.write_text(synthetic_final_markdown(fixture_artifacts), encoding="utf-8")
+            if case.get("invalid_markdown_claimed_valid"):
+                synthetic_markdown.write_text("# fake validator pass\n", encoding="utf-8")
+            verification_payload = synthetic_verification_payload(fixture_artifacts)
+            tamper_sidecar_field = case.get("tamper_sidecar_field")
+            if isinstance(tamper_sidecar_field, dict):
+                records = verification_payload.get("records")
+                if isinstance(records, list) and records and isinstance(records[0], dict):
+                    records[0][str(tamper_sidecar_field.get("field") or "")] = tamper_sidecar_field.get("value")
             (task_dir / "synthetic.verification.json").write_text(
-                json.dumps(
-                    {
-                        "records": [
-                            {
-                                "原始表述": "某某科技",
-                                "存疑类型": "公司或证券标的",
-                                "当前判断": "待人工确认",
-                                "候选项": "候选科技(000001.SZ)",
-                                "是否需要 sidecar": True,
-                                "上下文依据": "synthetic regression",
-                                "检索/证据路径": "exchange_disclosure",
-                                "最终处理": "正文保留存疑标记",
-                            }
-                        ]
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
+                json.dumps(verification_payload, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
             artifact_dir = task_dir / "artifacts"
@@ -503,10 +927,27 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 artifact_type = str(artifact_type)
                 if artifact_type in omitted or artifact_type not in bundle.get("expected_artifacts", []):
                     continue
+                if artifact_type == "source_manifest" and case.get("source_manifest_first_material_name"):
+                    artifact = json.loads(json.dumps(artifact, ensure_ascii=False))
+                    materials = artifact.get("materials") if isinstance(artifact, dict) else None
+                    if isinstance(materials, list) and materials and isinstance(materials[0], dict):
+                        materials[0]["name"] = str(case["source_manifest_first_material_name"])
+                if artifact_type == "source_manifest" and case.get("use_generated_source_manifest"):
+                    artifact, _ = create_source_manifest(request_payload, archive_allowed=False)
+                if artifact_type == "source_reconciliation" and (
+                    "source_reconciliation_primary" in case or "source_reconciliation_cross_check" in case
+                ):
+                    artifact = json.loads(json.dumps(artifact, ensure_ascii=False))
+                    if "source_reconciliation_primary" in case:
+                        artifact["primary_body_source"] = case.get("source_reconciliation_primary")
+                    if "source_reconciliation_cross_check" in case:
+                        artifact["cross_check_source"] = case.get("source_reconciliation_cross_check")
                 if case.get("record_main_actions") and artifact_type == "export_manifest":
                     deferred_export = (artifact_type, artifact)
                     continue
                 payload = fixture_payload(dispatch_manifest, artifact_type, artifact, synthetic_markdown)
+                if artifact_type == str(case.get("top_level_final_field_artifact") or ""):
+                    payload["final_markdown"] = "# forbidden direct collector field"
                 (artifact_dir / f"{artifact_type}.json").write_text(
                     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
@@ -583,6 +1024,19 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         artifact_fixture_path = base_dir / str(case["artifact_file"])
         with tempfile.TemporaryDirectory(prefix="mas-dry-run-") as tmpdir:
             result = run_mas_dry_run(file_path, artifact_fixture_path, Path(tmpdir))
+            combined_payload = json.loads(
+                Path(str(result.get("combined_artifacts_file") or "")).read_text(encoding="utf-8")
+            )
+            combined_artifacts = combined_payload.get("artifacts", {})
+            result["combined_artifact_types"] = sorted(combined_artifacts) if isinstance(combined_artifacts, dict) else []
+            if isinstance(combined_artifacts, dict):
+                export_manifest = combined_artifacts.get("export_manifest", {})
+                markdown_path = Path(str(export_manifest.get("markdown_path") or "")) if isinstance(export_manifest, dict) else Path()
+                result["combined_export_hash_matches"] = bool(
+                    isinstance(export_manifest, dict)
+                    and markdown_path.is_file()
+                    and export_manifest.get("markdown_sha256") == file_sha256(markdown_path)
+                )
         expected_phase_order = [str(item) for item in case.get("expect_phase_order", [])]
         if expected_phase_order and result.get("phase_order") != expected_phase_order:
             result["errors"].append(
@@ -648,6 +1102,13 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 f"MAS dry-run final_next_action phase 不符合预期: expected={expected_next_phase} "
                 f"actual={result.get('final_next_action', {}).get('phase')}"
             )
+            result["ok"] = False
+        for artifact_type in [str(item) for item in case.get("expect_combined_artifacts", [])]:
+            if artifact_type not in result.get("combined_artifact_types", []):
+                result["errors"].append(f"MAS dry-run combined artifacts 缺少: {artifact_type}")
+                result["ok"] = False
+        if case.get("expect_combined_export_hash_matches") and not result.get("combined_export_hash_matches"):
+            result["errors"].append("MAS dry-run combined export_manifest 哈希未绑定实际 Markdown")
             result["ok"] = False
         trace_text = json.dumps(result, ensure_ascii=False, sort_keys=True)
         for term in [str(item) for item in case.get("require_trace_terms", [])]:
@@ -798,6 +1259,47 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 if owner_result.get("ok") or "artifact_owner 必须为 Main Orchestrator" not in owner_errors:
                     result["errors"].append("MAS ingest 未拦截跨 owner artifact")
                     result["ok"] = False
+                forged_main_payload = {
+                    **owner_payload,
+                    "task_id": f"{bound_payload.get('run_id')}:main:source_manifest",
+                    "dispatch_phase": "pre_draft",
+                    "artifact_owner": "Main Orchestrator",
+                    "artifact": {
+                        **owner_payload["artifact"],
+                        "materials": [
+                            {"kind": "audio", "name": "synthetic_meeting.wav"},
+                            {"kind": "document", "name": "provided_transcript.md"},
+                        ],
+                    },
+                }
+                forged_main_path = task_dir / "forged-main-owned-return.json"
+                forged_main_path.write_text(
+                    json.dumps(forged_main_payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                forged_main_result = ingest_mas_artifact_file(
+                    forged_main_path,
+                    task_dir,
+                    through_phase="pre_draft",
+                )
+                forged_main_errors = "\n".join(str(item) for item in forged_main_result.get("errors", []))
+                if forged_main_result.get("ok") or "不接受 Main Orchestrator 自有 artifact" not in forged_main_errors:
+                    result["errors"].append("MAS ingest 未拒绝伪造的 main-owned artifact")
+                    result["ok"] = False
+    elif case.get("check") == "mas_plan_summary":
+        summary = json.loads(file_path.read_text(encoding="utf-8"))
+        result = plan_from_summary(summary)
+        expected_status = str(case.get("expect_plan_status") or "")
+        if expected_status and result.get("plan_status") != expected_status:
+            result["errors"].append(
+                f"MAS plan summary status 不符合预期: expected={expected_status} actual={result.get('plan_status')}"
+            )
+            result["ok"] = False
+        plan_text = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        for term in [str(item) for item in case.get("required_terms", [])]:
+            if term not in plan_text:
+                result["errors"].append(f"MAS plan summary 缺少文本锚点: {term}")
+                result["ok"] = False
     elif case.get("check") == "mas_next_action_plan":
         request_payload = json.loads(file_path.read_text(encoding="utf-8"))
         if not isinstance(request_payload, dict):
@@ -816,7 +1318,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             write_mas_dispatch_files(bundle, task_dir)
             _, dispatch_manifest = dispatch_context(task_dir)
             synthetic_markdown = task_dir / "synthetic-final.md"
-            synthetic_markdown.write_text("# Synthetic MAS plan final\n", encoding="utf-8")
+            synthetic_markdown.write_text(synthetic_final_markdown(fixture_artifacts), encoding="utf-8")
             artifact_dir = task_dir / "artifacts"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             deferred_export: tuple[str, Any] | None = None
@@ -899,9 +1401,15 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             request_payload = json.loads(file_path.read_text(encoding="utf-8"))
             if not isinstance(request_payload, dict):
                 raise ValueError(f"MAS phase operator request must be a JSON object: {file_path}")
-            bundle = build_mas_task_bundle_from_request(request_payload)
-            write_mas_dispatch_files(bundle, task_dir)
-            _, dispatch_manifest = dispatch_context(task_dir)
+            initialize_with_request = bool(case.get("initialize_with_request"))
+            if initialize_with_request and case.get("return_artifacts"):
+                raise ValueError("initialize_with_request regression cannot pre-bind return artifacts")
+            if initialize_with_request:
+                dispatch_manifest: dict[str, Any] = {}
+            else:
+                bundle = build_mas_task_bundle_from_request(request_payload)
+                write_mas_dispatch_files(bundle, task_dir)
+                _, dispatch_manifest = dispatch_context(task_dir)
             returns_dir = tmp_path / "returns"
             returns_dir.mkdir(parents=True, exist_ok=True)
             return_paths: list[Path] = []
@@ -929,7 +1437,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 return_paths.append(return_path)
             result = run_mas_phase_operator(
                 task_dir=task_dir,
-                request_path=None,
+                request_path=file_path if initialize_with_request else None,
                 return_paths=return_paths,
                 through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
                 auto_source_manifest=bool(case.get("auto_source_manifest", False)),
@@ -1025,26 +1533,9 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             write_mas_dispatch_files(bundle, task_dir)
             _, dispatch_manifest = dispatch_context(task_dir)
             synthetic_markdown = task_dir / "synthetic-final.md"
-            synthetic_markdown.write_text("# Synthetic MAS full-loop final\n", encoding="utf-8")
+            synthetic_markdown.write_text(synthetic_final_markdown(fixture_artifacts), encoding="utf-8")
             (task_dir / "synthetic.verification.json").write_text(
-                json.dumps(
-                    {
-                        "records": [
-                            {
-                                "原始表述": "某某科技",
-                                "存疑类型": "公司或证券标的",
-                                "当前判断": "待人工确认",
-                                "候选项": "候选科技(000001.SZ)",
-                                "是否需要 sidecar": True,
-                                "上下文依据": "synthetic full-loop",
-                                "检索/证据路径": "exchange_disclosure",
-                                "最终处理": "正文保留存疑标记",
-                            }
-                        ]
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                json.dumps(synthetic_verification_payload(fixture_artifacts), ensure_ascii=False, indent=2)
                 + "\n",
                 encoding="utf-8",
             )
@@ -1281,6 +1772,8 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             result["errors"].extend(timestamp_index_result["errors"])
             result["warnings"].extend(timestamp_index_result["warnings"])
             result["ok"] = result["ok"] and timestamp_index_result["ok"]
+    result.setdefault("errors", [])
+    result.setdefault("warnings", [])
     raw_ok = bool(result["ok"])
     expect_fail = bool(case.get("expect_fail"))
     required_error_terms = [str(term) for term in case.get("required_error_terms", [])]

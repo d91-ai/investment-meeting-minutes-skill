@@ -8,12 +8,19 @@ import json
 from pathlib import Path
 from typing import Any
 
+from create_mas_source_manifest import normalize_material
+from build_mas_task_bundle import PRIMARY_SOURCE_ALIASES_BY_MODE
 from summarize_mas_decisions import summarize_payload
-from validate_meeting_minutes_contract import validate_verification_sidecar
+from validate_meeting_minutes_contract import (
+    read_verification_records,
+    validate_contract,
+    validate_verification_sidecar,
+)
 from validate_mas_artifacts import (
     artifact_mapping,
     artifact_set_digest,
     file_sha256,
+    forbidden_field_errors,
     has_items,
     read_json,
     validate_dispatch_context,
@@ -22,6 +29,19 @@ from validate_mas_artifacts import (
 )
 
 PHASE_ORDER = {"pre_draft": 0, "draft_review": 1, "final_verification": 2}
+BODY_MATERIAL_KINDS_BY_MODE = {
+    "audio_only": {"audio"},
+    "document_only": {"document"},
+    "audio_plus_document": {"audio", "document"},
+}
+SOURCE_ALIAS_KINDS = {
+    "aligned_transcript": {"audio"},
+    "audio_transcript": {"audio"},
+    "document": {"document"},
+    "provided_document": {"document"},
+    "provided_transcript": {"document"},
+    "transcript": {"audio", "document"},
+}
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -73,6 +93,8 @@ def merge_artifact_files(paths: list[Path]) -> tuple[dict[str, Any], list[dict[s
         mapping, mapping_errors = artifact_mapping(payload)
         for error in mapping_errors:
             errors.append(f"{path.name}: {error}")
+        for error in forbidden_field_errors(payload, path.name):
+            errors.append(error)
         for artifact_type, artifact in mapping.items():
             if artifact_type in artifacts:
                 errors.append(f"重复 MAS artifact: {artifact_type}")
@@ -244,6 +266,7 @@ def main_action_receipt_state(
 
 def export_binding_errors(
     artifacts: dict[str, Any],
+    bundle: dict[str, Any],
     task_dir: Path,
     receipt_state: dict[str, Any],
 ) -> list[str]:
@@ -265,6 +288,22 @@ def export_binding_errors(
             errors.append("export_manifest 验证的 Markdown 与 main_action_receipt 不是同一版本")
         if export_manifest.get("main_actions_verified") is not True:
             errors.append("export_manifest.main_actions_verified 必须确认主流程动作已反映在终稿")
+    try:
+        markdown = markdown_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        errors.append(f"export_manifest Markdown 无法按 UTF-8 读取: {exc}")
+    else:
+        if "\ufffd" in markdown:
+            errors.append("export_manifest Markdown 包含 Unicode 替换字符 U+FFFD")
+        contract_result = validate_contract(
+            markdown,
+            source_mode=str(bundle.get("source_mode") or "auto"),
+            timestamp_mode="auto",
+        )
+        errors.extend(
+            f"export_manifest Markdown contract: {error}"
+            for error in contract_result.get("errors", [])
+        )
     known_unverified = export_manifest.get("known_unverified_parts")
     if has_items(known_unverified):
         sidecar_path_value = str(export_manifest.get("verification_sidecar_path") or "").strip()
@@ -275,6 +314,156 @@ def export_binding_errors(
             sidecar_result = validate_verification_sidecar(sidecar_path, require_verification=True)
             for error in sidecar_result.get("errors", []):
                 errors.append(f"export_manifest verification sidecar: {error}")
+    return errors
+
+
+def artifact_context_errors(
+    artifacts: dict[str, Any],
+    bundle: dict[str, Any],
+    task_dir: Path,
+) -> list[str]:
+    """Bind specialist claims to the current dispatch and its sidecar files."""
+    errors: list[str] = []
+    source_manifest = artifacts.get("source_manifest")
+    if isinstance(source_manifest, dict):
+        if source_manifest.get("source_mode") != bundle.get("source_mode"):
+            errors.append("source_manifest.source_mode 与当前 MAS task bundle 不一致")
+        expected_materials = [normalize_material(item) for item in bundle.get("materials", [])]
+        actual_materials = source_manifest.get("materials")
+        expected_keys = {
+            (str(item.get("kind") or ""), str(item.get("name") or ""))
+            for item in expected_materials
+        }
+        actual_keys = {
+            (str(item.get("kind") or ""), str(item.get("name") or ""))
+            for item in actual_materials
+            if isinstance(actual_materials, list) and isinstance(item, dict)
+        } if isinstance(actual_materials, list) else set()
+        if expected_keys != actual_keys:
+            errors.append("source_manifest.materials 与当前 MAS task bundle 不一致")
+        kinds = {kind for kind, _ in actual_keys}
+        source_mode = str(bundle.get("source_mode") or "")
+        has_audio = "audio" in kinds
+        has_document = "document" in kinds
+        if source_mode == "audio_only" and not has_audio:
+            errors.append("source_manifest audio_only 必须包含 audio material")
+        elif source_mode == "document_only" and not has_document:
+            errors.append("source_manifest document_only 必须包含可作为正文的 document material；pdf_attachment 不能替代正文")
+        elif source_mode == "audio_plus_document" and (not has_audio or not has_document):
+            errors.append("source_manifest audio_plus_document 必须同时包含 audio 和 document material")
+
+    reconciliation = artifacts.get("source_reconciliation")
+    if isinstance(reconciliation, dict):
+        primary = str(reconciliation.get("primary_body_source") or "").strip()
+        cross_check = str(reconciliation.get("cross_check_source") or "").strip()
+        source_mode = str(bundle.get("source_mode") or "")
+        eligible_kinds = BODY_MATERIAL_KINDS_BY_MODE.get(source_mode, set())
+        material_kinds_by_reference: dict[str, set[str]] = {}
+        for material in bundle.get("materials", []):
+            normalized = normalize_material(material)
+            kind = str(normalized.get("kind") or "")
+            name = str(normalized.get("name") or "")
+            if kind not in eligible_kinds or not name:
+                continue
+            for reference in {name, Path(name).stem}:
+                material_kinds_by_reference.setdefault(reference, set()).add(kind)
+        allowed = PRIMARY_SOURCE_ALIASES_BY_MODE.get(source_mode, set()) | set(material_kinds_by_reference)
+
+        def source_kinds(value: str) -> set[str]:
+            return SOURCE_ALIAS_KINDS.get(value, set()) | material_kinds_by_reference.get(value, set())
+
+        def validate_bound_source(field: str, value: str) -> bool:
+            if value.startswith(("http://", "https://", "file://")) or Path(value).is_absolute():
+                if field == "primary_body_source":
+                    errors.append("source_reconciliation.primary_body_source 必须引用当前会话材料，不得使用外部 URL 或绝对路径")
+                else:
+                    errors.append("source_reconciliation.cross_check_source 必须引用当前会话正文材料，不得使用外部 URL 或绝对路径")
+                return False
+            if value not in allowed:
+                if field == "primary_body_source":
+                    errors.append("source_reconciliation.primary_body_source 未绑定到当前会话材料或允许的来源别名")
+                else:
+                    errors.append("source_reconciliation.cross_check_source 未绑定到当前会话可用正文材料或允许的来源别名")
+                return False
+            return True
+
+        primary_bound = bool(primary) and validate_bound_source("primary_body_source", primary)
+        cross_bound = bool(cross_check) and validate_bound_source("cross_check_source", cross_check)
+        if source_mode == "audio_plus_document" and reconciliation.get("manual_review_required") is False:
+            if not cross_check:
+                errors.append("source_reconciliation audio_plus_document 自动继续时 cross_check_source 不得为空")
+            elif primary_bound and cross_bound:
+                primary_kinds = source_kinds(primary)
+                cross_kinds = source_kinds(cross_check)
+                if len(primary_kinds) != 1 or len(cross_kinds) != 1 or primary_kinds == cross_kinds:
+                    errors.append("source_reconciliation audio_plus_document 自动继续时主源与交叉源必须来自不同且明确的证据侧")
+
+    export_manifest = artifacts.get("export_manifest")
+    doubtful_items = artifacts.get("doubtful_items")
+    if isinstance(export_manifest, dict) and isinstance(doubtful_items, list):
+        expected_sidecar_items = {
+            str(item.get("原始表述") or "").strip()
+            for item in doubtful_items
+            if isinstance(item, dict) and item.get("是否需要 sidecar") is True
+        }
+        known_unverified = {
+            str(item).strip()
+            for item in export_manifest.get("known_unverified_parts", [])
+            if str(item).strip()
+        } if isinstance(export_manifest.get("known_unverified_parts"), list) else set()
+        if expected_sidecar_items != known_unverified:
+            errors.append("export_manifest.known_unverified_parts 必须与需要 sidecar 的 doubtful_items 完全一致")
+        if expected_sidecar_items:
+            sidecar_path = resolve_runtime_path(task_dir, export_manifest.get("verification_sidecar_path"))
+            try:
+                sidecar_records = read_verification_records(sidecar_path)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                sidecar_records = []
+            if any(
+                not str(item.get("原始表述") or "").strip()
+                for item in sidecar_records
+                if isinstance(item, dict)
+            ):
+                errors.append("verification sidecar 原始表述不得为空")
+            sidecar_items = {
+                str(item.get("原始表述") or "").strip()
+                for item in sidecar_records
+                if isinstance(item, dict) and str(item.get("原始表述") or "").strip()
+            }
+            if sidecar_items != expected_sidecar_items:
+                errors.append("verification sidecar 原始表述必须与需要 sidecar 的 doubtful_items 完全一致")
+            selected_doubtful_records = [
+                item
+                for item in doubtful_items
+                if isinstance(item, dict) and item.get("是否需要 sidecar") is True
+            ]
+            selected_sidecar_records = [
+                item
+                for item in sidecar_records
+                if isinstance(item, dict) and str(item.get("原始表述") or "").strip()
+            ]
+            doubtful_by_raw = {
+                str(item.get("原始表述") or "").strip(): item
+                for item in selected_doubtful_records
+            }
+            sidecar_by_raw = {
+                str(item.get("原始表述") or "").strip(): item
+                for item in selected_sidecar_records
+            }
+            if len(selected_doubtful_records) != len(doubtful_by_raw) or len(selected_sidecar_records) != len(sidecar_by_raw):
+                errors.append("doubtful_items 与 verification sidecar 的原始表述必须各自唯一")
+            for raw in sorted(expected_sidecar_items & sidecar_items):
+                for field in (
+                    "存疑类型",
+                    "当前判断",
+                    "候选项",
+                    "是否需要 sidecar",
+                    "上下文依据",
+                    "检索/证据路径",
+                    "最终处理",
+                ):
+                    if doubtful_by_raw[raw].get(field) != sidecar_by_raw[raw].get(field):
+                        errors.append(f"verification sidecar 与 doubtful_items 字段不一致: {raw} -> {field}")
     return errors
 
 
@@ -320,16 +509,23 @@ def next_action(
             "errors": non_missing_errors,
         }
     decision_type = str(decision.get("decision") or "")
+    if decision.get("ok") and decision_type == "repair_required":
+        main_actions = [str(item) for item in decision.get("main_actions", [])]
+        if "repair_transcript_before_draft" in main_actions:
+            return {
+                "type": "repair_before_continue",
+                "phase": "pre_draft",
+                "main_actions": main_actions,
+            }
+        return {
+            "type": "repair_before_final_delivery",
+            "phase": "final_verification",
+            "main_actions": main_actions,
+        }
     if decision.get("ok") and decision_type == "request_user":
         return {
             "type": "ask_user_for_narrow_confirmation",
             "phase": "",
-            "main_actions": decision.get("main_actions", []),
-        }
-    if decision.get("ok") and decision_type == "repair_required":
-        return {
-            "type": "repair_before_final_delivery",
-            "phase": "final_verification",
             "main_actions": decision.get("main_actions", []),
         }
     required_actions = action_names(decision) if decision.get("ok") else []
@@ -487,6 +683,7 @@ def collect_mas_run(
             errors.append(str(error))
     warnings.extend(str(warning) for warning in validation.get("warnings", []))
     warnings.extend(str(warning) for warning in decision.get("warnings", []))
+    errors.extend(artifact_context_errors(artifacts, bundle, task_dir))
 
     missing_artifacts = [artifact for artifact in required_artifacts if artifact not in artifacts]
     gates = phase_gates(bundle, artifacts, manifest)
@@ -498,7 +695,7 @@ def collect_mas_run(
     )
     if "main_action_receipt" in artifacts and not receipt_state.get("valid"):
         errors.extend(str(error) for error in receipt_state.get("errors", []))
-    errors.extend(export_binding_errors(artifacts, task_dir, receipt_state))
+    errors.extend(export_binding_errors(artifacts, bundle, task_dir, receipt_state))
     action = next_action(gates, decision, errors, missing_artifacts, receipt_state)
     return {
         "schema_version": "1.0",

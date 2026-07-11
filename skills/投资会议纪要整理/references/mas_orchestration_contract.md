@@ -121,6 +121,8 @@ Required fields:
 - `archive_status`
 - `skipped_reason`
 
+`materials` must be a non-empty array for an active MAS run and must match the current bound task bundle by normalized material `kind` and basename. Known audio, document, PDF, JSON metadata, and timestamp-index filenames derive their canonical kind from the filename; an explicit mismatched `kind` cannot relabel a PDF, audio file, or metadata file as a body document. `source_mode` must match the bundle and its material-kind coverage (`audio_only`, `document_only`, or both for `audio_plus_document`). `archive_status` is one of `not_started`, `completed`, `skipped`, `skipped_for_fixture`, or `failed`; `archive_allowed=false` cannot be paired with `archive_status=completed`.
+
 ### transcript_audit
 
 Required fields:
@@ -144,6 +146,8 @@ Required fields:
 - `conflicts`
 - `manual_review_required`
 
+An automatically selected `primary_body_source` must be an eligible current-session body material name/stem or an allowed source alias such as `aligned_transcript`, `audio_transcript`, or `provided_document`; metadata, timestamp indexes, and `pdf_attachment` files are not body sources. An external URL, `file://` URI, or absolute local path is invalid. For `audio_plus_document`, automatic continuation also requires a non-empty `cross_check_source` bound to the other explicit evidence side; an empty, external, unbound, ambiguous, or same-side cross-check does not pass.
+
 ### entity_verification_report
 
 Required fields:
@@ -155,11 +159,11 @@ Required fields:
 - `unresolved_items`
 - `conflicts`
 
-`confirmed_item_evidence_paths` must be a per-confirmed-item mapping. A confirmed non-person business item is not sufficient merely because `external_evidence_paths` is non-empty; each string in `confirmed_items` must map to at least one external evidence path or source identifier. Each external reference must be an `http://`/`https://` URL or an opaque public source ID such as `exchange_disclosure`; local candidate file paths are invalid. This shape check does not claim that network retrieval occurred; live verification remains a main-workflow evidence requirement.
+`confirmed_item_evidence_paths` must be a per-confirmed-item mapping. A confirmed non-person business item is not sufficient merely because `external_evidence_paths` is non-empty; each string in `confirmed_items` must map to at least one external evidence path or source identifier. Each external reference must be a public `https://` URL or one of the supported public source IDs: `a_stock_data_live`, `cninfo`, `company_website`, `exchange_disclosure`, `professional_database`, or `regulatory_disclosure`. HTTP, localhost/private-network addresses, credential-bearing query parameters, local candidate file paths, and arbitrary opaque strings are invalid. This shape check does not claim that network retrieval occurred; live verification remains a main-workflow evidence requirement.
 
 ### doubtful_items
 
-Use the fields and type enum in `verification_policy.md`. This list remains the only source for final ambiguity-table rows and verification sidecar records.
+Use the fields and type enum in `verification_policy.md`. This list remains the only source for final ambiguity-table rows and verification sidecar records. Every entity `unresolved_items` entry and every export `known_unverified_parts` entry must have the same exact `原始表述` in `doubtful_items`. The sidecar record set must exactly match business doubtful items whose `是否需要 sidecar=true`.
 
 ### target_attribution_review
 
@@ -172,6 +176,8 @@ Required fields:
 - `non_source_companies`
 - `recommended_revisions`
 
+`segments_reviewed` must be a positive integer; a zero-scope review does not pass.
+
 ### fidelity_review
 
 Required fields:
@@ -181,6 +187,8 @@ Required fields:
 - `pronoun_rewrite_findings`
 - `omission_findings`
 - `recommended_revisions`
+
+`paragraphs_reviewed` must be a positive integer; a zero-scope review does not pass.
 
 ### export_manifest
 
@@ -194,7 +202,7 @@ Required fields:
 - `known_unverified_parts`
 - `main_actions_verified`
 
-`validators_run` must be a non-empty array of objects with a non-empty `name` and boolean `ok`. `regression_result` must contain boolean `ok`; `export_status` must be `passed`, `failed`, or `blocked`. The collector resolves `markdown_path`, recomputes its SHA-256, and rejects a missing, stale, or mismatched final Markdown. When `known_unverified_parts` is non-empty, `verification_sidecar_path` must point to an existing, parseable, non-empty sidecar that passes the shared sidecar validator.
+`validators_run` must contain exactly the supported structural validators, `validate_utf8_text.py` and `validate_meeting_minutes_contract.py`, each with boolean `ok`. `regression_result` must contain `name=run_meeting_minutes_regression.py`, a positive integer `case_count`, and boolean `ok`; `export_status` must be `passed`, `failed`, or `blocked`. The collector resolves `markdown_path`, recomputes its SHA-256, and rejects a missing, stale, or mismatched final Markdown. When `known_unverified_parts` is non-empty, `verification_sidecar_path` must point to an existing, parseable, non-empty sidecar that passes the shared sidecar validator and matches `doubtful_items`.
 
 ### main_action_receipt
 
@@ -217,7 +225,7 @@ Use MAS when any risk is present:
 - `audio_plus_document` with source conflict or unclear primary body source.
 - Multiple targets, sectors, positive/negative views, customers, suppliers, competitors, or upstream/downstream entities mixed in one meeting.
 - Numerous non-person business doubtful items.
-- High-risk facts such as company codes, customers, orders, capacity, revenue, profit, valuation, policies, events, dates, models, or investment actions.
+- High-risk public facts such as company codes, customers, orders, capacity, revenue, profit, valuation, policies, events, dates, or models; or source-fidelity risk around speaker investment actions. Public facts require external evidence, while buy/sell/add/reduce/tracking actions are verified against the current-session source span unless the action embeds a public entity, ticker, or event.
 - Prior user feedback indicates summary compression, third-person rewrite, omission, missed verification, or target-attribution drift.
 
 Do not trigger MAS by default for short, clean `fast_document` work unless one of the above risks appears.
@@ -227,6 +235,13 @@ For mixed audio+document work, source selection is considered unresolved until t
 ## Task Bundle
 
 Before dispatching specialist agents, use `scripts/build_mas_task_bundle.py` to generate a deterministic task bundle from `run_profile`, `source_mode`, `meeting_type`, risk flags, and current-session materials.
+
+Accepted `risk_flags` are explicit and unknown tokens fail fast:
+- Audio: `audio_input`, `long_audio`, `noisy_audio`, `unclear_speaker_boundaries`, `timestamp_alignment`, `strict_audio`.
+- Source reconciliation: `audio_plus_document`, `source_conflict`, `primary_source_uncertain`.
+- Entity/public fact: `entity_verification`, `high_risk_facts`, `many_doubtful_items`, `company_codes`, `customers_suppliers`, `numbers_dates`.
+- Target attribution: `target_attribution`, `multi_target`, `mixed_targets`, `positive_negative_views`.
+- Fidelity: `fidelity_review`, `omission_risk`, `summary_compression`, `third_person_rewrite`, `prior_user_feedback`.
 
 The task bundle must define:
 - Whether MAS is required for the current run.
@@ -260,7 +275,8 @@ Subagent execution rules:
 - Tasks in the same phase may run in parallel; tasks across phases must wait for their prerequisites.
 - Keep subagents read-only toward repository files and meeting-note files unless a future task explicitly assigns a private artifact output path.
 - Require each subagent to return only the JSON artifact shape requested in its prompt.
-- Save main-owned artifacts such as `source_manifest` under the dispatch directory's `artifacts/` folder. Use `scripts/create_mas_source_manifest.py` or `scripts/run_mas_phase_operator.py --auto-source-manifest` to create the initial `source_manifest` from request or bundle metadata without claiming archive completion.
+- Generated prompts must render the role-specific inputs and checks, use type-correct JSON examples, and state that private recordings, transcripts, meeting excerpts, and local paths must not be uploaded to external services.
+- Save main-owned artifacts such as `source_manifest` under the dispatch directory's `artifacts/` folder. Use `scripts/create_mas_source_manifest.py` or `scripts/run_mas_phase_operator.py --auto-source-manifest` to create the initial `source_manifest` from the bound bundle without claiming archive completion. `source_manifest` is always `pre_draft`; `main_action_receipt` is always `draft_review`.
 - For each returned specialist JSON, run `scripts/ingest_mas_artifact.py RETURNED.json --task-dir "$MAS_DISPATCH" --through-phase PHASE --json`. The ingest script writes valid artifacts under `artifacts/`, writes invalid or duplicate returns under `repair_history/`, and emits the next collector command.
 - Require returned `run_id`, `task_id`, `dispatch_phase`, `artifact_owner`, and artifact set to match the generated prompt and dispatch manifest. Do not ingest an artifact copied from another meeting or task even when its inner schema is valid.
 - Do not manually overwrite an existing artifact file. If a specialist return is invalid or duplicate, repair or re-dispatch from the `repair_history/` record before continuing.
@@ -332,6 +348,8 @@ The dry-run is deterministic and uses synthetic artifacts. In a live Codex subag
 - Dispatch the next phase without user input only when collector `ok` is true and `next_action.type` is `collect_or_dispatch_phase_artifacts`.
 - Apply final automatic actions only when collector `ok` is true and `next_action.type` is `continue_without_user_intervention` or `apply_main_actions_before_final_delivery`; otherwise repair artifacts or ask the narrow confirmation requested by `next_action`.
 
+`--overwrite` may delete only an existing MAS dry-run directory under the system temporary root whose basename starts with `mas-` and which contains a dry-run marker or prior MAS control file. A marker outside the temporary root never authorizes recursive deletion.
+
 ## Live Codex Synthetic Pilot Findings
 
 The portable synthetic trace in `references/regression_samples/mas_live_pilot_trace_synthetic.json` records a live Codex subagent pilot with five read-only specialist tasks across `pre_draft`, `draft_review`, and `final_verification`. It used synthetic audio+document materials only; no real meeting materials, active skill install sync, commit, push, or final Markdown ownership transfer is part of the trace.
@@ -369,6 +387,7 @@ The main workflow should keep the source wording and add or preserve `doubtful_i
 ### 修复必需
 
 The main workflow must repair and rerun verification before final delivery when:
+- Transcript audit requires a rerun or repair; this emits `repair_before_continue` in `pre_draft`, before drafting.
 - Required validators were not run.
 - A validator, export step, or regression result is failed, blocked, or structurally reports `ok=false`.
 - The contract verifier reports errors that cannot be resolved by merely marking content doubtful.
@@ -384,6 +403,8 @@ Ask the user only when:
 
 After artifacts are emitted, use `scripts/summarize_mas_decisions.py` as a conservative helper for automatic pass, automatic doubtful handling, repair-required gates, and narrow user confirmation. The helper may only consume explicit artifact fields such as `manual_review_required`, `doubtful_items`, unresolved items, known unverified parts, review findings, and export status. It must not infer semantic investment direction or target priority from free text.
 
+Deterministic transcript/export/validator repair takes precedence over a user question in the same run. A doubtful item requests the user only when its `当前判断` or `最终处理` begins with an explicit marker such as `请求人工确认` or `请求用户确认`; free-text mentions such as `无需用户确认` do not trigger a question.
+
 For normal runs, prefer `scripts/collect_mas_artifacts.py` over calling the validator and summarizer separately. The collector reads the task bundle, derives the required artifact list, validates the merged artifact set, detects duplicate artifact types, embeds the summarizer result, reports `phase_gates`, and emits a machine-readable `next_action` in one run summary.
 
 When duplicate artifacts exist, collector output includes `duplicate_artifacts` with the artifact type, first path, and duplicate path. When invalid or duplicate artifacts are present, repair them before dispatching later phases, even if later-phase artifacts are also missing.
@@ -392,6 +413,7 @@ When duplicate artifacts exist, collector output includes `duplicate_artifacts` 
 - `collect_or_dispatch_phase_artifacts`: send or recollect the listed phase task files and main-owned artifacts.
 - `repair_missing_artifacts`: regenerate missing artifacts before continuing.
 - `repair_invalid_or_duplicate_artifacts`: remove duplicates or regenerate invalid specialist returns.
+- `repair_before_continue`: repair or rerun the transcript in `pre_draft` before drafting.
 - `repair_before_final_delivery`: repair export, validator, or regression failures before final delivery; rerun the relevant checks after repair.
 - `apply_main_actions_before_final_verification`: apply the listed main-owned draft/doubtful actions, record `main_action_receipt`, then rerun collector before dispatching Contract Verifier.
 - `apply_main_actions_before_final_delivery`: apply automatic doubtful, repair, or revision actions before user-facing delivery; if the action changes the final Markdown or sidecar, rerun export and validation before delivery.

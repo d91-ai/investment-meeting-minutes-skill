@@ -13,6 +13,7 @@ from validate_mas_artifacts import validate_payload
 AUDIO_EXTENSIONS = {".aac", ".aiff", ".flac", ".m4a", ".mp3", ".mp4", ".wav"}
 DOCUMENT_EXTENSIONS = {".doc", ".docx", ".md", ".srt", ".txt", ".vtt"}
 PDF_EXTENSIONS = {".pdf"}
+ARCHIVE_STATUSES = {"not_started", "completed", "skipped", "skipped_for_fixture", "failed"}
 
 
 def read_json(path: Path) -> Any:
@@ -53,7 +54,9 @@ def normalize_material(item: Any) -> dict[str, str]:
     if isinstance(item, dict):
         raw_name = str(item.get("name") or item.get("file") or item.get("path") or "unnamed_material")
         name = safe_material_name(raw_name)
-        kind = str(item.get("kind") or infer_material_kind(name))
+        inferred_kind = infer_material_kind(name)
+        explicit_kind = str(item.get("kind") or "").strip()
+        kind = inferred_kind if inferred_kind != "material" else explicit_kind or inferred_kind
         material = {"kind": kind, "name": name}
         status = item.get("status")
         if status not in (None, ""):
@@ -94,7 +97,14 @@ def create_source_manifest(
     skipped_reason: str = "",
 ) -> tuple[dict[str, Any], list[str]]:
     warnings: list[str] = []
-    materials = [normalize_material(item) for item in context.get("materials", [])]
+    raw_materials = context.get("materials", [])
+    if not isinstance(raw_materials, list):
+        raise ValueError("source_manifest materials must be a JSON array")
+    if archive_status not in ARCHIVE_STATUSES:
+        raise ValueError("source_manifest archive_status is invalid: " + archive_status)
+    if not archive_allowed and archive_status == "completed":
+        raise ValueError("source_manifest cannot report completed archive when archive_allowed=false")
+    materials = [normalize_material(item) for item in raw_materials]
     if not materials:
         warnings.append("source_manifest materials is empty")
     if not skipped_reason and not archive_allowed:

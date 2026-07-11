@@ -10,12 +10,36 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from validate_mas_artifacts import DOUBTFUL_REQUIRED_FIELDS, FORBIDDEN_FINAL_FIELDS, REQUIRED_FIELDS
+from validate_mas_artifacts import (
+    BOOLEAN_FIELD_RULES,
+    DOUBTFUL_REQUIRED_FIELDS,
+    FORBIDDEN_FINAL_FIELDS,
+    LIST_FIELD_RULES,
+    REQUIRED_FIELDS,
+    STRING_FIELD_RULES,
+)
 
 RUN_PROFILES = {"fast_document", "standard", "strict_audio"}
 SOURCE_MODES = {"document_only", "audio_only", "audio_plus_document"}
 MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
 SOURCE_SELECTION_STATUSES = {"not_applicable", "not_compared", "compared_clear", "conflict", "uncertain"}
+PRIMARY_SOURCE_ALIASES_BY_MODE = {
+    "audio_only": {"aligned_transcript", "audio_transcript", "transcript"},
+    "document_only": {"document", "provided_document", "provided_transcript", "transcript"},
+    "audio_plus_document": {
+        "aligned_transcript",
+        "audio_transcript",
+        "document",
+        "provided_document",
+        "provided_transcript",
+        "transcript",
+    },
+}
+PRIMARY_SOURCE_EXAMPLE_BY_MODE = {
+    "audio_only": "aligned_transcript",
+    "document_only": "provided_document",
+    "audio_plus_document": "aligned_transcript",
+}
 
 AUDIO_RISKS = {
     "audio_input",
@@ -51,6 +75,13 @@ FIDELITY_RISKS = {
     "third_person_rewrite",
     "prior_user_feedback",
 }
+KNOWN_RISK_FLAGS = (
+    AUDIO_RISKS
+    | SOURCE_RECONCILIATION_RISKS
+    | ENTITY_RISKS
+    | TARGET_RISKS
+    | FIDELITY_RISKS
+)
 
 ROLE_SPECS: dict[str, dict[str, Any]] = {
     "transcript_audit": {
@@ -86,6 +117,7 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
             "speaker order",
             "verbatimness",
             "timestamp evidence",
+            "ASR noise versus human-correction traces",
             "omissions",
             "source conflicts",
         ],
@@ -201,7 +233,11 @@ def normalized_flags(flags: Any) -> list[str]:
         return []
     if not isinstance(flags, list):
         raise ValueError("risk_flags 必须是 JSON array")
-    return sorted({str(flag).strip() for flag in flags if str(flag).strip()})
+    normalized = sorted({str(flag).strip() for flag in flags if str(flag).strip()})
+    unknown = sorted(set(normalized) - KNOWN_RISK_FLAGS)
+    if unknown:
+        raise ValueError("未知 risk_flags: " + ", ".join(unknown))
+    return normalized
 
 
 def validate_choice(name: str, value: str, allowed: set[str]) -> None:
@@ -283,23 +319,71 @@ def output_shape_for(
     artifact_type: str,
     secondary_artifacts: list[str],
     identity: dict[str, str] | None = None,
+    source_mode: str = "audio_plus_document",
 ) -> dict[str, Any]:
+    def placeholder(field: str) -> Any:
+        artifact_examples: dict[str, dict[str, Any]] = {
+            "transcript_audit": {
+                "asr_primary": "SenseVoiceSmall",
+                "asr_auxiliary": "",
+                "timestamp_index_status": "unavailable",
+                "recommended_action": "continue",
+            },
+            "source_reconciliation": {
+                "primary_body_source": PRIMARY_SOURCE_EXAMPLE_BY_MODE.get(source_mode, "transcript"),
+                "primary_source_reason": "replace with current-session evidence",
+                "cross_check_source": "provided_document" if source_mode == "audio_plus_document" else "",
+                "manual_review_required": False,
+            },
+            "target_attribution_review": {"segments_reviewed": 1},
+            "fidelity_review": {"paragraphs_reviewed": 1},
+            "export_manifest": {
+                "markdown_path": "NOTE.md",
+                "markdown_sha256": "0" * 64,
+                "verification_sidecar_path": "",
+                "validators_run": [
+                    {"name": "validate_utf8_text.py", "ok": False},
+                    {"name": "validate_meeting_minutes_contract.py", "ok": False},
+                ],
+                "regression_result": {
+                    "name": "run_meeting_minutes_regression.py",
+                    "case_count": 1,
+                    "ok": False,
+                },
+                "export_status": "blocked",
+                "main_actions_verified": False,
+            },
+        }
+        if field in artifact_examples.get(artifact_type, {}):
+            return copy.deepcopy(artifact_examples[artifact_type][field])
+        if field in BOOLEAN_FIELD_RULES.get(artifact_type, []):
+            return False
+        if field in LIST_FIELD_RULES.get(artifact_type, []):
+            return []
+        if field in STRING_FIELD_RULES.get(artifact_type, []):
+            return ""
+        if field in {"segments_reviewed", "paragraphs_reviewed"}:
+            return 1
+        if field in {"confirmed_item_evidence_paths", "regression_result"}:
+            return {}
+        return None
+
     identity = identity or {}
     if secondary_artifacts:
         shape: dict[str, Any] = {
             **identity,
             "artifacts": {
-                artifact_type: {field: "<value>" for field in REQUIRED_FIELDS[artifact_type]},
+                artifact_type: {field: placeholder(field) for field in REQUIRED_FIELDS[artifact_type]},
             }
         }
         for secondary in secondary_artifacts:
             if secondary == "doubtful_items":
-                shape["artifacts"][secondary] = [{field: "<value>" for field in DOUBTFUL_REQUIRED_FIELDS}]
+                shape["artifacts"][secondary] = []
         return shape
     return {
         **identity,
         "artifact_type": artifact_type,
-        "artifact": {field: "<value>" for field in REQUIRED_FIELDS[artifact_type]},
+        "artifact": {field: placeholder(field) for field in REQUIRED_FIELDS[artifact_type]},
     }
 
 
@@ -315,8 +399,11 @@ def prompt_for_task(artifact_type: str, spec: dict[str, Any], run_profile: str, 
         "Do not modify repository files or meeting-note files; return the requested process artifact only.",
         "Use only current-session meeting materials as meeting-content evidence.",
         "External sources may verify names, codes, terms, and public facts only.",
+        "Do not upload private meeting materials, transcripts, recordings, or local paths to external services.",
         "Return only JSON. Do not include prose outside JSON.",
         f"Primary artifact: {artifact_type}.",
+        "Role inputs: " + "; ".join(str(item) for item in spec.get("inputs", [])) + ".",
+        "Required checks: " + "; ".join(str(item) for item in spec.get("checks", [])) + ".",
         f"Required fields: {', '.join(required_fields)}.",
     ]
     if "doubtful_items" in secondary:
@@ -326,15 +413,37 @@ def prompt_for_task(artifact_type: str, spec: dict[str, Any], run_profile: str, 
         lines.append("Do not use continue when quality_flags, speaker_boundary_findings, or conflicts are non-empty.")
     elif artifact_type == "source_reconciliation":
         lines.append("When manual_review_required=false, primary_body_source and primary_source_reason must be non-empty.")
+        aliases = ", ".join(sorted(PRIMARY_SOURCE_ALIASES_BY_MODE.get(source_mode, {"transcript"})))
+        lines.append(
+            "primary_body_source must name a current-session material or use an alias allowed for this source_mode: "
+            + aliases
+            + "."
+        )
+        if source_mode == "audio_plus_document":
+            lines.append(
+                "When manual_review_required=false, cross_check_source must be non-empty, bound to current-session "
+                "audio/document evidence, and come from the evidence side not used by primary_body_source."
+            )
+        else:
+            lines.append("If cross_check_source is non-empty, it must be bound to an eligible current-session body source.")
     elif artifact_type == "entity_verification_report":
         lines.append("Every items entry must appear in exactly one of confirmed_items or unresolved_items.")
         lines.append("Do not copy local_candidate_paths into external_evidence_paths.")
+        lines.append("If entity evidence is insufficient, put the exact item in unresolved_items and doubtful_items; do not guess.")
+    elif artifact_type == "target_attribution_review":
+        lines.append("segments_reviewed must be a positive integer for the actual reviewed scope.")
+        lines.append("If target attribution is unsupported, add the exact finding to recommended_revisions; do not invent a target.")
+    elif artifact_type == "fidelity_review":
+        lines.append("paragraphs_reviewed must be a positive integer for the actual reviewed scope.")
+        lines.append("If source mapping is insufficient, add the exact paragraph to source_mapping_failures; do not infer missing speech.")
     elif artifact_type == "export_manifest":
         lines.append("Return markdown_sha256 for markdown_path and set main_actions_verified as a boolean.")
-        lines.append("validators_run must contain objects with non-empty name and boolean ok; regression_result must contain boolean ok.")
+        lines.append("validators_run must contain exactly validate_utf8_text.py and validate_meeting_minutes_contract.py with boolean ok.")
+        lines.append("regression_result must contain name=run_meeting_minutes_regression.py, a positive integer case_count, and boolean ok.")
         lines.append("Set export_status to exactly one of: passed, failed, blocked.")
     lines.append(f"Forbidden final-output fields: {', '.join(sorted(FORBIDDEN_FINAL_FIELDS))}.")
-    lines.append("If evidence is insufficient or conflicting, mark the item unresolved instead of guessing.")
+    if artifact_type not in {"entity_verification_report", "target_attribution_review", "fidelity_review"}:
+        lines.append("If evidence is insufficient or conflicting, use this artifact's conflict or failure fields instead of guessing.")
     return "\n".join(lines)
 
 
@@ -404,7 +513,11 @@ def build_task(artifact_type: str, run_profile: str, source_mode: str) -> dict[s
         "checks": spec["checks"],
         "required_fields": REQUIRED_FIELDS[artifact_type],
         "forbidden_final_fields": sorted(FORBIDDEN_FINAL_FIELDS),
-        "expected_output_shape": output_shape_for(artifact_type, secondary_artifacts),
+        "expected_output_shape": output_shape_for(
+            artifact_type,
+            secondary_artifacts,
+            source_mode=source_mode,
+        ),
         "prompt": prompt_for_task(artifact_type, spec, run_profile, source_mode),
         "material_handoff": DISPATCH_PHASES[dispatch_phase]["materials"],
     }
@@ -438,6 +551,7 @@ def bind_dispatch_identity(bundle: dict[str, Any]) -> dict[str, Any]:
                         "dispatch_phase": dispatch_phase,
                         "artifact_owner": owner,
                     },
+                    source_mode=str(bound.get("source_mode") or "audio_plus_document"),
                 ),
             }
         )
@@ -488,6 +602,9 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
     validate_choice("meeting_type", meeting_type, MEETING_TYPES)
 
     risk_flags = normalized_flags(request.get("risk_flags", request.get("risks", [])))
+    materials = request.get("materials", [])
+    if not isinstance(materials, list):
+        raise ValueError("materials 必须是 JSON array")
     source_selection_status = normalized_source_selection_status(source_mode, request.get("source_selection_status"))
     inferred_risks = infer_risk_flags(run_profile, source_mode, risk_flags, source_selection_status)
     expected_artifacts = select_expected_artifacts(
@@ -515,7 +632,7 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
         "meeting_type": meeting_type,
         "mas_required": should_use_mas(run_profile, source_mode, risk_flags, source_selection_status),
         "risk_flags": inferred_risks,
-        "materials": request.get("materials", []),
+        "materials": copy.deepcopy(materials),
         "main_orchestrator": {
             "final_writer_only": True,
             "must_not_delegate": [
@@ -549,6 +666,10 @@ def validate_bundle(bundle: dict[str, Any]) -> list[str]:
     if not isinstance(tasks, list):
         errors.append("MAS task bundle tasks 必须是 JSON array")
         tasks = []
+    if not isinstance(bundle.get("materials"), list):
+        errors.append("MAS task bundle materials 必须是 JSON array")
+    elif bundle.get("mas_required") and not bundle.get("materials"):
+        errors.append("MAS task bundle 启用 MAS 时 materials 不得为空")
     dispatch = bundle.get("dispatch_protocol")
     if bundle.get("mas_required") and not isinstance(dispatch, dict):
         errors.append("MAS task bundle dispatch_protocol 必须是 JSON object")
@@ -590,7 +711,7 @@ def validate_bundle(bundle: dict[str, Any]) -> list[str]:
     return errors
 
 
-def write_dispatch_files(bundle: dict[str, Any], task_dir: Path) -> dict[str, Any]:
+def write_dispatch_files(bundle: dict[str, Any], task_dir: Path, *, overwrite_prompts: bool = True) -> dict[str, Any]:
     task_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = task_dir / "artifacts"
     if artifact_dir.exists() and any(artifact_dir.glob("*.json")):
@@ -598,6 +719,9 @@ def write_dispatch_files(bundle: dict[str, Any], task_dir: Path) -> dict[str, An
             "task_dir already contains artifact JSON files; use a fresh dispatch directory "
             "or finish/repair the existing MAS run before generating a new bundle"
         )
+    if overwrite_prompts:
+        for path in task_dir.glob("[0-9][0-9]-*.prompt.md"):
+            path.unlink()
     bundle = bind_dispatch_identity(bundle)
     bundle_path = task_dir / "mas_task_bundle.json"
     write_json(bundle_path, bundle)
@@ -684,6 +808,10 @@ def main() -> int:
         dispatch_files: dict[str, Any] | None = None
         if args.task_dir:
             dispatch_files = write_dispatch_files(bundle, Path(args.task_dir))
+            bound_bundle = read_json(Path(dispatch_files["bundle_file"]))
+            if not isinstance(bound_bundle, dict):
+                raise ValueError("写入后的 MAS task bundle 顶层必须是 JSON object")
+            bundle = bound_bundle
         output_payload = dict(bundle)
         if dispatch_files:
             output_payload["dispatch_files"] = dispatch_files

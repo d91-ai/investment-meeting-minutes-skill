@@ -61,7 +61,7 @@ def prepare_dispatch(task_dir: Path, request_path: Path | None, overwrite_dispat
     if errors:
         return {"created": False, "errors": errors, "warnings": []}
     try:
-        dispatch_files = write_dispatch_files(bundle, task_dir)
+        dispatch_files = write_dispatch_files(bundle, task_dir, overwrite_prompts=overwrite_dispatch)
     except (OSError, ValueError) as exc:
         return {"created": False, "errors": [f"dispatch files cannot be written: {exc}"], "warnings": []}
     return {"created": True, "errors": [], "warnings": [], **dispatch_files}
@@ -102,7 +102,9 @@ def auto_write_source_manifest(task_dir: Path, request_path: Path | None) -> dic
             "errors": [],
             "warnings": [],
         }
-    context_path = request_path if request_path else task_dir / "mas_task_bundle.json"
+    # Always use the bound dispatch bundle. A raw request has no run_id and is
+    # not the authoritative post-dispatch context.
+    context_path = task_dir / "mas_task_bundle.json"
     context = read_json(context_path)
     if not isinstance(context, dict):
         return {

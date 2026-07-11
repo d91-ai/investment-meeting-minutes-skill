@@ -10,6 +10,8 @@ import os
 import re
 import shutil
 import sys
+import tempfile
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -82,19 +84,39 @@ def normalize_meeting_date(date_override: str | None, content: str = "") -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def next_available_output_path(export_dir: Path, filename_base: str) -> Path:
-    """Return an output path that does not overwrite an existing note."""
-    md_path = export_dir / f"{filename_base}.md"
-    if not md_path.exists():
-        return md_path
-
+def output_path_candidates(export_dir: Path, filename_base: str) -> list[Path]:
+    candidates = [export_dir / f"{filename_base}.md"]
     stamp = datetime.now().strftime("%H%M%S")
     for idx in range(1, 1000):
         suffix = f"-{stamp}" if idx == 1 else f"-{stamp}-{idx}"
-        candidate_md = export_dir / f"{filename_base}{suffix}.md"
-        if not candidate_md.exists():
-            return candidate_md
-    raise FileExistsError(f"无法为 {filename_base} 生成未占用的输出文件名")
+        candidates.append(export_dir / f"{filename_base}{suffix}.md")
+    return candidates
+
+
+def publish_completed_file(part_path: Path, export_dir: Path, filename_base: str) -> Path:
+    """Atomically publish a completed file without exposing partial Markdown."""
+    for candidate in output_path_candidates(export_dir, filename_base):
+        try:
+            os.link(part_path, candidate)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise OSError(
+                exc.errno,
+                "目标文件系统不支持安全的原子无覆盖发布；未采用可能覆盖或暴露半文件的降级方案",
+                str(candidate),
+            ) from exc
+        return candidate
+    raise FileExistsError(f"无法为 {filename_base} 原子发布未占用的输出文件名")
+
+
+def cleanup_part_file(part_path: Path | None) -> None:
+    if part_path is None:
+        return
+    try:
+        part_path.unlink(missing_ok=True)
+    except OSError as exc:
+        warnings.warn(f"已完成 Markdown 发布，但临时 part 文件清理失败: {part_path}: {exc}", RuntimeWarning)
 
 
 def export_note(source_file: Path, export_dir: Path, date_override: str | None) -> ExportResult:
@@ -108,14 +130,30 @@ def export_note(source_file: Path, export_dir: Path, date_override: str | None) 
     export_dir = export_dir / meeting_date
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    md_path = next_available_output_path(export_dir, filename_base)
+    md_path = export_dir / f"{filename_base}.md"
+    part_path: Path | None = None
 
     try:
-        shutil.copy2(source_file, md_path)
-        md_ok, md_message = validate_utf8_text_file(md_path, require_cjk=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{filename_base}.",
+            suffix=".part",
+            dir=export_dir,
+            delete=False,
+        ) as destination:
+            part_path = Path(destination.name)
+            with source_file.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+        shutil.copystat(source_file, part_path)
+        md_ok, md_message = validate_utf8_text_file(part_path, require_cjk=True)
+        if not md_ok:
+            raise UnicodeError(md_message)
+        md_path = publish_completed_file(part_path, export_dir, filename_base)
     except Exception as exc:
         md_ok = False
         md_message = str(exc)
+    finally:
+        cleanup_part_file(part_path)
 
     return ExportResult(
         md_path=md_path,

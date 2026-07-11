@@ -3,7 +3,7 @@
     "source_manifest": {
       "source_mode": "document_only",
       "materials": [
-        {"kind": "document", "name": "synthetic-clean-transcript.md"}
+        {"kind": "document", "name": "clean_company_call.md"}
       ],
       "archive_allowed": true,
       "archive_status": "skipped_for_fixture",
@@ -33,8 +33,11 @@
       "markdown_path": "synthetic.md",
       "markdown_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "verification_sidecar_path": "",
-      "validators_run": [{"name": "validate_meeting_minutes_contract.py", "ok": true}],
-      "regression_result": {"ok": false, "errors": ["synthetic regression failure"]},
+      "validators_run": [
+        {"name": "validate_utf8_text.py", "ok": true},
+        {"name": "validate_meeting_minutes_contract.py", "ok": true}
+      ],
+      "regression_result": {"name": "run_meeting_minutes_regression.py", "case_count": 1, "ok": false, "errors": ["synthetic regression failure"]},
       "export_status": "passed",
       "known_unverified_parts": [],
       "main_actions_verified": true

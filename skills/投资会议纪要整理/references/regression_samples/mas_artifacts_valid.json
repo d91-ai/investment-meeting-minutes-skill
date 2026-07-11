@@ -3,8 +3,8 @@
     "source_manifest": {
       "source_mode": "audio_plus_document",
       "materials": [
-        {"kind": "audio", "name": "synthetic-audio.m4a"},
-        {"kind": "document", "name": "synthetic-draft.md"}
+        {"kind": "audio", "name": "synthetic_meeting.wav"},
+        {"kind": "document", "name": "provided_transcript.md"}
       ],
       "archive_allowed": true,
       "archive_status": "skipped_for_fixture",
@@ -71,8 +71,11 @@
       "markdown_path": "synthetic.md",
       "markdown_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "verification_sidecar_path": "synthetic.verification.json",
-      "validators_run": [{"name": "validate_meeting_minutes_contract.py", "ok": true}],
-      "regression_result": {"ok": true},
+      "validators_run": [
+        {"name": "validate_utf8_text.py", "ok": true},
+        {"name": "validate_meeting_minutes_contract.py", "ok": true}
+      ],
+      "regression_result": {"name": "run_meeting_minutes_regression.py", "case_count": 1, "ok": true},
       "export_status": "passed",
       "known_unverified_parts": ["某某科技"],
       "main_actions_verified": true

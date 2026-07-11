@@ -11,6 +11,8 @@ import os
 import re
 import shutil
 import sys
+import tempfile
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -158,6 +160,44 @@ def plan_archive_files(
     }
 
 
+def archive_target_candidates(target: Path) -> list[Path]:
+    timestamp = datetime.now().strftime("%H%M%S")
+    candidates = [target]
+    candidates.extend(
+        target.with_name(
+            f"{target.stem}{f'-{timestamp}' if index == 1 else f'-{timestamp}-{index}'}{target.suffix}"
+        )
+        for index in range(1, 1000)
+    )
+    return candidates
+
+
+def publish_archive_file(part_path: Path, target: Path) -> Path:
+    """Atomically publish a completed archive file without overwriting."""
+    for candidate in archive_target_candidates(target):
+        try:
+            os.link(part_path, candidate)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise OSError(
+                exc.errno,
+                "目标文件系统不支持安全的原子无覆盖归档；未采用可能覆盖或暴露半文件的降级方案",
+                str(candidate),
+            ) from exc
+        return candidate
+    raise FileExistsError(f"无法为归档文件原子发布未占用名称: {target.name}")
+
+
+def cleanup_archive_part_file(part_path: Path | None) -> None:
+    if part_path is None:
+        return
+    try:
+        part_path.unlink(missing_ok=True)
+    except OSError as exc:
+        warnings.warn(f"已完成原始文件归档，但临时 part 文件清理失败: {part_path}: {exc}", RuntimeWarning)
+
+
 def archive_files(
     files: list[Path],
     archive_root: Path,
@@ -169,11 +209,33 @@ def archive_files(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[Path] = []
-    for item in plan["files"]:
-        source = Path(str(item["source"]))
-        target = Path(str(item["target"]))
-        shutil.copy2(source, target)
-        copied.append(target)
+    try:
+        for item in plan["files"]:
+            source = Path(str(item["source"]))
+            target = Path(str(item["target"]))
+            part_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{target.name}.",
+                    suffix=".part",
+                    dir=target_dir,
+                    delete=False,
+                ) as target_handle:
+                    part_path = Path(target_handle.name)
+                    with source.open("rb") as source_handle:
+                        shutil.copyfileobj(source_handle, target_handle)
+                shutil.copystat(source, part_path)
+                target = publish_archive_file(part_path, target)
+                copied.append(target)
+            except Exception:
+                raise
+            finally:
+                cleanup_archive_part_file(part_path)
+    except Exception:
+        for target in copied:
+            target.unlink(missing_ok=True)
+        raise
     return copied
 
 

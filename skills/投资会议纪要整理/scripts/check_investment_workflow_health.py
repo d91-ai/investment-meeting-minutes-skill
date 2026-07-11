@@ -332,6 +332,43 @@ def local_exporter_check() -> dict[str, Any]:
     return check("error", "本地 Markdown 导出器", "导出脚本 --help 失败", path=str(script), stderr=stderr.strip() or stdout.strip())
 
 
+def atomic_no_clobber_check(path: Path) -> dict[str, Any]:
+    """Verify the destination supports same-directory hard-link publication."""
+    if not path.is_dir():
+        return check("error", "安全原子发布", "本地输出目录不存在或不是目录", path=str(path))
+    source_path: Path | None = None
+    target_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".meeting-minutes-link-probe-",
+            suffix=".part",
+            dir=path,
+            delete=False,
+        ) as source:
+            source.write(b"atomic-link-probe\n")
+            source_path = Path(source.name)
+        target_path = source_path.with_name(f"{source_path.name}.published")
+        os.link(source_path, target_path)
+        if target_path.read_bytes() != b"atomic-link-probe\n":
+            return check("error", "安全原子发布", "hard-link 探针内容不一致", path=str(path))
+        return check("ok", "安全原子发布", "目标目录支持同目录 hard-link 原子无覆盖发布", path=str(path))
+    except OSError as exc:
+        return check(
+            "error",
+            "安全原子发布",
+            f"目标目录不支持安全的 hard-link 原子无覆盖发布: {exc}",
+            path=str(path),
+        )
+    finally:
+        for probe_path in (target_path, source_path):
+            if probe_path is not None:
+                try:
+                    probe_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
 def asr_checks(strict: bool, *, runtime_smoke: bool) -> list[dict[str, Any]]:
     runtime_python = asr_runtime_python()
     checks = [
@@ -360,6 +397,7 @@ def document_checks(strict: bool, *, prepare_local_dirs: bool = False) -> list[d
 def export_checks(strict: bool, *, prepare_local_dirs: bool = False) -> list[dict[str, Any]]:
     return [
         path_check("本地输出目录", MINUTES_DIR, writable=True, create_if_missing=prepare_local_dirs),
+        atomic_no_clobber_check(MINUTES_DIR),
         markdown_validator_check(),
         local_exporter_check(),
     ]

@@ -69,7 +69,7 @@ MAIN_ACTION_SPECS: dict[str, dict[str, Any]] = {
     "repair_transcript_before_draft": {
         "automation_level": "repair_required",
         "inputs": ["transcript_audit"],
-        "main_workflow_action": "Repair or rerun transcription before drafting or final delivery.",
+        "main_workflow_action": "Repair or rerun transcription before drafting.",
         "output": "new transcript evidence and a replacement transcript_audit artifact",
     },
     "ask_user_about_transcript_quality": {
@@ -146,7 +146,12 @@ def prompt_path(task_dir: Path, relative_path: str) -> str:
 def plan_status_for(action_type: str) -> str:
     if action_type == "collect_or_dispatch_phase_artifacts":
         return "dispatch_or_collect_phase"
-    if action_type in {"repair_missing_artifacts", "repair_invalid_or_duplicate_artifacts", "repair_before_final_delivery"}:
+    if action_type in {
+        "repair_missing_artifacts",
+        "repair_invalid_or_duplicate_artifacts",
+        "repair_before_continue",
+        "repair_before_final_delivery",
+    }:
         return "repair_before_continue"
     if action_type == "ask_user_for_narrow_confirmation":
         return "ask_user"
@@ -256,7 +261,12 @@ def plan_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
                 "command": collector_command(task_dir, phase_for_commands),
             }
         )
-    elif action_type in {"repair_missing_artifacts", "repair_invalid_or_duplicate_artifacts", "repair_before_final_delivery"}:
+    elif action_type in {
+        "repair_missing_artifacts",
+        "repair_invalid_or_duplicate_artifacts",
+        "repair_before_continue",
+        "repair_before_final_delivery",
+    }:
         recommended_steps.append(
             {
                 "action": action_type,

@@ -70,6 +70,8 @@ REVIEW_SPEAKER_ROLE_TERMS = {
     "主持人",
     "研究员",
     "管理层",
+    "负责人",
+    "主管",
 }
 
 DOCUMENT_ONLY_SOURCE_MODES = {"document", "document-only", "document_only", "text", "text-only", "文稿", "纯文本"}
@@ -376,9 +378,34 @@ def validate_verification_sidecar(verification_path: Path | None, *, require_ver
         if doubtful_type not in ALLOWED_DOUBTFUL_TYPES:
             errors.append("verification 存疑类型必须为固定枚举值: 人名, 说话人身份, 公司或证券标的, 行业术语, 数字或时间, 其他业务事实")
         sidecar_value = record.get("是否需要 sidecar")
-        sidecar_enabled = sidecar_value is True or str(sidecar_value).strip().lower() == "true"
-        if not sidecar_enabled or doubtful_type in NON_BUSINESS_SIDECAR_TYPES:
+        if not isinstance(sidecar_value, bool):
+            errors.append(f"verification 第 {index} 条 是否需要 sidecar 必须是 boolean")
+        if sidecar_value is not True or doubtful_type in NON_BUSINESS_SIDECAR_TYPES:
             errors.append("verification sidecar 记录必须来自 是否需要 sidecar=true 的非人名业务存疑项")
+        for field in VERIFICATION_REQUIRED_FIELDS:
+            if field == "是否需要 sidecar":
+                continue
+            if field == "检索/证据路径" and field in record:
+                evidence_path = record[field]
+                if not (
+                    isinstance(evidence_path, str)
+                    or (
+                        isinstance(evidence_path, list)
+                        and all(isinstance(item, str) and item.strip() for item in evidence_path)
+                    )
+                ):
+                    errors.append(f"verification 第 {index} 条 检索/证据路径 必须是 string 或非空 string array")
+                continue
+            if field in record and not isinstance(record[field], str):
+                errors.append(f"verification 第 {index} 条 {field} 必须是 string")
+        for field in ("原始表述", "当前判断", "上下文依据", "最终处理"):
+            if isinstance(record.get(field), str) and not record[field].strip():
+                errors.append(f"verification 第 {index} 条 {field} 不得为空")
+        evidence_path = record.get("检索/证据路径")
+        if isinstance(evidence_path, str) and not evidence_path.strip():
+            errors.append(f"verification 第 {index} 条 检索/证据路径 不得为空")
+        elif isinstance(evidence_path, list) and not evidence_path:
+            errors.append(f"verification 第 {index} 条 检索/证据路径 不得为空")
     return {"ok": not errors, "errors": errors, "warnings": warnings, "record_count": len(records)}
 
 

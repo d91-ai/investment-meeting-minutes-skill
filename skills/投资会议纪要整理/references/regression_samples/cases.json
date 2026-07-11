@@ -604,9 +604,17 @@
       "expected_stem": "2026-07-02 - 会议系列 - 会议类型"
     },
     {
+      "name": "导出非法日期负例",
+      "mode": "export_invalid_date_negative",
+      "check": "export_filename",
+      "file": "invalid_date_negative.md",
+      "expect_fail": true,
+      "required_error_terms": ["会议日期 必须为 YYYY-MM-DD"]
+    },
+    {
       "name": "文本-only 样例",
       "mode": "text_only",
-      "source_mode": "document",
+      "source_mode": "document_only",
       "file": "text_only.md",
       "required_terms": ["中芯国际", "订单能见度改善", "没有加仓"]
     },
@@ -631,8 +639,36 @@
       "required_error_terms": ["缺少字段"]
     },
     {
+      "name": "verification sidecar false 记录负例",
+      "mode": "audio_false_sidecar_negative",
+      "file": "audio_only.md",
+      "verification_file": "audio_false_sidecar.verification.json",
+      "require_verification": true,
+      "expect_fail": true,
+      "required_error_terms": ["sidecar 记录必须来自 是否需要 sidecar=true"]
+    },
+    {
+      "name": "verification sidecar 人名 true 负例",
+      "mode": "audio_person_true_sidecar_negative",
+      "file": "audio_only.md",
+      "verification_file": "audio_person_true_sidecar.verification.json",
+      "require_verification": true,
+      "expect_fail": true,
+      "required_error_terms": ["非人名业务存疑项"]
+    },
+    {
+      "name": "verification sidecar 未知存疑类型负例",
+      "mode": "audio_unknown_type_sidecar_negative",
+      "file": "audio_only.md",
+      "verification_file": "audio_unknown_type_sidecar.verification.json",
+      "require_verification": true,
+      "expect_fail": true,
+      "required_error_terms": ["存疑类型必须为固定枚举值"]
+    },
+    {
       "name": "音频+文稿 样例",
       "mode": "audio_text",
+      "source_mode": "audio_plus_document",
       "file": "audio_text.md",
       "require_audio_timestamps": true,
       "required_terms": ["光模块", "800G", "我还是觉得", "我不想只写成订单好转", "存疑：英伟达供货节奏"]
@@ -673,19 +709,35 @@
       "required_error_terms": ["duration_ms"]
     },
     {
+      "name": "可靠时间戳索引为空负例",
+      "mode": "timestamp_index_empty_negative",
+      "file": "audio_only.md",
+      "timestamp_index_file": "timestamp_index_empty_negative.json",
+      "timestamp_index_require_reliable": true,
+      "expect_fail": true,
+      "required_error_terms": ["timestamp_index 不能为空"]
+    },
+    {
+      "name": "未选中低精度 timestamp 内部线索样例",
+      "mode": "timestamp_index_unselected_low_precision",
+      "file": "audio_only.md",
+      "timestamp_index_file": "timestamp_index_unselected_low_precision.json",
+      "required_warning_terms": ["未被选中用于存疑"]
+    },
+    {
       "name": "多人复盘会类型样例",
       "mode": "meeting_type_review",
       "source_mode": "document",
       "file": "review_meeting.md",
-      "required_terms": ["多人复盘会", "真实顺序", "中际旭创", "我今天还是围绕", "我没有减仓", "不想改成别的说法"]
+      "required_terms": ["多人复盘会", "真实顺序", "中际旭创", "我今天还是围绕", "我没有减仓", "不想改成别的说法", "兆易创新(603986.SH)｜江波龙(301308.SZ)", "立讯精密(002475.SZ)"]
     },
     {
-      "name": "Word 标题存疑加粗下划线样例",
-      "mode": "word_bold_heading_doubtful",
+      "name": "空标的标题负例",
+      "mode": "empty_target_heading_negative",
       "source_mode": "document",
-      "file": "word_bold_heading_doubtful.md",
-      "word_export": true,
-      "required_terms": ["候选公司(09999.HK)", "候选板块", "候选术语"]
+      "file": "empty_target_heading_negative.md",
+      "expect_fail": true,
+      "required_error_terms": ["标题不得使用空括号占位"]
     },
     {
       "name": "发言人标题上下文识别样例",
@@ -703,7 +755,7 @@
       "required_error_terms": ["发言人标题不是标的或主题标题"]
     },
     {
-      "name": "多人复盘会缺标的标题 warning 样例",
+      "name": "多人复盘会缺板块标题 warning 样例",
       "mode": "review_missing_heading_warning",
       "source_mode": "document",
       "file": "review_missing_heading_warning.md",
@@ -757,6 +809,53 @@
       "required_error_terms": ["缺少样例关键锚点", "包含样例禁止锚点"]
     },
     {
+      "name": "转录预处理保留实体中的单字",
+      "mode": "process_transcript_entity_filler",
+      "check": "process_transcript",
+      "file": "text_only.md",
+      "input_text": "发言人1：哈森股份订单有变化，哈药股份今天提了一下。",
+      "expected_segment_count": 1,
+      "required_terms": ["哈森股份订单有变化", "哈药股份今天提了一下"],
+      "forbidden_terms": ["森股份订单有变化，药股份"]
+    },
+    {
+      "name": "转录预处理识别数字发言人",
+      "mode": "process_transcript_numeric_speakers",
+      "check": "process_transcript",
+      "file": "text_only.md",
+      "input_text": "发言人1：我看好半导体。\n发言人2：我看好存储。",
+      "expected_segment_count": 2,
+      "required_terms": ["### 1. 发言人1", "### 2. 发言人2", "我看好半导体", "我看好存储"],
+      "forbidden_terms": ["### 1. 发言人A"]
+    },
+    {
+      "name": "转录预处理不把行业短句当公司名",
+      "mode": "process_transcript_industry_not_company",
+      "check": "process_transcript",
+      "file": "text_only.md",
+      "input_text": "发言人1：我看好半导体。",
+      "expected_segment_count": 1,
+      "required_terms": ["疑似公司名称：未识别", "我看好半导体"],
+      "forbidden_terms": ["疑似公司名称：我看好半导体"]
+    },
+    {
+      "name": "转录预处理空输入负例",
+      "mode": "process_transcript_empty_input_negative",
+      "check": "process_transcript",
+      "file": "text_only.md",
+      "input_text": "",
+      "expect_fail": true,
+      "required_error_terms": ["输入文本为空"]
+    },
+    {
+      "name": "SenseVoice bridge 缺 audio 字段负例",
+      "mode": "sensevoice_bridge_no_audio_negative",
+      "check": "sensevoice_bridge_form",
+      "file": "text_only.md",
+      "expect_fail": true,
+      "required_error_terms": ["audio field required"]
+    },
+    {
       "name": "公司交流类型样例",
       "mode": "meeting_type_listed_company",
       "source_mode": "document",
@@ -764,11 +863,43 @@
       "required_terms": ["公司交流", "单家公司交流", "公司经营"]
     },
     {
+      "name": "公司交流裸 Q 格式负例",
+      "mode": "listed_company_bare_q_negative",
+      "source_mode": "document",
+      "file": "listed_company_bare_q_negative.md",
+      "expect_fail": true,
+      "required_error_terms": ["包含禁止输出内容"]
+    },
+    {
       "name": "专家交流类型样例",
       "mode": "meeting_type_expert_call",
       "source_mode": "document",
       "file": "expert_call.md",
       "required_terms": ["专家交流", "问答线索", "设备订单"]
+    },
+    {
+      "name": "专家交流裸提问格式负例",
+      "mode": "expert_call_bare_q_negative",
+      "source_mode": "document",
+      "file": "expert_call_bare_q_negative.md",
+      "expect_fail": true,
+      "required_error_terms": ["包含禁止输出内容"]
+    },
+    {
+      "name": "非法日期元信息负例",
+      "mode": "invalid_date_negative",
+      "source_mode": "document",
+      "file": "invalid_date_negative.md",
+      "expect_fail": true,
+      "required_error_terms": ["会议日期 必须为 YYYY-MM-DD", "整理时间 必须为 YYYY-MM-DD"]
+    },
+    {
+      "name": "非零填充日期元信息负例",
+      "mode": "non_padded_date_negative",
+      "source_mode": "document",
+      "file": "non_padded_date_negative.md",
+      "expect_fail": true,
+      "required_error_terms": ["会议日期 必须为 YYYY-MM-DD", "整理时间 必须为 YYYY-MM-DD"]
     },
     {
       "name": "音频未提供时间戳负例",

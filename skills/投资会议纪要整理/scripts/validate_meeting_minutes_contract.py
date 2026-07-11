@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ FORBIDDEN_PATTERNS = [
     r"Traceback",
     r"Observation:",
     r"(?m)^###\s*问答\s*\d+",
+    r"(?im)^\s*(?:Q|提问|问)[:：]",
     r"(?im)^\s*A[:：]",
 ]
 FORBIDDEN_ESCAPE_HEADINGS = {
@@ -70,23 +72,25 @@ REVIEW_SPEAKER_ROLE_TERMS = {
     "管理层",
 }
 
-DOCUMENT_ONLY_SOURCE_MODES = {"document", "document-only", "text", "text-only", "文稿", "纯文本"}
-AUDIO_SOURCE_MODES = {"audio", "audio-only", "audio-text", "audio+text", "音频", "音频转写", "文稿+音频"}
+DOCUMENT_ONLY_SOURCE_MODES = {"document", "document-only", "document_only", "text", "text-only", "文稿", "纯文本"}
+AUDIO_SOURCE_MODES = {
+    "audio",
+    "audio-only",
+    "audio_only",
+    "audio-text",
+    "audio_text",
+    "audio+text",
+    "audio+document",
+    "audio_plus_document",
+    "音频",
+    "音频转写",
+    "文稿+音频",
+    "音频+文稿",
+}
+SOURCE_MODE_CHOICES = ["auto", *sorted(DOCUMENT_ONLY_SOURCE_MODES), *sorted(AUDIO_SOURCE_MODES)]
 AUDIO_AMBIGUITY_HEADER = ["时间戳", "原始表述", "当前判断", "候选项", "人工确认"]
 DOCUMENT_AMBIGUITY_HEADER = ["原始表述", "当前判断", "候选项", "人工确认"]
 PLACEHOLDER_VALUES = {"", "-", "无", "暂无", "无存疑", "暂无存疑", "none", "n/a"}
-REQUIRED_WORD_TEXT = ["一、发言整理"]
-FORBIDDEN_WORD_TEXT = [
-    "AI结构化总结",
-    "标的汇总表",
-    "三、处理说明",
-    "三、标的汇总表",
-    "四、存疑与待确认",
-    "输入来源",
-    "整理说明",
-    "#### ",
-    "##### ",
-]
 MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
 MEETING_TYPE_ALIASES = {"上市公司交流": "公司交流"}
 QUESTION_LINE_RE = re.compile(r"^\*\*【[^】\n]+】\*\*\s*$", re.MULTILINE)
@@ -101,6 +105,8 @@ VERIFICATION_REQUIRED_FIELDS = [
     "检索/证据路径",
     "最终处理",
 ]
+ALLOWED_DOUBTFUL_TYPES = {"人名", "说话人身份", "公司或证券标的", "行业术语", "数字或时间", "其他业务事实"}
+NON_BUSINESS_SIDECAR_TYPES = {"人名", "说话人身份"}
 TIMESTAMP_INDEX_REQUIRED_FIELDS = ["source", "precision", "text", "start", "end", "start_ms", "end_ms"]
 RELIABLE_TIMESTAMP_PRECISIONS = {"sentence", "phrase"}
 LOW_TIMESTAMP_PRECISIONS = {"segment", "chunk", "unavailable"}
@@ -214,6 +220,13 @@ def forbidden_escape_heading_findings(markdown: str) -> list[str]:
     return findings
 
 
+def empty_bracket_heading_findings(markdown: str) -> list[str]:
+    findings: list[str] = []
+    for match in re.finditer(r"(?m)^#{4,5}\s*【\s*】\s*$", markdown):
+        findings.append(match.group(0).strip())
+    return findings
+
+
 def review_meeting_heading_warnings(markdown: str, meeting_type: str) -> list[str]:
     if meeting_type != "多人复盘会":
         return []
@@ -224,7 +237,6 @@ def review_meeting_heading_warnings(markdown: str, meeting_type: str) -> list[st
     warnings: list[str] = []
     current_speaker = ""
     has_sector_heading = False
-    has_target_heading = False
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line or line == "---" or line.startswith("|"):
@@ -232,14 +244,11 @@ def review_meeting_heading_warnings(markdown: str, meeting_type: str) -> list[st
         if line.startswith("### "):
             current_speaker = line.removeprefix("### ").strip()
             has_sector_heading = False
-            has_target_heading = False
             continue
         if line.startswith("#### "):
             has_sector_heading = True
-            has_target_heading = False
             continue
         if line.startswith("##### "):
-            has_target_heading = True
             continue
         if line.startswith("#"):
             continue
@@ -247,8 +256,6 @@ def review_meeting_heading_warnings(markdown: str, meeting_type: str) -> list[st
         preview = line[:50]
         if not has_sector_heading:
             warnings.append(f"多人复盘会正文段落缺少相邻板块标题，建议复核: {speaker_hint}{preview}")
-        elif not has_target_heading:
-            warnings.append(f"多人复盘会正文段落缺少相邻标的标题，建议复核: {speaker_hint}{preview}")
         if len(warnings) >= 4:
             break
     return warnings
@@ -261,6 +268,22 @@ def metadata_field_present(markdown: str, field: str) -> bool:
 def markdown_field(markdown: str, field: str) -> str:
     match = re.search(rf"^\*\*{re.escape(field)}\*\*[:：]\s*(.+?)\s*$", markdown, re.MULTILINE)
     return match.group(1).strip() if match else ""
+
+
+def validate_date_metadata(markdown: str) -> list[str]:
+    errors: list[str] = []
+    for field in ("会议日期", "整理时间"):
+        value = markdown_field(markdown, field)
+        if not value:
+            continue
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            errors.append(f"{field} 必须为 YYYY-MM-DD 且为合法日期: {value}")
+            continue
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            errors.append(f"{field} 必须为 YYYY-MM-DD 且为合法日期: {value}")
+    return errors
 
 
 def body_bold_terms_missing_timestamps(markdown: str) -> list[str]:
@@ -298,112 +321,6 @@ def body_bold_terms(markdown: str) -> list[str]:
             if term and term not in METADATA_BOLD_LABELS:
                 terms.append(term)
     return terms
-
-
-def markdown_bold_terms(markdown: str) -> list[str]:
-    terms: list[str] = []
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        metadata_match = re.match(r"^\*\*([^*\n：:]{1,20})\*\*[:：]", stripped)
-        if metadata_match and metadata_match.group(1).strip() in METADATA_BOLD_LABELS:
-            continue
-        if re.match(r"^\*\*(Q|q|提问|问)[:：]", stripped) or QUESTION_LINE_RE.match(stripped):
-            continue
-        for match in re.finditer(r"\*\*([^*\n]{1,80})\*\*", stripped):
-            term = match.group(1).strip()
-            if term and term not in METADATA_BOLD_LABELS:
-                terms.append(term)
-    return terms
-
-
-def docx_paragraph_text(path: Path) -> tuple[str, list[dict[str, Any]], list[list[list[str]]]]:
-    try:
-        from docx import Document
-    except ImportError as exc:
-        raise RuntimeError("缺少 python-docx，无法校验 Word 文件") from exc
-
-    document = Document(str(path))
-    paragraphs: list[str] = []
-    runs: list[dict[str, Any]] = []
-    tables: list[list[list[str]]] = []
-    for paragraph in document.paragraphs:
-        paragraphs.append(paragraph.text)
-        for run in paragraph.runs:
-            if run.text:
-                runs.append({"text": run.text, "bold": bool(run.bold), "underline": bool(run.underline)})
-    for table in document.tables:
-        table_rows: list[list[str]] = []
-        for row in table.rows:
-            row_values: list[str] = []
-            for cell in row.cells:
-                row_values.append(cell.text.strip())
-                paragraphs.append(cell.text)
-                for paragraph in cell.paragraphs:
-                    for run in paragraph.runs:
-                        if run.text:
-                            runs.append({"text": run.text, "bold": bool(run.bold), "underline": bool(run.underline)})
-            table_rows.append(row_values)
-        tables.append(table_rows)
-    return "\n".join(paragraphs), runs, tables
-
-
-def table_contains_fields(table: list[list[str]], fields: list[str]) -> bool:
-    cells = [cell.strip().rstrip("：:") for row in table for cell in row]
-    return all(field in cells for field in fields)
-
-
-def first_row_matches(table: list[list[str]], headers: list[str]) -> bool:
-    return bool(table) and [cell.strip() for cell in table[0]] == headers
-
-
-def markdown_ambiguity_headers(markdown: str) -> list[str]:
-    table_lines = ambiguity_table_lines(markdown)
-    if not table_lines:
-        return []
-    return [cell.strip() for cell in table_lines[0].strip("|").split("|")]
-
-
-def validate_word_contract(docx_path: Path, markdown: str | None = None) -> dict[str, Any]:
-    errors: list[str] = []
-    warnings: list[str] = []
-    if not docx_path.exists():
-        return {"ok": False, "errors": [f"Word 文件不存在: {docx_path}"], "warnings": []}
-
-    try:
-        text, runs, tables = docx_paragraph_text(docx_path)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "errors": [f"Word 文件无法打开: {exc}"], "warnings": []}
-
-    for required in REQUIRED_WORD_TEXT:
-        if required not in text:
-            errors.append(f"Word 缺少必需章节: {required}")
-    for forbidden in FORBIDDEN_WORD_TEXT:
-        if forbidden in text:
-            errors.append(f"Word 包含禁止内容: {forbidden}")
-    if not re.search(r"[\u4e00-\u9fff]", text):
-        errors.append("Word 未检测到中文内容")
-
-    if markdown:
-        if not any(table_contains_fields(table, REQUIRED_METADATA_FIELDS) for table in tables):
-            errors.append("Word 元信息必须使用真正表格，并包含会议日期、整理时间、会议标题、会议类型、会议系列")
-        ambiguity_headers = markdown_ambiguity_headers(markdown)
-        if ambiguity_headers and not any(first_row_matches(table, ambiguity_headers) for table in tables):
-            errors.append(f"Word 存疑表必须使用真正表格，并包含表头: {' | '.join(ambiguity_headers)}")
-        for term in markdown_bold_terms(markdown):
-            matched = any(term in run["text"] and run["bold"] and run["underline"] for run in runs)
-            if not matched:
-                errors.append(f"Markdown 加粗存疑词未在 Word 中检测到加粗+下划线: {term}")
-
-    return {
-        "ok": not errors,
-        "errors": errors,
-        "warnings": warnings,
-        "paragraph_count": text.count("\n") + 1 if text else 0,
-        "run_count": len(runs),
-        "table_count": len(tables),
-    }
 
 
 def read_verification_records(path: Path) -> list[dict[str, Any]]:
@@ -454,6 +371,14 @@ def validate_verification_sidecar(verification_path: Path | None, *, require_ver
         missing = [field for field in VERIFICATION_REQUIRED_FIELDS if field not in record]
         if missing:
             errors.append(f"verification 第 {index} 条缺少字段: {', '.join(missing)}")
+            continue
+        doubtful_type = str(record.get("存疑类型", "")).strip()
+        if doubtful_type not in ALLOWED_DOUBTFUL_TYPES:
+            errors.append("verification 存疑类型必须为固定枚举值: 人名, 说话人身份, 公司或证券标的, 行业术语, 数字或时间, 其他业务事实")
+        sidecar_value = record.get("是否需要 sidecar")
+        sidecar_enabled = sidecar_value is True or str(sidecar_value).strip().lower() == "true"
+        if not sidecar_enabled or doubtful_type in NON_BUSINESS_SIDECAR_TYPES:
+            errors.append("verification sidecar 记录必须来自 是否需要 sidecar=true 的非人名业务存疑项")
     return {"ok": not errors, "errors": errors, "warnings": warnings, "record_count": len(records)}
 
 
@@ -526,21 +451,25 @@ def validate_timestamp_index_records(
                     errors.append(f"timestamp_index 第 {index} 条句级/短句级 anchor 缺少 {field}")
         elif precision == "segment":
             source = str(record.get("source") or "").strip().lower()
+            segment_error = ""
             if source != "sensevoice_vad_segment":
-                errors.append(f"timestamp_index 第 {index} 条低精度 segment 不得作为可靠存疑时间戳；只有短 VAD segment 可用")
+                segment_error = f"timestamp_index 第 {index} 条低精度 segment 不得作为可靠存疑时间戳；只有短 VAD segment 可用"
             else:
                 start_ms = _timestamp_record_ms(record, "start_ms")
                 end_ms = _timestamp_record_ms(record, "end_ms")
                 if start_ms is None or end_ms is None:
-                    errors.append(f"timestamp_index 第 {index} 条短 VAD segment start_ms/end_ms 必须为数字")
+                    segment_error = f"timestamp_index 第 {index} 条短 VAD segment start_ms/end_ms 必须为数字"
                 else:
                     duration_ms = end_ms - start_ms
                     if duration_ms <= 0:
-                        errors.append(f"timestamp_index 第 {index} 条短 VAD segment duration_ms 必须大于 0")
+                        segment_error = f"timestamp_index 第 {index} 条短 VAD segment duration_ms 必须大于 0"
                     elif duration_ms > MAX_RELIABLE_VAD_SEGMENT_MS:
-                        errors.append(
-                            f"timestamp_index 第 {index} 条短 VAD segment duration_ms 超过 10000: {duration_ms}"
-                        )
+                        segment_error = f"timestamp_index 第 {index} 条短 VAD segment duration_ms 超过 10000: {duration_ms}"
+            if segment_error:
+                if used_for_doubtful:
+                    errors.append(segment_error)
+                else:
+                    warnings.append(f"{segment_error}；未被选中用于存疑时仅作内部复核线索")
         elif precision in LOW_TIMESTAMP_PRECISIONS:
             if used_for_doubtful:
                 errors.append(f"timestamp_index 第 {index} 条低精度 {precision} 不得作为可靠存疑时间戳")
@@ -555,7 +484,9 @@ def validate_timestamp_index_records(
                     f"timestamp_index 第 {index} 条被标记用于存疑，但不是 sentence/phrase 或短 VAD segment: {precision or '空'}"
                 )
 
-    if require_reliable and records and reliable_count == 0:
+    if require_reliable and not records:
+        errors.append("要求可靠时间戳时，timestamp_index 不能为空")
+    elif require_reliable and reliable_count == 0:
         errors.append("要求可靠时间戳时，timestamp_index 至少应包含 sentence/phrase anchor 或短 VAD segment")
     if require_reliable and selected_count == 0:
         warnings.append("要求可靠时间戳时，timestamp_index 未标记 used_for_doubtful/selected_for_ambiguity；仅完成字段和精度基础检查")
@@ -782,6 +713,7 @@ def validate_contract(
     for field in REQUIRED_METADATA_FIELDS:
         if not metadata_field_present(markdown, field):
             errors.append(f"缺少会议元信息字段: {field}")
+    errors.extend(validate_date_metadata(markdown))
 
     meeting_type = markdown_field(markdown, "会议类型")
     errors.extend(validate_meeting_type_reference(markdown, meeting_type))
@@ -801,6 +733,10 @@ def validate_contract(
     if escape_headings:
         preview = "；".join(escape_headings[:6])
         errors.append(f"包含契约外逃逸标题: {preview}")
+    empty_bracket_headings = empty_bracket_heading_findings(markdown)
+    if empty_bracket_headings:
+        preview = "；".join(empty_bracket_headings[:6])
+        errors.append(f"标题不得使用空括号占位: {preview}")
 
     has_body_section = "## 一、发言整理" in markdown
     has_subheading = bool(re.search(r"^###(?!#)\s+", markdown, re.MULTILINE))
@@ -872,7 +808,6 @@ def validate_contract(
 def main() -> int:
     parser = argparse.ArgumentParser(description="校验会议纪要 Markdown 是否符合当前输出契约")
     parser.add_argument("markdown_file", help="待校验 Markdown 文件")
-    parser.add_argument("--word", help="可选：同时校验对应导出 Word 文件")
     parser.add_argument("--verification", help="可选：同时校验同 stem 的 verification JSON/JSONL 结构")
     parser.add_argument("--require-verification", action="store_true", help="要求 verification sidecar 存在且至少包含一条记录")
     parser.add_argument("--timestamp-index", help="可选：同时校验 timestamp_index.json 字段和精度")
@@ -881,7 +816,7 @@ def main() -> int:
     parser.add_argument("--forbid-term", action="append", default=[], help="样例或人工复核中不应出现的改写锚点，可重复")
     parser.add_argument(
         "--source-mode",
-        choices=["auto", "document", "document-only", "text", "text-only", "audio", "audio-only", "audio-text", "audio+text"],
+        choices=SOURCE_MODE_CHOICES,
         default="auto",
         help="来源模式；需结合 --timestamp-mode 判断存疑表是否包含时间戳列",
     )
@@ -905,6 +840,13 @@ def main() -> int:
         else:
             print(payload["errors"][0], file=sys.stderr)
         return 1
+    except OSError as exc:
+        payload = {"ok": False, "errors": [f"文件无法读取: {exc}"], "warnings": []}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(payload["errors"][0], file=sys.stderr)
+        return 1
 
     result = validate_contract(
         markdown,
@@ -914,12 +856,6 @@ def main() -> int:
         require_audio_timestamps=args.require_audio_timestamps,
         timestamp_mode=args.timestamp_mode,
     )
-    if args.word:
-        word_result = validate_word_contract(Path(args.word).expanduser(), markdown)
-        result["word"] = word_result
-        result["errors"].extend(word_result["errors"])
-        result["warnings"].extend(word_result["warnings"])
-        result["ok"] = result["ok"] and word_result["ok"]
     if args.verification or args.require_verification:
         verification_path = Path(args.verification).expanduser() if args.verification else None
         verification_result = validate_verification_sidecar(

@@ -21,7 +21,7 @@ FILLER_PATTERNS = [
     (r"(然后就是)+", "然后"),
     (r"(那个那个)+", "那个"),
     (r"(对对对|是是是|嗯嗯嗯)", ""),
-    (r"(嗯|啊|呃|哦|哈)[，, ]*", ""),
+    (r"(^|[\s，,。！？；;：:、])(嗯|啊|呃|哦|哈)(?=$|[\s，,。！？；;：:、])[\s，,。！？；;：:、]*", r"\1"),
     (r"^(那个|就是|然后|所以)[，, ]*", ""),
     (r"我跟你说[，, ]*", ""),
     (r"你知道吗?[，, ]*", ""),
@@ -30,7 +30,7 @@ FILLER_PATTERNS = [
 ]
 
 SPEAKER_PATTERNS = [
-    r"^(?P<speaker>[A-Za-z]{1,3}|发言人[A-Z]|主持人|分析师|嘉宾)[：:]\s*(?P<content>.+)$",
+    r"^(?P<speaker>[A-Za-z]{1,3}|发言人[A-Z]|发言人\d+|主持人|分析师|嘉宾)[：:]\s*(?P<content>.+)$",
     r"^(?P<speaker>发言人\d+|[A-Za-z]{1,3}|主持人|分析师|嘉宾)\s+(?P<timestamp>\d{1,2}:\d{2}(?::\d{2})?)\s*(?P<content>.*)$",
     r"^(?P<speaker>[\u4e00-\u9fff]{1,8})[：:]\s*(?P<content>.+)$",
     r"^【(?P<speaker>[^】]{1,12})】\s*(?P<content>.+)$",
@@ -58,6 +58,28 @@ COMPANY_HINTS = [
     "电子",
     "汽车",
 ]
+COMPANY_CONTEXT_PREFIXES = [
+    "继续看好",
+    "重点关注",
+    "主要关注",
+    "我看好",
+    "不看好",
+    "看好",
+    "提到",
+    "讲到",
+    "关注",
+]
+
+
+def normalize_company_candidate(candidate: str, hint: str) -> str:
+    normalized = candidate.strip()
+    for prefix in COMPANY_CONTEXT_PREFIXES:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :].strip()
+            break
+    if normalized == hint or len(normalized) <= len(hint):
+        return ""
+    return normalized
 
 
 def clean_text(text: str) -> str:
@@ -126,7 +148,10 @@ def extract_candidates(text: str) -> tuple[list[str], list[str]]:
         symbols.update(re.findall(pattern, text))
 
     for hint in COMPANY_HINTS:
-        companies.update(re.findall(rf"[\u4e00-\u9fff]{{2,8}}{re.escape(hint)}", text))
+        for match in re.findall(rf"[\u4e00-\u9fff]{{2,8}}{re.escape(hint)}", text):
+            candidate = normalize_company_candidate(match, hint)
+            if candidate:
+                companies.add(candidate)
 
     return sorted(symbols), sorted(companies)
 
@@ -181,9 +206,20 @@ def main() -> int:
         if not input_path.exists():
             print(f"输入文件不存在: {input_path}", file=sys.stderr)
             return 1
-        raw_text = input_path.read_text(encoding="utf-8")
+        try:
+            raw_text = input_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            print(f"输入文件不是有效 UTF-8: {input_path}: {exc}", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"输入文件无法读取: {input_path}: {exc}", file=sys.stderr)
+            return 1
     else:
         parser.error("请提供输入文件或使用 --stdin")
+
+    if not raw_text.strip():
+        print("输入文本为空，无法预处理会议转录。", file=sys.stderr)
+        return 1
 
     preferred_speakers = (
         [item.strip() for item in args.speakers.split(",") if item.strip()]

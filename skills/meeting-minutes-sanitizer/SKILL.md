@@ -19,13 +19,13 @@ The core rule is: preserve business facts as much as possible, and remove speake
 Run the bundled script on Markdown or plain text input:
 
 ```bash
-python scripts/sanitize_minutes.py path/to/minutes.md
+python3 scripts/sanitize_minutes.py path/to/minutes.md
 ```
 
 Optional flags:
 
 ```bash
-python scripts/sanitize_minutes.py path/to/minutes.txt --output-dir outputs --meeting-date 2026-06-14
+python3 scripts/sanitize_minutes.py path/to/minutes.txt --output-dir outputs --meeting-date 2026-06-14
 ```
 
 The script currently supports `.md` and `.txt`. For `.docx` input, first convert the document to Markdown or plain text, then run the script.

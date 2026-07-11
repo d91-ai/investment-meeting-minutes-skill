@@ -2,6 +2,8 @@
 
 Use this file when archiving raw meeting inputs or exporting confirmed meeting notes. The naming contract is deterministic so local runs and later manual review use the same paths.
 
+This contract applies only when the user has allowed archive/export writes. If the user asks for read-only analysis, says not to archive, says not to modify files, or marks the run as a no-archive test, do not run archive/export writes without explicit confirmation.
+
 ## Raw Input Archive
 
 Archive root:
@@ -73,9 +75,10 @@ Preferred final-note filename:
 
 ```text
 YYYY-MM-DD - 会议系列 - 会议类型.md
-YYYY-MM-DD - 会议系列 - 会议类型.docx
 ```
 
-Use `--meeting-date` when an explicit export date is needed; otherwise use the Markdown `会议日期` field, then the current date as the last fallback. The filename series comes from `会议系列`; the filename type comes from `会议类型`. If either value is missing, use the literal placeholder `会议系列` or `会议类型`. The `会议标题` field does not control the final Markdown or Word filename. If the filename collides, append a timestamp suffix and keep both files.
+Use `--meeting-date` when an explicit export date is needed; otherwise use the Markdown `会议日期` field, then the current date as the last fallback. The filename series comes from `会议系列`; the filename type comes from `会议类型`. If either value is missing, use the literal placeholder `会议系列` or `会议类型`. The `会议标题` field does not control the final Markdown filename. If the filename collides, append a timestamp suffix to the Markdown file.
+
+When non-person business doubts require audit records, a same-stem `.verification.json` or `.verification.jsonl` may be kept as an internal sidecar. It is not a formal deliverable.
 
 Do not expose raw archive paths or technical archive status in the human-readable note body.

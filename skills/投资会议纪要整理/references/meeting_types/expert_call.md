@@ -1,6 +1,6 @@
 # 专家交流 Reference
 
-本文件定义 `专家交流` 的最终纪要格式依据。共同元信息、存疑表和 Word 导出规则仍以 `../output_contract.md` 为准。
+本文件定义 `专家交流` 的最终纪要格式依据。共同元信息、存疑表和内部 verification sidecar 规则仍以 `../output_contract.md` 为准。
 
 ## 适用范围
 

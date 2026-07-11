@@ -150,16 +150,18 @@ def asr_model_cache_check(*, strict: bool) -> dict[str, Any]:
         )
 
     models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
+    required_model_names = {"sensevoice", "paraformer", "vad"}
     required_incomplete = {
-        name: model
-        for name, model in models.items()
-        if name in {"sensevoice", "paraformer"} and isinstance(model, dict) and not model.get("complete")
+        name: model if isinstance(model, dict) else {"complete": False, "missing": ["not reported"]}
+        for name in required_model_names
+        for model in [models.get(name)]
+        if not (isinstance(model, dict) and model.get("complete"))
     }
     if returncode == 0 and not required_incomplete:
         return check(
             "ok",
             "ASR 模型缓存",
-            "SenseVoice 主模型和 Paraformer 辅助模型缓存完整",
+            "SenseVoice 主模型、Paraformer 辅助模型和 fsmn-vad 模型缓存完整",
             cache_root=payload.get("cache_root"),
             models=models,
         )
@@ -167,7 +169,7 @@ def asr_model_cache_check(*, strict: bool) -> dict[str, Any]:
     return check(
         status,
         "ASR 模型缓存",
-        "SenseVoice/Paraformer 模型缓存不完整；运行期禁止远程查找或下载模型",
+        "SenseVoice/Paraformer/fsmn-vad 模型缓存不完整；运行期禁止远程查找或下载模型",
         cache_root=payload.get("cache_root"),
         incomplete=required_incomplete,
         stderr=stderr.strip(),
@@ -186,16 +188,18 @@ def sensevoice_service_model_cache_check(*, strict: bool) -> dict[str, Any]:
 
     model_cache = payload.get("model_cache") if isinstance(payload.get("model_cache"), dict) else {}
     models = model_cache.get("models") if isinstance(model_cache.get("models"), dict) else {}
+    required_model_names = {"sensevoice", "paraformer", "vad"}
     required_incomplete = {
-        model_name: model
-        for model_name, model in models.items()
-        if model_name in {"sensevoice", "paraformer"} and isinstance(model, dict) and not model.get("complete")
+        model_name: model if isinstance(model, dict) else {"complete": False, "missing": ["not reported"]}
+        for model_name in required_model_names
+        for model in [models.get(model_name)]
+        if not (isinstance(model, dict) and model.get("complete"))
     }
     if payload.get("ok") is True and models and not required_incomplete:
         return check(
             "ok",
             name,
-            "服务使用的 SenseVoice 主模型和 Paraformer 辅助模型缓存完整",
+            "服务使用的 SenseVoice 主模型、Paraformer 辅助模型和 fsmn-vad 模型缓存完整",
             cache_root=model_cache.get("cache_root"),
             python=model_cache.get("python"),
         )
@@ -203,7 +207,7 @@ def sensevoice_service_model_cache_check(*, strict: bool) -> dict[str, Any]:
     return check(
         status,
         name,
-        "服务使用的 SenseVoice/Paraformer 模型缓存不完整；运行期禁止远程下载模型",
+        "服务使用的 SenseVoice/Paraformer/fsmn-vad 模型缓存不完整；运行期禁止远程下载模型",
         cache_root=model_cache.get("cache_root"),
         python=model_cache.get("python"),
         incomplete=required_incomplete,
@@ -321,11 +325,11 @@ def markdown_validator_check() -> dict[str, Any]:
 def local_exporter_check() -> dict[str, Any]:
     script = SCRIPT_DIR / "export_to_obsidian.py"
     if not script.exists():
-        return check("error", "本地 Markdown+Word 导出器", "导出脚本不存在", path=str(script))
+        return check("error", "本地 Markdown 导出器", "导出脚本不存在", path=str(script))
     returncode, stdout, stderr = run_command([sys.executable, str(script), "--help"], timeout=10)
     if returncode == 0:
-        return check("ok", "本地 Markdown+Word 导出器", "导出脚本可运行", path=str(script))
-    return check("error", "本地 Markdown+Word 导出器", "导出脚本 --help 失败", path=str(script), stderr=stderr.strip() or stdout.strip())
+        return check("ok", "本地 Markdown 导出器", "导出脚本可运行", path=str(script))
+    return check("error", "本地 Markdown 导出器", "导出脚本 --help 失败", path=str(script), stderr=stderr.strip() or stdout.strip())
 
 
 def asr_checks(strict: bool, *, runtime_smoke: bool) -> list[dict[str, Any]]:
@@ -354,11 +358,9 @@ def document_checks(strict: bool, *, prepare_local_dirs: bool = False) -> list[d
 
 
 def export_checks(strict: bool, *, prepare_local_dirs: bool = False) -> list[dict[str, Any]]:
-    document_python = document_runtime_python()
     return [
         path_check("本地输出目录", MINUTES_DIR, writable=True, create_if_missing=prepare_local_dirs),
         markdown_validator_check(),
-        python_module_check("Python 依赖: python-docx", "docx", strict=strict, python_executable=document_python),
         local_exporter_check(),
     ]
 

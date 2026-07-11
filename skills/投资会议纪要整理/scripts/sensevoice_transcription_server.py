@@ -23,6 +23,7 @@ DEFAULT_PRIMARY_ENGINE = "sensevoice"
 DEFAULT_PRIMARY_MODEL = "iic/SenseVoiceSmall"
 DEFAULT_AUXILIARY_ENGINE = "paraformer"
 DEFAULT_AUXILIARY_MODEL = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+DEFAULT_VAD_MODEL = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 DEFAULT_MODEL_CACHE = os.environ.get(
     "SENSEVOICE_MODEL_CACHE",
     os.environ.get(
@@ -36,6 +37,7 @@ LOG_DIR = Path(os.environ.get("KUMAAI_SYNC_LOG_DIR", str(Path.home() / "Library/
 MODEL_REQUIREMENTS = {
     "sensevoice": ("iic/SenseVoiceSmall", ("config.yaml", "model.pt")),
     "paraformer": (DEFAULT_AUXILIARY_MODEL, ("config.yaml", "model.pt")),
+    "vad": (DEFAULT_VAD_MODEL, ("config.yaml", "model.pt")),
 }
 
 
@@ -103,6 +105,15 @@ def _parse_multipart_form(handler: BaseHTTPRequestHandler, content_type: str) ->
         charset = part.get_content_charset() or "utf-8"
         form.add_field(name, payload.decode(charset, errors="replace"))
     return form
+
+
+def require_audio_form_file(form: MultipartForm) -> UploadedFormFile:
+    file_item = form["audio"] if "audio" in form else None
+    if file_item is None or not getattr(file_item, "filename", None):
+        raise ValueError("audio field required")
+    if not hasattr(file_item, "file"):
+        raise ValueError("audio field must be a file upload")
+    return file_item
 
 
 def _model_cache_status() -> dict:
@@ -199,9 +210,13 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
     server_version = "SenseVoiceBridge/1.0"
 
     def log_message(self, fmt: str, *args) -> None:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with (LOG_DIR / "sensevoice-transcription-server.log").open("a", encoding="utf-8") as handle:
-            handle.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))
+        message = "%s - %s\n" % (self.log_date_time_string(), fmt % args)
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with (LOG_DIR / "sensevoice-transcription-server.log").open("a", encoding="utf-8") as handle:
+                handle.write(message)
+        except OSError:
+            sys.stderr.write(message)
 
     def do_GET(self) -> None:
         if self.path.rstrip("/") == "/health":
@@ -237,9 +252,10 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             _json_response(self, 400, {"ok": False, "error": str(exc), "text": ""})
             return
-        file_item = form["audio"] if "audio" in form else None
-        if file_item is None or not getattr(file_item, "filename", None):
-            _json_response(self, 200, {"ok": True, "engine": "sensevoice", "model": DEFAULT_PRIMARY_MODEL, "text": ""})
+        try:
+            file_item = require_audio_form_file(form)
+        except ValueError as exc:
+            _json_response(self, 400, {"ok": False, "error": str(exc), "text": ""})
             return
 
         filename = _clean_filename(file_item.filename)

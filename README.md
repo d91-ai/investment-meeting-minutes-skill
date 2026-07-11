@@ -1,6 +1,6 @@
 # 投资会议纪要整理 Skill
 
-这个仓库保存 Codex 使用的中文投资会议纪要整理 skill 包，用于把投资研究场景中的会议录音、转写稿、纪要草稿或音频+文字混合材料，整理成可人工复核、可本地归档的 Markdown 和 Word 会议纪要。
+这个仓库保存 Codex 使用的中文投资会议纪要整理 skill 包，用于把投资研究场景中的会议录音、转写稿、纪要草稿或音频+文字混合材料，整理成可人工复核、可本地归档的 Markdown 会议纪要。
 
 当前定位是 **single main workflow + deterministic validation**，并逐步升级为 **main orchestrator + MAS process automation**：默认使用最快的单主流程路径，在长录音、噪音重、多人边界不清、多标的混杂、音频/文档冲突或高风险事实较多时，由 MAS 专家层自动处理过程审查和结构化中间产物。最终 Markdown 和本地归档产物只由主流程统一生成；verification sidecar 仅作为内部审计文件，不作为正式交付物。
 
@@ -113,4 +113,4 @@ python3 skills/投资会议纪要整理/scripts/plan_mas_next_action.py --summar
 ## 已知限制
 
 - 真实生产启用前仍需要脱敏 blind-run 数据验证。
-- Word 导出依赖 `python-docx`。
+- DOCX 可作为输入材料，但正式交付只导出 Markdown。

@@ -10,7 +10,7 @@
 - 主流程是最终会议纪要的唯一写作者，避免多流程直接拼接造成格式、口径和风格割裂。
 - 基础 skill 是唯一会议纪要 skill；会议类型只影响最终格式细节。
 - MAS 的目标是提高自动化效率、降低常规人工参与度、提升最终产物质量；它是高风险任务的过程自动化层，不是多个 agent 拼接终稿的写作机制。
-- Specialist agents 只产出结构化 artifact，例如 `transcript_audit`、`source_reconciliation`、`entity_verification_report`、`target_attribution_review`、`fidelity_review` 和 `export_manifest`；主流程负责裁决、自动修正、标存疑、请求人工确认和最终交付。
+- Specialist agents 只产出与当前风险直接对应的结构化 artifact，例如 `transcript_audit`、`source_reconciliation`、`entity_verification_report`、`target_attribution_review`、`fidelity_review` 和 `export_manifest`；不为单一风险固定派发全部专家。主流程负责裁决、自动修正、标存疑、请求人工确认和最终交付。
 - 主 workflow 固定为：转录 -> 校对 -> 识别 -> 联网核验 -> 编辑 -> 排版 -> 验证。
 - `发言整理` 默认是可复核原文纪要，不输出摘要、压缩稿或研报化改写；多人复盘会每段标的标题只覆盖该段明确看好的证券标的，不把顺带提及、负向、客户/供应商、竞争对手、上下游或背景对象写入标的行。
 - 音频+文稿输入时，先完成音频转录，再比较音频转录、`aligned_transcript` 和文稿质量；以覆盖更完整、发言顺序更可靠、逐字性更强、噪声/遗漏更少的一侧作为正文主源，另一侧作为发言人、术语、遗漏和冲突的交叉对比材料。联网核验只确认实体、代码、术语和公开事实，不补写会议没有说过的内容。
@@ -77,13 +77,13 @@ python3 skills/投资会议纪要整理/scripts/run_mas_phase_operator.py --requ
 
 首轮 operator 会生成绑定当前 `run_id`/`task_id` 的 prompt 和派发清单，并停在待收集 specialist 返回的状态。不要把仓库内固定 fixture 直接当成这次 run 的返回值；subagent 必须按本次 prompt 的 identity 返回，再用 `run_mas_phase_operator.py --task-dir "$MAS_DISPATCH" --return-json RETURN.json --through-phase pre_draft --json` 继续。
 
-`create_mas_source_manifest.py` 生成主流程自有 `source_manifest` artifact，默认只记录材料清单和未确认归档状态；真实归档状态仍由主流程确认。
+`create_mas_source_manifest.py` 生成主流程自有 `source_manifest` artifact，默认只记录材料清单和未确认归档状态；使用 `--task-dir` 时，会在任务锁内以当前 bundle/manifest 为唯一权威上下文。
 
-`ingest_mas_artifact.py` 接收一个 subagent 返回的 JSON：有效 artifact 写入 dispatch 目录的 `artifacts/`，schema 无效或重复 artifact 写入 `repair_history/`，并返回建议的 collector 命令。
+`ingest_mas_artifact.py` 接收一个 subagent 返回的 JSON：同一 task 的 primary/secondary artifacts 与替换历史在 task-dir 锁内作为可恢复事务提交；普通失败会回滚，进程中断留下的未完成事务会在下次 ingest 前恢复。schema 无效或重复 artifact 写入 `repair_history/`，并返回建议的 collector 命令。
 
 每个 subagent 返回必须携带生成 prompt 中的 `run_id`、`task_id`、`dispatch_phase` 和 `artifact_owner`，且只能返回该 task 声明的 primary/secondary artifacts。需要替换同一 run/task 的旧 artifact 时，使用 `--replace-existing`；脚本会先把旧值归档到 `repair_history/`，不允许静默覆盖。
 
-`collect_mas_artifacts.py` 的 `mas_run_summary.json` 以顶层 `ok` 作为继续门禁，并通过 `phase_gates` 和 `next_action` 告诉主流程下一步应派发、补齐、修复、自动处理或请求人工。
+`collect_mas_artifacts.py` 的 `mas_run_summary.json` 以顶层 `ok` 作为继续门禁；发现未完成 ingest 事务时会先阻断。collector CLI 和 `run_mas_phase_operator.py` 都从同一锁内快照发布 summary、combined artifacts、next-action plan 及 operator state，避免控制文件来自不同 artifact 版本。
 
 `plan_mas_next_action.py` 把 collector 的 `next_action` 转成可执行清单，包括待派发 prompt、对应 ingest 命令、主流程自有 artifact 缺口、修复动作、窄口径人工确认或最终 `main_action_checklist`。
 

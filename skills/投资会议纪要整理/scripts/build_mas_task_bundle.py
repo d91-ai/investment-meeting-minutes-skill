@@ -10,6 +10,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from create_mas_source_manifest import material_coverage_errors
+from mas_task_lock import mas_task_lock
 from validate_mas_artifacts import (
     BOOLEAN_FIELD_RULES,
     DOUBTFUL_REQUIRED_FIELDS,
@@ -246,6 +248,30 @@ def validate_choice(name: str, value: str, allowed: set[str]) -> None:
         raise ValueError(f"{name} 必须是以下之一: {allowed_text}")
 
 
+def bundle_configuration_errors(
+    run_profile: str,
+    source_mode: str,
+    meeting_type: str,
+    source_selection_status: str,
+) -> list[str]:
+    errors: list[str] = []
+    if run_profile not in RUN_PROFILES:
+        errors.append("run_profile 必须是固定枚举值")
+    if source_mode not in SOURCE_MODES:
+        errors.append("source_mode 必须是固定枚举值")
+    if meeting_type not in MEETING_TYPES:
+        errors.append("meeting_type 必须是固定枚举值")
+    if source_selection_status not in SOURCE_SELECTION_STATUSES:
+        errors.append("source_selection_status 必须是固定枚举值")
+    if source_mode == "audio_only" and run_profile != "strict_audio":
+        errors.append("audio_only 必须使用 strict_audio run_profile")
+    if source_mode == "audio_plus_document" and source_selection_status == "not_applicable":
+        errors.append("audio_plus_document 的 source_selection_status 不得为 not_applicable")
+    if source_mode in {"audio_only", "document_only"} and source_selection_status != "not_applicable":
+        errors.append("非混合来源的 source_selection_status 必须为 not_applicable")
+    return errors
+
+
 def normalized_source_selection_status(source_mode: str, value: Any) -> str:
     status = str(value or "").strip()
     if not status:
@@ -300,7 +326,7 @@ def select_expected_artifacts(
     if not should_use_mas(run_profile, source_mode, risk_flags, source_selection_status):
         return []
 
-    artifacts = {"source_manifest", "entity_verification_report", "doubtful_items", "fidelity_review", "export_manifest"}
+    artifacts = {"source_manifest", "export_manifest"}
     if risks & AUDIO_RISKS or source_mode == "audio_plus_document":
         artifacts.add("transcript_audit")
     if source_mode == "audio_plus_document" or risks & SOURCE_RECONCILIATION_RISKS:
@@ -310,7 +336,7 @@ def select_expected_artifacts(
     if risks & ENTITY_RISKS:
         artifacts.add("entity_verification_report")
         artifacts.add("doubtful_items")
-    if risks & FIDELITY_RISKS:
+    if risks & (FIDELITY_RISKS | SOURCE_RECONCILIATION_RISKS):
         artifacts.add("fidelity_review")
     return sorted(artifacts)
 
@@ -501,6 +527,15 @@ def prompt_markdown(bundle: dict[str, Any], task: dict[str, Any]) -> str:
 
 def build_task(artifact_type: str, run_profile: str, source_mode: str) -> dict[str, Any]:
     spec = ROLE_SPECS[artifact_type]
+    inputs = [str(item) for item in spec.get("inputs", [])]
+    if artifact_type == "fidelity_review" and source_mode != "audio_plus_document":
+        inputs = [
+            "selected primary body source and source-selection rationale"
+            if item == "source_reconciliation"
+            else item
+            for item in inputs
+        ]
+    prompt_spec = {**spec, "inputs": inputs}
     secondary_artifacts = [str(item) for item in spec.get("secondary_artifacts", [])]
     dispatch_phase = str(spec["dispatch_phase"])
     task = {
@@ -509,7 +544,7 @@ def build_task(artifact_type: str, run_profile: str, source_mode: str) -> dict[s
         "dispatch_phase": dispatch_phase,
         "secondary_artifacts": secondary_artifacts,
         "objective": spec["objective"],
-        "inputs": spec["inputs"],
+        "inputs": inputs,
         "checks": spec["checks"],
         "required_fields": REQUIRED_FIELDS[artifact_type],
         "forbidden_final_fields": sorted(FORBIDDEN_FINAL_FIELDS),
@@ -518,7 +553,7 @@ def build_task(artifact_type: str, run_profile: str, source_mode: str) -> dict[s
             secondary_artifacts,
             source_mode=source_mode,
         ),
-        "prompt": prompt_for_task(artifact_type, spec, run_profile, source_mode),
+        "prompt": prompt_for_task(artifact_type, prompt_spec, run_profile, source_mode),
         "material_handoff": DISPATCH_PHASES[dispatch_phase]["materials"],
     }
     if "doubtful_items" in secondary_artifacts:
@@ -606,6 +641,14 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(materials, list):
         raise ValueError("materials 必须是 JSON array")
     source_selection_status = normalized_source_selection_status(source_mode, request.get("source_selection_status"))
+    configuration_errors = bundle_configuration_errors(
+        run_profile,
+        source_mode,
+        meeting_type,
+        source_selection_status,
+    )
+    if configuration_errors:
+        raise ValueError("; ".join(configuration_errors))
     inferred_risks = infer_risk_flags(run_profile, source_mode, risk_flags, source_selection_status)
     expected_artifacts = select_expected_artifacts(
         run_profile,
@@ -654,12 +697,27 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_bundle(bundle: dict[str, Any]) -> list[str]:
+def validate_bundle(
+    bundle: dict[str, Any],
+    *,
+    require_material_coverage: bool = True,
+) -> list[str]:
     errors: list[str] = []
     expected_artifacts = bundle.get("expected_artifacts")
     tasks = bundle.get("tasks")
     if bundle.get("schema_version") != "1.0":
         errors.append("MAS task bundle schema_version 必须是 1.0")
+    run_profile = str(bundle.get("run_profile") or "")
+    source_mode = str(bundle.get("source_mode") or "")
+    meeting_type = str(bundle.get("meeting_type") or "")
+    source_selection_status = str(bundle.get("source_selection_status") or "")
+    configuration_errors = bundle_configuration_errors(
+        run_profile,
+        source_mode,
+        meeting_type,
+        source_selection_status,
+    )
+    errors.extend(configuration_errors)
     if not isinstance(expected_artifacts, list):
         errors.append("MAS task bundle expected_artifacts 必须是 JSON array")
         expected_artifacts = []
@@ -668,8 +726,15 @@ def validate_bundle(bundle: dict[str, Any]) -> list[str]:
         tasks = []
     if not isinstance(bundle.get("materials"), list):
         errors.append("MAS task bundle materials 必须是 JSON array")
-    elif bundle.get("mas_required") and not bundle.get("materials"):
+    elif require_material_coverage and bundle.get("mas_required") and not bundle.get("materials"):
         errors.append("MAS task bundle 启用 MAS 时 materials 不得为空")
+    elif require_material_coverage:
+        errors.extend(
+            material_coverage_errors(
+                str(bundle.get("source_mode") or ""),
+                list(bundle.get("materials") or []),
+            )
+        )
     dispatch = bundle.get("dispatch_protocol")
     if bundle.get("mas_required") and not isinstance(dispatch, dict):
         errors.append("MAS task bundle dispatch_protocol 必须是 JSON object")
@@ -683,7 +748,51 @@ def validate_bundle(bundle: dict[str, Any]) -> list[str]:
         if str(artifact) not in owners:
             errors.append(f"MAS task bundle artifact_owners 缺少 owner: {artifact}")
 
-    expected_set = {str(item) for item in expected_artifacts}
+    expected_list = [str(item) for item in expected_artifacts]
+    expected_set = set(expected_list)
+    if len(expected_list) != len(expected_set):
+        errors.append("MAS task bundle expected_artifacts 不得重复")
+    risk_flags: list[str] = []
+    try:
+        risk_flags = normalized_flags(bundle.get("risk_flags"))
+    except ValueError as exc:
+        errors.append(str(exc))
+    else:
+        if risk_flags != bundle.get("risk_flags"):
+            errors.append("MAS task bundle risk_flags 必须去重并排序")
+    if not isinstance(bundle.get("mas_required"), bool):
+        errors.append("MAS task bundle mas_required 必须是 boolean")
+    if not configuration_errors and isinstance(bundle.get("mas_required"), bool):
+        canonical_mas_required = should_use_mas(
+            run_profile,
+            source_mode,
+            risk_flags,
+            source_selection_status,
+        )
+        if bundle.get("mas_required") != canonical_mas_required:
+            errors.append("MAS task bundle mas_required 与 risk matrix 不一致")
+        canonical_expected = set(
+            select_expected_artifacts(
+                run_profile,
+                source_mode,
+                meeting_type,
+                risk_flags,
+                source_selection_status,
+            )
+        )
+        if expected_set != canonical_expected:
+            errors.append(
+                "MAS task bundle expected_artifacts 与 risk matrix 不一致: "
+                f"expected={sorted(canonical_expected)} actual={sorted(expected_set)}"
+            )
+    if (
+        bundle.get("source_mode") == "audio_plus_document"
+        and "fidelity_review" in expected_set
+        and "source_reconciliation" not in expected_set
+    ):
+        errors.append("audio_plus_document fidelity_review 缺少 source_reconciliation 依赖")
+    produced_artifacts = {"source_manifest"} if bundle.get("mas_required") else set()
+    producer_counts: dict[str, int] = {"source_manifest": 1} if bundle.get("mas_required") else {}
     for task in tasks:
         if not isinstance(task, dict):
             errors.append("MAS task bundle task 必须是 JSON object")
@@ -691,6 +800,32 @@ def validate_bundle(bundle: dict[str, Any]) -> list[str]:
         artifact_type = str(task.get("artifact_type") or "")
         if artifact_type not in ROLE_SPECS:
             errors.append(f"未知 MAS task artifact_type: {artifact_type}")
+            continue
+        expected_task = build_task(artifact_type, run_profile, source_mode)
+        for field in (
+            "role",
+            "dispatch_phase",
+            "secondary_artifacts",
+            "objective",
+            "inputs",
+            "checks",
+            "required_fields",
+            "forbidden_final_fields",
+            "prompt",
+            "material_handoff",
+        ):
+            if task.get(field) != expected_task.get(field):
+                errors.append(f"{artifact_type} task {field} 与角色契约不一致")
+        if task.get("secondary_required_fields") != expected_task.get("secondary_required_fields"):
+            errors.append(f"{artifact_type} task secondary_required_fields 与角色契约不一致")
+        produced_artifacts.add(artifact_type)
+        producer_counts[artifact_type] = producer_counts.get(artifact_type, 0) + 1
+        actual_secondary = task.get("secondary_artifacts")
+        if isinstance(actual_secondary, list):
+            for item in actual_secondary:
+                secondary = str(item)
+                produced_artifacts.add(secondary)
+                producer_counts[secondary] = producer_counts.get(secondary, 0) + 1
         if artifact_type not in expected_set:
             errors.append(f"task artifact_type 不在 expected_artifacts 中: {artifact_type}")
         required_fields = task.get("required_fields")
@@ -708,12 +843,45 @@ def validate_bundle(bundle: dict[str, Any]) -> list[str]:
             errors.append(f"{artifact_type} task prompt 缺少 JSON-only 输出要求")
         if "Do not modify repository files or meeting-note files" not in prompt:
             errors.append(f"{artifact_type} task prompt 缺少文件写入边界")
+    if produced_artifacts != expected_set:
+        missing_producers = sorted(expected_set - produced_artifacts)
+        unexpected_producers = sorted(produced_artifacts - expected_set)
+        if missing_producers:
+            errors.append("MAS task bundle 缺少 artifact 生产者: " + ", ".join(missing_producers))
+        if unexpected_producers:
+            errors.append("MAS task bundle 包含未声明 artifact 生产者: " + ", ".join(unexpected_producers))
+    duplicate_producers = sorted(
+        artifact_type
+        for artifact_type, count in producer_counts.items()
+        if count != 1
+    )
+    if duplicate_producers:
+        errors.append("MAS task bundle artifact 必须恰好一个生产者: " + ", ".join(duplicate_producers))
     return errors
 
 
-def write_dispatch_files(bundle: dict[str, Any], task_dir: Path, *, overwrite_prompts: bool = True) -> dict[str, Any]:
+def _write_dispatch_files_unlocked(
+    bundle: dict[str, Any],
+    task_dir: Path,
+    *,
+    overwrite_prompts: bool = False,
+) -> dict[str, Any]:
     task_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = task_dir / "artifacts"
+    existing_dispatch_files = [
+        path
+        for path in [
+            task_dir / "mas_task_bundle.json",
+            task_dir / "dispatch_manifest.json",
+            *task_dir.glob("[0-9][0-9]-*.prompt.md"),
+        ]
+        if path.exists()
+    ]
+    if existing_dispatch_files and not overwrite_prompts:
+        raise ValueError(
+            "task_dir already contains dispatch files; pass the explicit overwrite option: "
+            + ", ".join(path.name for path in existing_dispatch_files)
+        )
     if artifact_dir.exists() and any(artifact_dir.glob("*.json")):
         raise ValueError(
             "task_dir already contains artifact JSON files; use a fresh dispatch directory "
@@ -773,6 +941,23 @@ def write_dispatch_files(bundle: dict[str, Any], task_dir: Path, *, overwrite_pr
     }
 
 
+def write_dispatch_files(
+    bundle: dict[str, Any],
+    task_dir: Path,
+    *,
+    overwrite_prompts: bool = False,
+) -> dict[str, Any]:
+    errors = validate_bundle(bundle, require_material_coverage=True)
+    if errors:
+        raise ValueError("; ".join(errors))
+    with mas_task_lock(task_dir, exclusive=True):
+        return _write_dispatch_files_unlocked(
+            bundle,
+            task_dir,
+            overwrite_prompts=overwrite_prompts,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="生成 MAS specialist task bundle")
     parser.add_argument("--request-json", help="包含 run_profile/source_mode/risk_flags 的 JSON 请求")
@@ -780,8 +965,10 @@ def main() -> int:
     parser.add_argument("--source-mode", choices=sorted(SOURCE_MODES), default=None)
     parser.add_argument("--meeting-type", choices=sorted(MEETING_TYPES), default=None)
     parser.add_argument("--risk", action="append", default=[], help="风险标记，可重复")
+    parser.add_argument("--material", action="append", default=[], help="当前会议材料路径，可重复")
     parser.add_argument("--out", help="写入 JSON 文件；默认输出到 stdout")
     parser.add_argument("--task-dir", help="写入 Codex-ready subagent prompt 文件和 dispatch manifest")
+    parser.add_argument("--overwrite-dispatch", action="store_true", help="显式覆盖无 artifact 的已有 dispatch 文件")
     args = parser.parse_args()
 
     try:
@@ -799,15 +986,27 @@ def main() -> int:
             request["meeting_type"] = args.meeting_type
         if args.risk:
             request["risk_flags"] = normalized_flags(request.get("risk_flags", [])) + normalized_flags(args.risk)
+        if args.material:
+            existing_materials = request.get("materials", [])
+            if not isinstance(existing_materials, list):
+                raise ValueError("materials 必须是 JSON array")
+            request["materials"] = [*existing_materials, *args.material]
 
         bundle = build_bundle_from_request(request)
-        errors = validate_bundle(bundle)
+        errors = validate_bundle(
+            bundle,
+            require_material_coverage=bool(args.request_json or args.material or args.task_dir),
+        )
         if errors:
             print(json.dumps({"ok": False, "errors": errors}, ensure_ascii=False, indent=2))
             return 1
         dispatch_files: dict[str, Any] | None = None
         if args.task_dir:
-            dispatch_files = write_dispatch_files(bundle, Path(args.task_dir))
+            dispatch_files = write_dispatch_files(
+                bundle,
+                Path(args.task_dir),
+                overwrite_prompts=bool(args.overwrite_dispatch),
+            )
             bound_bundle = read_json(Path(dispatch_files["bundle_file"]))
             if not isinstance(bound_bundle, dict):
                 raise ValueError("写入后的 MAS task bundle 顶层必须是 JSON object")

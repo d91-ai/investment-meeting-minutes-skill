@@ -82,7 +82,8 @@
 ### Fidelity Reviewer
 
 输入：
-- 终稿草案、对应 source spans、source_reconciliation。
+- 终稿草案和对应 source spans。
+- `audio_plus_document` 额外要求已完成的 `source_reconciliation`；单一来源改用主流程已选定的正文源及选择理由，不伪造 reconciliation artifact。
 
 输出：
 - `fidelity_review`
@@ -243,6 +244,8 @@ Accepted `risk_flags` are explicit and unknown tokens fail fast:
 - Target attribution: `target_attribution`, `multi_target`, `mixed_targets`, `positive_negative_views`.
 - Fidelity: `fidelity_review`, `omission_risk`, `summary_compression`, `third_person_rewrite`, `prior_user_feedback`.
 
+Artifact selection is incremental rather than all-specialist by default. Every active MAS run keeps main-owned `source_manifest` plus final `export_manifest`; audio risks add `transcript_audit`, source-selection risks add `source_reconciliation` and `fidelity_review`, entity/public-fact risks add `entity_verification_report` plus `doubtful_items`, target risks add `target_attribution_review`, and fidelity risks add `fidelity_review`. `audio_only` must use `strict_audio`, which may reach the full set through its inferred risks. A flags-only CLI call may inspect a plan without materials; `--task-dir`, `--request-json`, or explicit `--material` activates source-coverage validation. Before any prompt files are written, the bundle builder must fail fast when `audio_only` lacks audio, `document_only` lacks a readable body document, or `audio_plus_document` lacks either evidence side; a PDF attachment alone is not a body document.
+
 The task bundle must define:
 - Whether MAS is required for the current run.
 - Expected artifacts for the selected risk profile.
@@ -251,6 +254,8 @@ The task bundle must define:
 - Main-orchestrator-only responsibilities: final Markdown writing, archive/export side effects, delivery wording, and user-facing conflict decisions.
 - The artifact validator command and required artifacts for later `scripts/validate_mas_artifacts.py` checks.
 - A fresh dispatch `run_id` plus one `task_id` per specialist task when prompt files are materialized.
+
+Bundle validation must enforce profile/source/meeting enums, `audio_only => strict_audio`, source-selection status, exact role task contracts, and a closed artifact-producer set covering every expected primary or secondary artifact. A non-overwrite dispatch write must recheck the target directory under the task lock and refuse any existing bundle, manifest, or generated prompt.
 
 The task bundle is a dispatch plan, not a runtime framework. It may be used with Codex subagents when available, or as a manual task checklist when subagent execution is not available. It must not create, modify, assemble, or export final Markdown.
 
@@ -276,14 +281,14 @@ Subagent execution rules:
 - Keep subagents read-only toward repository files and meeting-note files unless a future task explicitly assigns a private artifact output path.
 - Require each subagent to return only the JSON artifact shape requested in its prompt.
 - Generated prompts must render the role-specific inputs and checks, use type-correct JSON examples, and state that private recordings, transcripts, meeting excerpts, and local paths must not be uploaded to external services.
-- Save main-owned artifacts such as `source_manifest` under the dispatch directory's `artifacts/` folder. Use `scripts/create_mas_source_manifest.py` or `scripts/run_mas_phase_operator.py --auto-source-manifest` to create the initial `source_manifest` from the bound bundle without claiming archive completion. `source_manifest` is always `pre_draft`; `main_action_receipt` is always `draft_review`.
-- For each returned specialist JSON, run `scripts/ingest_mas_artifact.py RETURNED.json --task-dir "$MAS_DISPATCH" --through-phase PHASE --json`. The ingest script writes valid artifacts under `artifacts/`, writes invalid or duplicate returns under `repair_history/`, and emits the next collector command.
+- Save main-owned artifacts such as `source_manifest` under the dispatch directory's `artifacts/` folder. Use `scripts/create_mas_source_manifest.py` or `scripts/run_mas_phase_operator.py --auto-source-manifest` to create the initial `source_manifest` from the bound bundle without claiming archive completion. When `--task-dir` is present, its locked bundle and dispatch manifest are the only authority for `run_id`, source mode, and materials; request arguments cannot override them. `source_manifest` is always `pre_draft`; `main_action_receipt` is always `draft_review`.
+- For each returned specialist JSON, run `scripts/ingest_mas_artifact.py RETURNED.json --task-dir "$MAS_DISPATCH" --through-phase PHASE --json`. Dispatch writes and ingest commits use an exclusive task-dir lock; collection uses a shared lock. The ingest script commits a task's primary/secondary artifacts and replacement-history records as one recoverable transaction, rolls back ordinary failures, and automatically recovers an interrupted uncommitted transaction before the next ingest. Invalid or duplicate returns go to `repair_history/`.
 - Require returned `run_id`, `task_id`, `dispatch_phase`, `artifact_owner`, and artifact set to match the generated prompt and dispatch manifest. Do not ingest an artifact copied from another meeting or task even when its inner schema is valid.
 - Do not manually overwrite an existing artifact file. If a specialist return is invalid or duplicate, repair or re-dispatch from the `repair_history/` record before continuing.
 - When a corrected same-run/task return must replace an existing artifact, use `ingest_mas_artifact.py --replace-existing`; the old artifact must be preserved as `superseded` in `repair_history/` before replacement.
-- Run `scripts/collect_mas_artifacts.py "$MAS_DISPATCH" --out "$MAS_DISPATCH/mas_run_summary.json" --combined-out "$MAS_DISPATCH/mas_artifacts_collected.json"` to merge artifacts, detect duplicates, check required artifacts from the bundle, validate field structure, produce the decision summary, and emit phase gates plus the next main-workflow action. Consume combined artifacts only when the collector summary has top-level `ok: true`; failed combined outputs are partial diagnostics.
+- Run `scripts/collect_mas_artifacts.py "$MAS_DISPATCH" --out "$MAS_DISPATCH/mas_run_summary.json" --combined-out "$MAS_DISPATCH/mas_artifacts_collected.json"` to merge artifacts, detect duplicates, check required artifacts from the bundle, validate field structure, produce the decision summary, and emit phase gates plus the next main-workflow action. A pending ingest transaction blocks collection until ingest recovery completes. Consume combined artifacts only when the collector summary has top-level `ok: true`; failed combined outputs are partial diagnostics.
 - Run `scripts/plan_mas_next_action.py --summary-json "$MAS_DISPATCH/mas_run_summary.json" --json` to turn `next_action` into the next executable checklist: prompt files to dispatch, ingest commands to run after returns, main-owned artifact gaps, repair actions, narrow user-confirmation actions, or final `main_action_checklist`.
-- Prefer `scripts/run_mas_phase_operator.py` when operating a live dispatch directory repeatedly. It initializes dispatch files from a request JSON when needed, ingests returned artifact JSON files, runs collector, writes `mas_artifacts_collected.json`, writes `mas_next_action_plan.json`, and records `mas_operator_state.json`.
+- Prefer `scripts/run_mas_phase_operator.py` when operating a live dispatch directory repeatedly. It initializes dispatch files from a request JSON when needed, ingests returned artifact JSON files, and publishes the collector summary, combined artifacts, next-action plan, and `mas_operator_state.json` as one locked artifact generation.
 - For a partial phase gate, pass `--through-phase pre_draft`, `--through-phase draft_review`, or `--through-phase final_verification` so the collector only requires artifacts whose phase is ready.
 - Gate on collector top-level `ok`. Treat the embedded `decision` as actionable only when collector output is `ok: true`; otherwise repair/regenerate invalid, duplicate, or missing artifacts before final delivery.
 - Apply final writing, doubtful marking, export, and user-facing decisions only in the Main Orchestrator.

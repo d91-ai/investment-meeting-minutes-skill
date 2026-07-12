@@ -8,8 +8,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from create_mas_source_manifest import normalize_material
+from create_mas_source_manifest import material_coverage_errors, normalize_material
 from build_mas_task_bundle import PRIMARY_SOURCE_ALIASES_BY_MODE
+from mas_task_lock import mas_task_lock
 from summarize_mas_decisions import summarize_payload
 from validate_meeting_minutes_contract import (
     read_verification_records,
@@ -341,16 +342,13 @@ def artifact_context_errors(
         } if isinstance(actual_materials, list) else set()
         if expected_keys != actual_keys:
             errors.append("source_manifest.materials 与当前 MAS task bundle 不一致")
-        kinds = {kind for kind, _ in actual_keys}
-        source_mode = str(bundle.get("source_mode") or "")
-        has_audio = "audio" in kinds
-        has_document = "document" in kinds
-        if source_mode == "audio_only" and not has_audio:
-            errors.append("source_manifest audio_only 必须包含 audio material")
-        elif source_mode == "document_only" and not has_document:
-            errors.append("source_manifest document_only 必须包含可作为正文的 document material；pdf_attachment 不能替代正文")
-        elif source_mode == "audio_plus_document" and (not has_audio or not has_document):
-            errors.append("source_manifest audio_plus_document 必须同时包含 audio 和 document material")
+        errors.extend(
+            f"source_manifest {error}"
+            for error in material_coverage_errors(
+                str(bundle.get("source_mode") or ""),
+                actual_materials if isinstance(actual_materials, list) else [],
+            )
+        )
 
     reconciliation = artifacts.get("source_reconciliation")
     if isinstance(reconciliation, dict):
@@ -583,7 +581,7 @@ def next_action(
     }
 
 
-def collect_mas_run(
+def _collect_mas_run_unlocked(
     task_dir: Path,
     artifact_dir: Path | None = None,
     through_phase: str | None = None,
@@ -594,6 +592,12 @@ def collect_mas_run(
     manifest_path = task_dir / "dispatch_manifest.json"
     errors: list[str] = []
     warnings: list[str] = []
+    pending_transactions = sorted(artifact_dir.glob(".mas-ingest-txn-*")) if artifact_dir.exists() else []
+    if pending_transactions:
+        errors.append(
+            "存在未完成 MAS artifact 事务，必须先通过 ingest 恢复: "
+            + ", ".join(path.name for path in pending_transactions)
+        )
 
     if not bundle_path.exists():
         errors.append(f"缺少 MAS task bundle: {bundle_path}")
@@ -720,6 +724,58 @@ def collect_mas_run(
     }
 
 
+def collect_mas_run(
+    task_dir: Path,
+    artifact_dir: Path | None = None,
+    through_phase: str | None = None,
+) -> dict[str, Any]:
+    task_dir = task_dir.expanduser()
+    with mas_task_lock(task_dir, exclusive=False):
+        return _collect_mas_run_unlocked(
+            task_dir,
+            artifact_dir=artifact_dir,
+            through_phase=through_phase,
+        )
+
+
+def combined_payload_from_summary(summary: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    source_paths = [
+        Path(str(item.get("path") or ""))
+        for item in summary.get("artifact_sources", [])
+        if isinstance(item, dict) and item.get("path")
+    ]
+    artifacts, _, errors, _ = merge_artifact_files(source_paths)
+    payload: dict[str, Any] = {"artifacts": artifacts}
+    if not summary.get("ok"):
+        payload.update(
+            {
+                "ok": False,
+                "errors": summary.get("errors", []),
+                "missing_artifacts": summary.get("missing_artifacts", []),
+                "duplicate_artifacts": summary.get("duplicate_artifacts", []),
+                "source_summary": {
+                    "task_dir": summary.get("task_dir"),
+                    "through_phase": summary.get("through_phase"),
+                },
+            }
+        )
+    return payload, errors
+
+
+def collect_mas_snapshot_unlocked(
+    task_dir: Path,
+    artifact_dir: Path | None = None,
+    through_phase: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    summary = _collect_mas_run_unlocked(
+        task_dir.expanduser(),
+        artifact_dir=artifact_dir,
+        through_phase=through_phase,
+    )
+    payload, errors = combined_payload_from_summary(summary)
+    return summary, payload, errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="收集 MAS subagent artifacts 并生成主流程决策摘要")
     parser.add_argument("task_dir", help="包含 mas_task_bundle.json 和 dispatch_manifest.json 的派发目录")
@@ -730,28 +786,19 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="输出 JSON；默认也是 JSON")
     args = parser.parse_args()
 
-    artifact_dir = Path(args.artifact_dir) if args.artifact_dir else None
-    result = collect_mas_run(Path(args.task_dir), artifact_dir=artifact_dir, through_phase=args.through_phase)
-    if args.combined_out:
-        source_paths = [Path(source["path"]) for source in result["artifact_sources"]]
-        artifacts, _, _, _ = merge_artifact_files(source_paths)
-        payload: dict[str, Any] = {"artifacts": artifacts}
-        if not result["ok"]:
-            payload.update(
-                {
-                    "ok": False,
-                    "errors": result.get("errors", []),
-                    "missing_artifacts": result.get("missing_artifacts", []),
-                    "duplicate_artifacts": result.get("duplicate_artifacts", []),
-                    "source_summary": {
-                        "task_dir": result.get("task_dir"),
-                        "through_phase": result.get("through_phase"),
-                    },
-                }
-            )
-        write_json(Path(args.combined_out), payload)
-    if args.out:
-        write_json(Path(args.out), result)
+    task_dir = Path(args.task_dir).expanduser()
+    artifact_dir = Path(args.artifact_dir).expanduser() if args.artifact_dir else None
+    with mas_task_lock(task_dir, exclusive=True):
+        result, combined_payload, combined_errors = collect_mas_snapshot_unlocked(
+            task_dir,
+            artifact_dir=artifact_dir,
+            through_phase=args.through_phase,
+        )
+        result["warnings"].extend(str(error) for error in combined_errors)
+        if args.combined_out:
+            write_json(Path(args.combined_out), combined_payload)
+        if args.out:
+            write_json(Path(args.out), result)
     if args.json or not args.out:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["ok"] else 1

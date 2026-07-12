@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from build_mas_task_bundle import build_bundle_from_request, read_json, validate_bundle, write_dispatch_files
-from collect_mas_artifacts import PHASE_ORDER, collect_mas_run, merge_artifact_files
+from collect_mas_artifacts import PHASE_ORDER, collect_mas_snapshot_unlocked
 from create_mas_source_manifest import create_source_manifest, source_manifest_artifact
 from ingest_mas_artifact import ingest_mas_artifact_file
+from mas_task_lock import mas_task_lock
 from plan_mas_next_action import plan_from_summary
 
 
@@ -67,32 +68,7 @@ def prepare_dispatch(task_dir: Path, request_path: Path | None, overwrite_dispat
     return {"created": True, "errors": [], "warnings": [], **dispatch_files}
 
 
-def write_combined_artifacts(summary: dict[str, Any], combined_out: Path) -> list[str]:
-    source_paths = [
-        Path(str(item.get("path") or ""))
-        for item in summary.get("artifact_sources", [])
-        if isinstance(item, dict) and item.get("path")
-    ]
-    artifacts, _, errors, _ = merge_artifact_files(source_paths)
-    payload: dict[str, Any] = {"artifacts": artifacts}
-    if not summary.get("ok"):
-        payload.update(
-            {
-                "ok": False,
-                "errors": summary.get("errors", []),
-                "missing_artifacts": summary.get("missing_artifacts", []),
-                "duplicate_artifacts": summary.get("duplicate_artifacts", []),
-                "source_summary": {
-                    "task_dir": summary.get("task_dir"),
-                    "through_phase": summary.get("through_phase"),
-                },
-            }
-        )
-    write_json(combined_out, payload)
-    return errors
-
-
-def auto_write_source_manifest(task_dir: Path, request_path: Path | None) -> dict[str, Any]:
+def _auto_write_source_manifest_unlocked(task_dir: Path, request_path: Path | None) -> dict[str, Any]:
     artifact_path = task_dir / "artifacts" / "source_manifest.json"
     if artifact_path.exists():
         return {
@@ -126,6 +102,11 @@ def auto_write_source_manifest(task_dir: Path, request_path: Path | None) -> dic
         "errors": [],
         "warnings": warnings,
     }
+
+
+def auto_write_source_manifest(task_dir: Path, request_path: Path | None) -> dict[str, Any]:
+    with mas_task_lock(task_dir, exclusive=True):
+        return _auto_write_source_manifest_unlocked(task_dir, request_path)
 
 
 def operator_status(plan: dict[str, Any], ingest_results: list[dict[str, Any]]) -> str:
@@ -232,53 +213,62 @@ def run_mas_phase_operator(
     plan_path = default_path(task_dir, str(plan_out) if plan_out else None, "mas_next_action_plan.json")
     state_path = default_path(task_dir, str(state_out) if state_out else None, "mas_operator_state.json")
 
-    if not errors:
-        summary = collect_mas_run(task_dir, through_phase=through_phase)
-        write_json(summary_path, summary)
-        combined_errors = write_combined_artifacts(summary, combined_path)
-        warnings.extend(combined_errors)
-        plan = plan_from_summary(summary)
-        write_json(plan_path, plan)
+    with mas_task_lock(task_dir, exclusive=True):
+        if not errors:
+            summary, combined_payload, combined_errors = collect_mas_snapshot_unlocked(
+                task_dir,
+                through_phase=through_phase,
+            )
+            write_json(summary_path, summary)
+            write_json(combined_path, combined_payload)
+            plan = plan_from_summary(summary)
+            write_json(plan_path, plan)
+            warnings.extend(combined_errors)
 
-    status = operator_status(plan, ingest_results) if plan else "inspect_operator_state"
-    result_errors = errors + [str(error) for item in ingest_results for error in item.get("errors", []) if not item.get("ok")]
-    command_ok = not result_errors and bool(plan.get("ok", False))
-    gate_ok = bool(summary.get("ok")) if summary else False
-    complete = gate_ok and status == "continue_main_workflow" and str(plan.get("phase") or "") == "complete"
-    result = {
-        "schema_version": "1.0",
-        "ok": command_ok,
-        "command_ok": command_ok,
-        "gate_ok": gate_ok,
-        "complete": complete,
-        "execution_mode": "operator_harness_no_subagent_dispatch_no_final_markdown",
-        "task_dir": str(task_dir),
-        "through_phase": through_phase or "complete",
-        "dispatch": dispatch,
-        "auto_source_manifest": source_manifest_result,
-        "ingested_return_count": len(return_paths),
-        "ingest_results": ingest_results,
-        "collector_ok": bool(summary.get("ok")) if summary else False,
-        "collector_summary_file": str(summary_path),
-        "combined_artifacts_file": str(combined_path),
-        "next_action_plan_file": str(plan_path),
-        "operator_state_file": str(state_path),
-        "operator_status": status,
-        "stop_reason": stop_reason_for(status),
-        "plan_status": plan.get("plan_status") if plan else "",
-        "next_action_type": plan.get("next_action_type") if plan else "",
-        "phase": plan.get("phase") if plan else "",
-        "dispatch_tasks": plan.get("dispatch_tasks", []) if plan else [],
-        "main_owned_missing_artifacts": plan.get("main_owned_missing_artifacts", []) if plan else [],
-        "repair_errors": plan.get("repair_errors", []) if plan else [],
-        "main_actions": plan.get("main_actions", []) if plan else [],
-        "main_action_checklist": plan.get("main_action_checklist", []) if plan else [],
-        "summary": summary,
-        "plan": plan,
-        "errors": result_errors,
-        "warnings": warnings,
-    }
-    write_json(state_path, result)
+        status = operator_status(plan, ingest_results) if plan else "inspect_operator_state"
+        result_errors = errors + [
+            str(error)
+            for item in ingest_results
+            for error in item.get("errors", [])
+            if not item.get("ok")
+        ]
+        command_ok = not result_errors and bool(plan.get("ok", False))
+        gate_ok = bool(summary.get("ok")) if summary else False
+        complete = gate_ok and status == "continue_main_workflow" and str(plan.get("phase") or "") == "complete"
+        result = {
+            "schema_version": "1.0",
+            "ok": command_ok,
+            "command_ok": command_ok,
+            "gate_ok": gate_ok,
+            "complete": complete,
+            "execution_mode": "operator_harness_no_subagent_dispatch_no_final_markdown",
+            "task_dir": str(task_dir),
+            "through_phase": through_phase or "complete",
+            "dispatch": dispatch,
+            "auto_source_manifest": source_manifest_result,
+            "ingested_return_count": len(return_paths),
+            "ingest_results": ingest_results,
+            "collector_ok": bool(summary.get("ok")) if summary else False,
+            "collector_summary_file": str(summary_path),
+            "combined_artifacts_file": str(combined_path),
+            "next_action_plan_file": str(plan_path),
+            "operator_state_file": str(state_path),
+            "operator_status": status,
+            "stop_reason": stop_reason_for(status),
+            "plan_status": plan.get("plan_status") if plan else "",
+            "next_action_type": plan.get("next_action_type") if plan else "",
+            "phase": plan.get("phase") if plan else "",
+            "dispatch_tasks": plan.get("dispatch_tasks", []) if plan else [],
+            "main_owned_missing_artifacts": plan.get("main_owned_missing_artifacts", []) if plan else [],
+            "repair_errors": plan.get("repair_errors", []) if plan else [],
+            "main_actions": plan.get("main_actions", []) if plan else [],
+            "main_action_checklist": plan.get("main_action_checklist", []) if plan else [],
+            "summary": summary,
+            "plan": plan,
+            "errors": result_errors,
+            "warnings": warnings,
+        }
+        write_json(state_path, result)
     return result
 
 

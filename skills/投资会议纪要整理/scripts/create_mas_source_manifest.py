@@ -4,16 +4,19 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 from pathlib import Path
 from typing import Any
 
+from mas_task_lock import mas_task_lock
 from validate_mas_artifacts import validate_payload
 
 AUDIO_EXTENSIONS = {".aac", ".aiff", ".flac", ".m4a", ".mp3", ".mp4", ".wav"}
 DOCUMENT_EXTENSIONS = {".doc", ".docx", ".md", ".srt", ".txt", ".vtt"}
 PDF_EXTENSIONS = {".pdf"}
 ARCHIVE_STATUSES = {"not_started", "completed", "skipped", "skipped_for_fixture", "failed"}
+SOURCE_MODES = {"document_only", "audio_only", "audio_plus_document"}
 
 
 def read_json(path: Path) -> Any:
@@ -47,7 +50,7 @@ def safe_material_name(value: str) -> str:
     value = value.strip()
     if not value:
         return "unnamed_material"
-    return Path(value).name if "/" in value else value
+    return Path(value.replace("\\", "/")).name
 
 
 def normalize_material(item: Any) -> dict[str, str]:
@@ -72,8 +75,23 @@ def normalize_material(item: Any) -> dict[str, str]:
     return material
 
 
+def material_coverage_errors(source_mode: str, materials: list[Any]) -> list[str]:
+    if source_mode not in SOURCE_MODES:
+        return ["source_mode 必须是固定枚举值"]
+    kinds = {str(normalize_material(item).get("kind") or "") for item in materials}
+    if source_mode == "audio_only" and "audio" not in kinds:
+        return ["audio_only 必须包含 audio material"]
+    if source_mode == "document_only" and "document" not in kinds:
+        return ["document_only 必须包含可作为正文的 document material；pdf_attachment 不能替代正文"]
+    if source_mode == "audio_plus_document" and not {"audio", "document"} <= kinds:
+        return ["audio_plus_document 必须同时包含 audio 和 document material"]
+    return []
+
+
 def load_context(request_json: Path | None, bundle_json: Path | None, task_dir: Path | None) -> dict[str, Any]:
-    if request_json:
+    if task_dir and (task_dir / "mas_task_bundle.json").exists():
+        payload = read_json(task_dir / "mas_task_bundle.json")
+    elif request_json:
         payload = read_json(request_json)
     elif bundle_json:
         payload = read_json(bundle_json)
@@ -149,31 +167,45 @@ def main() -> int:
     artifact_file = ""
     artifact: dict[str, Any] | None = None
     try:
-        context = load_context(
-            Path(args.request_json).expanduser() if args.request_json else None,
-            Path(args.bundle_json).expanduser() if args.bundle_json else None,
-            task_dir,
-        )
-        manifest, manifest_warnings = create_source_manifest(
-            context,
-            archive_allowed=bool(args.archive_allowed),
-            archive_status=str(args.archive_status),
-            skipped_reason=str(args.skipped_reason),
-        )
-        warnings.extend(manifest_warnings)
-        run_id = str(context.get("run_id") or "")
-        if not run_id:
-            raise ValueError("source_manifest context missing dispatch run_id")
-        artifact = source_manifest_artifact(manifest, run_id)
-        validation = validate_payload(artifact, required_artifacts=["source_manifest"])
-        errors.extend(str(error) for error in validation.get("errors", []))
-        if not errors:
-            out_path = Path(args.out).expanduser() if args.out else None
-            if out_path is None and task_dir is not None:
-                out_path = task_dir / "artifacts" / "source_manifest.json"
-            if out_path is not None:
-                write_json(out_path, artifact, overwrite=bool(args.overwrite))
-                artifact_file = str(out_path)
+        lock_context = mas_task_lock(task_dir, exclusive=True) if task_dir is not None else nullcontext()
+        with lock_context:
+            if task_dir is not None:
+                bundle_path = task_dir / "mas_task_bundle.json"
+                dispatch_path = task_dir / "dispatch_manifest.json"
+                if not bundle_path.is_file() or not dispatch_path.is_file():
+                    raise ValueError("task-dir must contain mas_task_bundle.json and dispatch_manifest.json")
+                context = read_json(bundle_path)
+                dispatch = read_json(dispatch_path)
+                if not isinstance(context, dict) or not isinstance(dispatch, dict):
+                    raise ValueError("task-dir dispatch context must contain JSON objects")
+                if not context.get("run_id") or context.get("run_id") != dispatch.get("run_id"):
+                    raise ValueError("task-dir bundle and dispatch manifest run_id must match")
+            else:
+                context = load_context(
+                    Path(args.request_json).expanduser() if args.request_json else None,
+                    Path(args.bundle_json).expanduser() if args.bundle_json else None,
+                    None,
+                )
+            manifest, manifest_warnings = create_source_manifest(
+                context,
+                archive_allowed=bool(args.archive_allowed),
+                archive_status=str(args.archive_status),
+                skipped_reason=str(args.skipped_reason),
+            )
+            warnings.extend(manifest_warnings)
+            run_id = str(context.get("run_id") or "")
+            if not run_id:
+                raise ValueError("source_manifest context missing dispatch run_id")
+            artifact = source_manifest_artifact(manifest, run_id)
+            validation = validate_payload(artifact, required_artifacts=["source_manifest"])
+            errors.extend(str(error) for error in validation.get("errors", []))
+            if not errors:
+                out_path = Path(args.out).expanduser() if args.out else None
+                if out_path is None and task_dir is not None:
+                    out_path = task_dir / "artifacts" / "source_manifest.json"
+                if out_path is not None:
+                    write_json(out_path, artifact, overwrite=bool(args.overwrite))
+                    artifact_file = str(out_path)
     except Exception as exc:
         errors.append(f"source_manifest creation failed: {exc.__class__.__name__}: {exc}")
         validation = {"ok": False, "errors": errors, "warnings": warnings}

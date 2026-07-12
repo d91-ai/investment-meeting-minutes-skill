@@ -45,6 +45,7 @@ from create_mas_source_manifest import create_source_manifest, source_manifest_a
 from summarize_mas_decisions import summarize_file as summarize_mas_decision_file  # noqa: E402
 from collect_mas_artifacts import collect_mas_run  # noqa: E402
 from ingest_mas_artifact import ingest_mas_artifact_file  # noqa: E402
+import ingest_mas_artifact as ingest_mas_artifact_module  # noqa: E402
 from plan_mas_next_action import plan_from_summary  # noqa: E402
 from run_mas_phase_operator import run_mas_phase_operator  # noqa: E402
 from run_mas_dry_run import (  # noqa: E402
@@ -369,7 +370,12 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         if not input_text.strip():
             errors.append("输入文本为空，无法预处理会议转录")
         else:
-            segments = detect_segments(input_text, None)
+            preferred_speakers = [
+                str(item)
+                for item in case.get("preferred_speakers", [])
+                if str(item).strip()
+            ]
+            segments = detect_segments(input_text, preferred_speakers or None)
             output = build_output(segments, input_text)
             expected_segment_count = case.get("expected_segment_count")
             if expected_segment_count is not None and len(segments) != int(expected_segment_count):
@@ -665,6 +671,60 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             if term not in manifest_text:
                 result["errors"].append(f"MAS source_manifest 缺少文本锚点: {term}")
                 result["ok"] = False
+    elif case.get("check") == "mas_source_manifest_cli_binding":
+        request_payload = json.loads(file_path.read_text(encoding="utf-8"))
+        if not isinstance(request_payload, dict):
+            raise ValueError(f"MAS source_manifest request 必须是 JSON object: {file_path}")
+        bundle = build_mas_task_bundle_from_request(request_payload)
+        conflicting_request = base_dir / str(case["conflicting_request_file"])
+        with tempfile.TemporaryDirectory(prefix="mas-source-manifest-cli-") as tmpdir:
+            task_dir = Path(tmpdir)
+            write_mas_dispatch_files(bundle, task_dir)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR / "create_mas_source_manifest.py"),
+                    "--task-dir",
+                    str(task_dir),
+                    "--request-json",
+                    str(conflicting_request),
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=20,
+                check=False,
+            )
+            errors = []
+            artifact_path = task_dir / "artifacts" / "source_manifest.json"
+            if completed.returncode != 0 or not artifact_path.is_file():
+                errors.append(
+                    "MAS source_manifest CLI 未成功生成绑定 artifact: "
+                    f"returncode={completed.returncode} output={completed.stdout}{completed.stderr}"
+                )
+            else:
+                bound_bundle = json.loads((task_dir / "mas_task_bundle.json").read_text(encoding="utf-8"))
+                artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                artifact_manifest = artifact_payload.get("artifact", {})
+                if artifact_payload.get("run_id") != bound_bundle.get("run_id"):
+                    errors.append("MAS source_manifest CLI 写入了非当前 dispatch run_id")
+                expected_materials = {
+                    str(item.get("name") or "")
+                    for item in create_source_manifest(bound_bundle)[0].get("materials", [])
+                    if isinstance(item, dict)
+                }
+                actual_materials = {
+                    str(item.get("name") or "")
+                    for item in artifact_manifest.get("materials", [])
+                    if isinstance(item, dict)
+                }
+                if actual_materials != expected_materials:
+                    errors.append(
+                        "MAS source_manifest CLI 材料未绑定当前 dispatch: "
+                        f"expected={sorted(expected_materials)} actual={sorted(actual_materials)}"
+                    )
+            result = {"ok": not errors, "errors": errors, "warnings": []}
     elif case.get("check") == "mas_task_bundle":
         request_payload = json.loads(file_path.read_text(encoding="utf-8"))
         if not isinstance(request_payload, dict):
@@ -693,6 +753,22 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         for role in [str(item) for item in case.get("require_roles", [])]:
             if role not in roles:
                 errors.append(f"MAS task bundle 缺少 role: {role}")
+        tasks_by_artifact = {
+            str(task.get("artifact_type") or ""): task
+            for task in bundle.get("tasks", [])
+            if isinstance(task, dict)
+        }
+        for artifact_type, required_inputs in dict(case.get("require_task_inputs", {})).items():
+            task = tasks_by_artifact.get(str(artifact_type))
+            if task is None:
+                errors.append(f"MAS task bundle 缺少用于检查 inputs 的 task: {artifact_type}")
+                continue
+            actual_inputs = {str(item) for item in task.get("inputs", [])}
+            for required_input in [str(item) for item in required_inputs]:
+                if required_input not in actual_inputs:
+                    errors.append(
+                        f"MAS task bundle {artifact_type} inputs 缺少: {required_input}"
+                    )
         for artifact, owner in dict(case.get("require_artifact_owners", {})).items():
             if artifact_owners.get(str(artifact)) != str(owner):
                 errors.append(
@@ -718,12 +794,121 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         request_payload = json.loads(file_path.read_text(encoding="utf-8"))
         errors = []
         try:
-            build_mas_task_bundle_from_request(request_payload)
+            bundle = build_mas_task_bundle_from_request(request_payload)
+            validation_errors = validate_mas_task_bundle(bundle)
+            if validation_errors:
+                raise ValueError("; ".join(validation_errors))
         except ValueError as exc:
             errors.append(str(exc))
         result = {
             "ok": not errors,
             "errors": errors,
+            "warnings": [],
+        }
+    elif case.get("check") == "mas_task_bundle_cli":
+        command = [
+            sys.executable,
+            str(SCRIPT_DIR / "build_mas_task_bundle.py"),
+            *[str(item) for item in case.get("cli_args", [])],
+        ]
+        expected_returncode = int(case.get("expect_returncode", 0))
+        with tempfile.TemporaryDirectory(prefix="mas-task-bundle-cli-") as tmpdir:
+            if case.get("with_task_dir"):
+                command.extend(["--task-dir", tmpdir])
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=20,
+                check=False,
+            )
+            errors = []
+            if completed.returncode != expected_returncode:
+                errors.append(
+                    "MAS task bundle CLI returncode 不符合预期: "
+                    f"expected={expected_returncode} actual={completed.returncode}"
+                )
+            output_text = completed.stdout + completed.stderr
+            for term in [str(item) for item in case.get("required_terms", [])]:
+                if term not in output_text:
+                    errors.append(f"MAS task bundle CLI 缺少文本锚点: {term}")
+            for filename in [str(item) for item in case.get("require_task_files", [])]:
+                if not (Path(tmpdir) / filename).is_file():
+                    errors.append(f"MAS task bundle CLI 缺少派发文件: {filename}")
+            if case.get("check_repeat_requires_overwrite") and completed.returncode == 0:
+                repeated = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=20,
+                    check=False,
+                )
+                repeated_text = repeated.stdout + repeated.stderr
+                if repeated.returncode != 1 or "already contains dispatch files" not in repeated_text:
+                    errors.append("MAS task bundle CLI 重复派发未要求显式覆盖授权")
+                overwritten = subprocess.run(
+                    [*command, "--overwrite-dispatch"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=20,
+                    check=False,
+                )
+                if overwritten.returncode != 0:
+                    errors.append(
+                        "MAS task bundle CLI 显式覆盖派发失败: "
+                        + overwritten.stdout
+                        + overwritten.stderr
+                    )
+            result = {
+                "ok": not errors,
+                "errors": errors,
+                "warnings": [],
+                "returncode": completed.returncode,
+            }
+    elif case.get("check") == "mas_task_bundle_mutation_reject":
+        request_payload = json.loads(file_path.read_text(encoding="utf-8"))
+        bundle = build_mas_task_bundle_from_request(request_payload)
+        mutation = str(case.get("mutation") or "")
+        if mutation == "audio_profile":
+            bundle["run_profile"] = "standard"
+        elif mutation == "drop_entity_secondary":
+            for task in bundle.get("tasks", []):
+                if isinstance(task, dict) and task.get("artifact_type") == "entity_verification_report":
+                    task["secondary_artifacts"] = []
+                    task.pop("secondary_required_fields", None)
+                    break
+        elif mutation == "drop_entity_scope":
+            removed = {"entity_verification_report", "doubtful_items"}
+            bundle["expected_artifacts"] = [
+                item for item in bundle.get("expected_artifacts", []) if str(item) not in removed
+            ]
+            bundle["tasks"] = [
+                task
+                for task in bundle.get("tasks", [])
+                if not isinstance(task, dict) or str(task.get("artifact_type") or "") != "entity_verification_report"
+            ]
+            for artifact_type in removed:
+                bundle.get("artifact_owners", {}).pop(artifact_type, None)
+            if isinstance(bundle.get("validation"), dict):
+                bundle["validation"]["required_artifacts"] = list(bundle["expected_artifacts"])
+        elif mutation == "duplicate_task":
+            entity_task = next(
+                task
+                for task in bundle.get("tasks", [])
+                if isinstance(task, dict) and task.get("artifact_type") == "entity_verification_report"
+            )
+            bundle["tasks"].append(json.loads(json.dumps(entity_task, ensure_ascii=False)))
+        elif mutation == "duplicate_expected_artifact":
+            bundle["expected_artifacts"].append(bundle["expected_artifacts"][0])
+        else:
+            raise ValueError(f"未知 MAS bundle mutation: {mutation}")
+        mutation_errors = validate_mas_task_bundle(bundle)
+        result = {
+            "ok": not mutation_errors,
+            "errors": mutation_errors,
             "warnings": [],
         }
     elif case.get("check") == "mas_task_dispatch_files":
@@ -811,6 +996,31 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 write_mas_dispatch_files(bundle, Path(tmpdir), overwrite_prompts=True)
                 if stale_prompt.exists():
                     errors.append("MAS dispatch 显式覆盖后未清理旧 prompt")
+                dispatch_before_reject = {
+                    path.name: path.read_bytes()
+                    for path in Path(tmpdir).glob("*")
+                    if path.is_file() and (
+                        path.name in {"mas_task_bundle.json", "dispatch_manifest.json"}
+                        or path.name.endswith(".prompt.md")
+                    )
+                }
+                try:
+                    write_mas_dispatch_files(bundle, Path(tmpdir), overwrite_prompts=False)
+                except ValueError as exc:
+                    if "already contains dispatch files" not in str(exc):
+                        errors.append(f"MAS dispatch 非覆盖模式错误不符合预期: {exc}")
+                else:
+                    errors.append("MAS dispatch 非覆盖模式未拒绝既有派发目录")
+                dispatch_after_reject = {
+                    path.name: path.read_bytes()
+                    for path in Path(tmpdir).glob("*")
+                    if path.is_file() and (
+                        path.name in {"mas_task_bundle.json", "dispatch_manifest.json"}
+                        or path.name.endswith(".prompt.md")
+                    )
+                }
+                if dispatch_after_reject != dispatch_before_reject:
+                    errors.append("MAS dispatch 非覆盖模式拒绝时仍改写了派发文件")
             result = {
                 "ok": not errors,
                 "errors": errors,
@@ -840,7 +1050,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 observed.append({"case": "corrupt_bundle", "errors": corrupt_bundle.get("errors", [])})
                 for path in (task_dir / "artifacts").glob("*.json"):
                     path.unlink()
-                write_mas_dispatch_files(bundle, task_dir)
+                write_mas_dispatch_files(bundle, task_dir, overwrite_prompts=True)
 
                 manifest_path = task_dir / "dispatch_manifest.json"
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -858,7 +1068,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                     observed.append({"case": "corrupt_manifest_task_count", "errors": corrupt_manifest.get("errors", [])})
                     for path in (task_dir / "artifacts").glob("*.json"):
                         path.unlink()
-                    write_mas_dispatch_files(bundle, task_dir)
+                    write_mas_dispatch_files(bundle, task_dir, overwrite_prompts=True)
                     _, dispatch_manifest = dispatch_context(task_dir)
                     (task_dir / "artifacts").mkdir(parents=True, exist_ok=True)
                     fixture_payload_data = json.loads(
@@ -1205,6 +1415,271 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 if not duplicate_result.get("repair_history_file"):
                     result["errors"].append("MAS ingest 重复 artifact 未写入 repair_history_file")
                     result["ok"] = False
+            if case.get("expect_transaction_rollback"):
+                with tempfile.TemporaryDirectory(prefix="mas-ingest-transaction-") as transaction_tmpdir:
+                    transaction_task_dir = Path(transaction_tmpdir)
+                    write_mas_dispatch_files(bundle, transaction_task_dir)
+                    _, transaction_manifest = dispatch_context(transaction_task_dir)
+                    transaction_return = bind_fixture_return(
+                        artifact_input_path,
+                        transaction_task_dir / "returned-artifact.json",
+                        transaction_manifest,
+                    )
+                    transaction_artifact_dir = transaction_task_dir / "artifacts"
+                    real_replace = ingest_mas_artifact_module.os.replace
+                    publish_count = 0
+
+                    def fail_second_artifact_publish(source: Any, destination: Any) -> None:
+                        nonlocal publish_count
+                        source_path = Path(source)
+                        destination_path = Path(destination)
+                        if source_path.parent.name == "stage" and destination_path.parent == transaction_artifact_dir:
+                            publish_count += 1
+                            if publish_count == 2:
+                                raise OSError(errno.EIO, "synthetic second artifact publish failure")
+                        real_replace(source, destination)
+
+                    with patch.object(
+                        ingest_mas_artifact_module.os,
+                        "replace",
+                        side_effect=fail_second_artifact_publish,
+                    ):
+                        failed_transaction = ingest_mas_artifact_file(
+                            transaction_return,
+                            transaction_task_dir,
+                            through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
+                        )
+                    result["transaction_failure_result"] = failed_transaction
+                    if failed_transaction.get("ok") or failed_transaction.get("ingest_status") != "artifact_transaction_failed_not_written":
+                        result["errors"].append("MAS ingest 多 artifact 故障未按事务失败")
+                        result["ok"] = False
+                    residual_artifacts = sorted(transaction_artifact_dir.glob("*.json"))
+                    residual_transactions = sorted(transaction_artifact_dir.glob(".mas-ingest-txn-*"))
+                    if residual_artifacts or residual_transactions:
+                        result["errors"].append(
+                            "MAS ingest 事务失败后残留 artifact 或事务目录: "
+                            + ", ".join(str(path) for path in residual_artifacts + residual_transactions)
+                        )
+                        result["ok"] = False
+                    retry_result = ingest_mas_artifact_file(
+                        transaction_return,
+                        transaction_task_dir,
+                        through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
+                    )
+                    result["transaction_retry_result"] = retry_result
+                    retry_types = {
+                        str(item.get("artifact_type") or "")
+                        for item in retry_result.get("written_artifacts", [])
+                        if isinstance(item, dict)
+                    }
+                    expected_retry_types = {str(item) for item in case.get("expect_written_artifacts", [])}
+                    if not retry_result.get("ok") or not expected_retry_types <= retry_types:
+                        result["errors"].append("MAS ingest 事务回滚后原返回无法干净重试")
+                        result["ok"] = False
+
+                    crash_task_dir = transaction_task_dir / "hard-crash-recovery"
+                    write_mas_dispatch_files(bundle, crash_task_dir)
+                    _, crash_manifest = dispatch_context(crash_task_dir)
+                    crash_return = bind_fixture_return(
+                        artifact_input_path,
+                        crash_task_dir / "returned-artifact.json",
+                        crash_manifest,
+                    )
+                    crash_script = "\n".join(
+                        [
+                            "import os, sys",
+                            "from pathlib import Path",
+                            "sys.path.insert(0, sys.argv[1])",
+                            "import ingest_mas_artifact as module",
+                            "artifact_dir = Path(sys.argv[3]) / 'artifacts'",
+                            "real_replace = module.os.replace",
+                            "state = {'publish_count': 0}",
+                            "def crash_during_publish(source, destination):",
+                            "    source_path = Path(source)",
+                            "    destination_path = Path(destination)",
+                            "    if source_path.parent.name == 'stage' and destination_path.parent == artifact_dir:",
+                            "        state['publish_count'] += 1",
+                            "        if state['publish_count'] == 2:",
+                            "            os._exit(77)",
+                            "    real_replace(source, destination)",
+                            "module.os.replace = crash_during_publish",
+                            "module.ingest_mas_artifact_file(Path(sys.argv[2]), Path(sys.argv[3]), through_phase=sys.argv[4] or None)",
+                        ]
+                    )
+                    crashed_ingest = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            crash_script,
+                            str(SCRIPT_DIR),
+                            str(crash_return),
+                            str(crash_task_dir),
+                            str(case.get("through_phase") or ""),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        timeout=20,
+                        check=False,
+                    )
+                    if crashed_ingest.returncode != 77:
+                        result["errors"].append(
+                            "MAS ingest 硬退出注入未生效: "
+                            f"returncode={crashed_ingest.returncode}"
+                        )
+                        result["ok"] = False
+                    crash_transactions = list((crash_task_dir / "artifacts").glob(".mas-ingest-txn-*"))
+                    if not crash_transactions:
+                        result["errors"].append("MAS ingest 硬退出后未保留可恢复事务")
+                        result["ok"] = False
+                    blocked_collector = collect_mas_run(
+                        crash_task_dir,
+                        through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
+                    )
+                    result["hard_crash_collector_result"] = blocked_collector
+                    blocked_error_text = "\n".join(
+                        str(item) for item in blocked_collector.get("errors", [])
+                    )
+                    if blocked_collector.get("ok") or "存在未完成 MAS artifact 事务" not in blocked_error_text:
+                        result["errors"].append("MAS collector 未阻断硬退出后的半发布 artifact 集合")
+                        result["ok"] = False
+                    crash_recovery_result = ingest_mas_artifact_file(
+                        crash_return,
+                        crash_task_dir,
+                        through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
+                    )
+                    result["hard_crash_recovery_result"] = crash_recovery_result
+                    crash_warning_text = "\n".join(
+                        str(item) for item in crash_recovery_result.get("warnings", [])
+                    )
+                    if (
+                        not crash_recovery_result.get("ok")
+                        or "recovered 1 unfinished MAS artifact transaction" not in crash_warning_text
+                        or list((crash_task_dir / "artifacts").glob(".mas-ingest-txn-*"))
+                    ):
+                        result["errors"].append("MAS ingest 硬退出事务未在下次 ingest 自动恢复")
+                        result["ok"] = False
+
+                    before_replacement = {
+                        path.name: path.read_bytes()
+                        for path in transaction_artifact_dir.glob("*.json")
+                    }
+                    publish_count = 0
+                    with patch.object(
+                        ingest_mas_artifact_module.os,
+                        "replace",
+                        side_effect=fail_second_artifact_publish,
+                    ):
+                        failed_replacement = ingest_mas_artifact_file(
+                            transaction_return,
+                            transaction_task_dir,
+                            through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
+                            replace_existing=True,
+                        )
+                    result["transaction_replacement_failure_result"] = failed_replacement
+                    after_failed_replacement = {
+                        path.name: path.read_bytes()
+                        for path in transaction_artifact_dir.glob("*.json")
+                    }
+                    if (
+                        failed_replacement.get("ok")
+                        or failed_replacement.get("ingest_status") != "artifact_transaction_failed_not_written"
+                        or after_failed_replacement != before_replacement
+                    ):
+                        result["errors"].append("MAS ingest 替换事务失败后未完整恢复旧 artifact set")
+                        result["ok"] = False
+
+                    real_write_json = ingest_mas_artifact_module.write_json
+                    repair_stage_count = 0
+
+                    def fail_second_repair_stage(path: Path, staged_payload: Any) -> None:
+                        nonlocal repair_stage_count
+                        if path.parent.name == "stage" and path.name.startswith("repair-"):
+                            repair_stage_count += 1
+                            if repair_stage_count == 2:
+                                raise OSError(errno.EIO, "synthetic replacement archive staging failure")
+                        real_write_json(path, staged_payload)
+
+                    superseded_before = set((transaction_task_dir / "repair_history").glob("*superseded*.json"))
+                    with patch.object(
+                        ingest_mas_artifact_module,
+                        "write_json",
+                        side_effect=fail_second_repair_stage,
+                    ):
+                        failed_archive_stage = ingest_mas_artifact_file(
+                            transaction_return,
+                            transaction_task_dir,
+                            through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
+                            replace_existing=True,
+                        )
+                    result["replacement_archive_stage_failure_result"] = failed_archive_stage
+                    superseded_after = set((transaction_task_dir / "repair_history").glob("*superseded*.json"))
+                    after_archive_stage_failure = {
+                        path.name: path.read_bytes()
+                        for path in transaction_artifact_dir.glob("*.json")
+                    }
+                    if (
+                        failed_archive_stage.get("ok")
+                        or failed_archive_stage.get("ingest_status") != "artifact_transaction_failed_not_written"
+                        or after_archive_stage_failure != before_replacement
+                        or superseded_after != superseded_before
+                    ):
+                        result["errors"].append("MAS ingest 替换归档预备失败后留下半提交记录")
+                        result["ok"] = False
+
+                    publish_count = 0
+                    restore_failure_count = 0
+
+                    def fail_publish_and_first_restore(source: Any, destination: Any) -> None:
+                        nonlocal publish_count, restore_failure_count
+                        source_path = Path(source)
+                        destination_path = Path(destination)
+                        if source_path.parent.name == "stage" and destination_path.parent == transaction_artifact_dir:
+                            publish_count += 1
+                            if publish_count == 2:
+                                raise OSError(errno.EIO, "synthetic second artifact publish failure")
+                        if source_path.parent.name == "backup" and destination_path.parent == transaction_artifact_dir:
+                            restore_failure_count += 1
+                            if restore_failure_count == 1:
+                                raise OSError(errno.EIO, "synthetic backup restore failure")
+                        real_replace(source, destination)
+
+                    with patch.object(
+                        ingest_mas_artifact_module.os,
+                        "replace",
+                        side_effect=fail_publish_and_first_restore,
+                    ):
+                        recovery_required_result = ingest_mas_artifact_file(
+                            transaction_return,
+                            transaction_task_dir,
+                            through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
+                            replace_existing=True,
+                        )
+                    result["transaction_recovery_required_result"] = recovery_required_result
+                    pending_transactions = list(transaction_artifact_dir.glob(".mas-ingest-txn-*"))
+                    if (
+                        recovery_required_result.get("ok")
+                        or recovery_required_result.get("ingest_status") != "artifact_transaction_recovery_required"
+                        or not pending_transactions
+                    ):
+                        result["errors"].append("MAS ingest 回滚失败后未保留可重试恢复状态")
+                        result["ok"] = False
+
+                    replacement_result = ingest_mas_artifact_file(
+                        transaction_return,
+                        transaction_task_dir,
+                        through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
+                        replace_existing=True,
+                    )
+                    result["transaction_replacement_result"] = replacement_result
+                    if (
+                        not replacement_result.get("ok")
+                        or replacement_result.get("ingest_status") != "replaced"
+                        or not replacement_result.get("repair_history_file")
+                        or list(transaction_artifact_dir.glob(".mas-ingest-txn-*"))
+                    ):
+                        result["errors"].append("MAS ingest 显式替换未归档旧值并提交完整 artifact set")
+                        result["ok"] = False
             if case.get("expect_identity_guard"):
                 bound_payload = json.loads(bound_return_path.read_text(encoding="utf-8"))
                 stale_payload = dict(bound_payload)

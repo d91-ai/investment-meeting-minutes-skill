@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from collect_mas_artifacts import collect_artifact_files, merge_artifact_files
+from mas_task_lock import mas_task_lock
 from validate_mas_artifacts import artifact_set_digest, file_sha256, read_json, validate_payload
 
 
@@ -19,7 +20,7 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def record_main_actions(
+def _record_main_actions_unlocked(
     task_dir: Path,
     markdown_path: Path,
     summary_path: Path | None = None,
@@ -95,6 +96,22 @@ def record_main_actions(
         "source_artifact_digest": receipt["source_artifact_digest"],
         "errors": [],
     }
+
+
+def record_main_actions(
+    task_dir: Path,
+    markdown_path: Path,
+    summary_path: Path | None = None,
+    replace: bool = False,
+) -> dict[str, Any]:
+    task_dir = task_dir.expanduser()
+    with mas_task_lock(task_dir, exclusive=True):
+        return _record_main_actions_unlocked(
+            task_dir,
+            markdown_path,
+            summary_path=summary_path,
+            replace=replace,
+        )
 
 
 def main() -> int:

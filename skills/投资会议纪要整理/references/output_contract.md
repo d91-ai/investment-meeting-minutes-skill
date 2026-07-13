@@ -132,4 +132,4 @@
 
 ## 归档
 
-原始输入、最终 Markdown 文件命名、输出目录、内部 verification sidecar 和历史文件处理以 `archive_naming_contract.md` 为准。最终交付不生成 Word 或 PDF。PDF 输入只作为附件归档，正文整理应使用音频、DOCX、TXT、Markdown 或用户另行提供的可读文本。
+原始输入、最终 Markdown 文件命名、输出目录、内部 verification sidecar 和历史文件处理以 `archive_naming_contract.md` 为准。最终文件名按会议类型分别使用 `YYYY-MM-DD - 会议系列.md`、`YYYY-MM-DD - 公司名 - 上市公司交流.md` 或 `YYYY-MM-DD - 主题 - 专家交流.md`；无法确定会议系列、公司名或主题时，必须请用户确认，不导出占位文件名。最终交付不生成 Word 或 PDF。PDF 输入只作为附件归档，正文整理应使用音频、DOCX、TXT、Markdown 或用户另行提供的可读文本。

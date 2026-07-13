@@ -967,19 +967,48 @@
       "required_terms": ["用户对公司名、股票代码、术语、候选项或事实边界的明确纠正/确认", "高优先级人工修正", "记录冲突并保留为存疑", "转录、校对、识别、联网核验、编辑、排版和验证不得静默跳过"]
     },
     {
-      "name": "导出命名使用会议系列和会议类型",
+      "name": "分会议类型的终稿命名契约检查",
+      "mode": "reference_archive_naming_by_meeting_type",
+      "check": "text_contains",
+      "file": "../archive_naming_contract.md",
+      "required_terms": ["YYYY-MM-DD - 会议系列.md", "YYYY-MM-DD - 公司名 - 上市公司交流.md", "YYYY-MM-DD - 主题 - 专家交流.md", "东方路", "程郡", "舵主", "科技", "华鑫周会", "电子", "苏总", "纪博", "崔磊", "李旦", "易欢欢", "when there is no match or more than one plausible match"]
+    },
+    {
+      "name": "多人复盘会导出命名仅使用会议系列",
       "mode": "export_filename",
       "check": "export_filename",
       "file": "text_only.md",
       "meeting_date_override": "2026-07-01",
-      "expected_stem": "2026-07-01 - 研究所周会 - 多人复盘会"
+      "expected_stem": "2026-07-01 - 研究所周会"
     },
     {
-      "name": "导出命名缺失元信息使用占位",
+      "name": "多人复盘会从会议标题匹配已知系列",
+      "mode": "export_filename_infer_review_series",
+      "check": "export_filename",
+      "file": "export_naming_infer_series.md",
+      "expected_stem": "2026-07-02 - 东方路"
+    },
+    {
+      "name": "多人复盘会无法匹配系列时要求确认",
       "mode": "export_filename_placeholder",
       "check": "export_filename",
       "file": "export_naming_missing_metadata.md",
-      "expected_stem": "2026-07-02 - 会议系列 - 会议类型"
+      "expect_fail": true,
+      "required_error_terms": ["无法确定多人复盘会的会议系列"]
+    },
+    {
+      "name": "上市公司交流导出命名使用公司名",
+      "mode": "export_filename_listed_company",
+      "check": "export_filename",
+      "file": "listed_company.md",
+      "expected_stem": "2026-05-11 - 测试公司 - 上市公司交流"
+    },
+    {
+      "name": "专家交流导出命名使用主题",
+      "mode": "export_filename_expert_call",
+      "check": "export_filename",
+      "file": "expert_call.md",
+      "expected_stem": "2026-05-11 - 测试 - 专家交流"
     },
     {
       "name": "并发导出不覆盖同名 Markdown",

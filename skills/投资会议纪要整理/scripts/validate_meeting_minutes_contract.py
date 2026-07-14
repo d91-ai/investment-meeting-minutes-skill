@@ -96,6 +96,8 @@ PLACEHOLDER_VALUES = {"", "-", "无", "暂无", "无存疑", "暂无存疑", "no
 MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
 MEETING_TYPE_ALIASES = {"上市公司交流": "公司交流"}
 QUESTION_LINE_RE = re.compile(r"^\*\*【[^】\n]+】\*\*\s*$", re.MULTILINE)
+REVIEW_TARGET_HEADING_RE = re.compile(r"^#####\s*【(?P<content>[^】\n]*)】\s*$")
+TARGET_WITH_CODE_RE = re.compile(r"^.+?(?:\([^()\n]+\)|（[^（）\n]+）)$")
 SINGLE_TIMESTAMP_RE = re.compile(r"^(?:\d{1,2}:[0-5]\d|\d{1,2}:[0-5]\d:[0-5]\d)$")
 VERIFICATION_REQUIRED_FIELDS = [
     "原始表述",
@@ -226,6 +228,29 @@ def empty_bracket_heading_findings(markdown: str) -> list[str]:
     findings: list[str] = []
     for match in re.finditer(r"(?m)^#{4,5}\s*【\s*】\s*$", markdown):
         findings.append(match.group(0).strip())
+    return findings
+
+
+def review_target_heading_code_findings(markdown: str, meeting_type: str) -> list[str]:
+    if meeting_type != "多人复盘会":
+        return []
+
+    findings: list[str] = []
+    for raw_line in body_section(markdown).splitlines():
+        line = raw_line.strip()
+        match = REVIEW_TARGET_HEADING_RE.fullmatch(line)
+        if not match:
+            continue
+        content = match.group("content").strip()
+        if not content:
+            continue
+        missing_codes = [
+            target.strip()
+            for target in content.split("｜")
+            if target.strip() and not TARGET_WITH_CODE_RE.fullmatch(target.strip())
+        ]
+        if missing_codes:
+            findings.append(f"{line}（缺少代码：{' / '.join(missing_codes)}）")
     return findings
 
 
@@ -764,6 +789,10 @@ def validate_contract(
     if empty_bracket_headings:
         preview = "；".join(empty_bracket_headings[:6])
         errors.append(f"标题不得使用空括号占位: {preview}")
+    target_headings_without_codes = review_target_heading_code_findings(markdown, meeting_type)
+    if target_headings_without_codes:
+        preview = "；".join(target_headings_without_codes[:6])
+        errors.append(f"多人复盘会标的行中的每个标的必须包含非空代码: {preview}")
 
     has_body_section = "## 一、发言整理" in markdown
     has_subheading = bool(re.search(r"^###(?!#)\s+", markdown, re.MULTILINE))

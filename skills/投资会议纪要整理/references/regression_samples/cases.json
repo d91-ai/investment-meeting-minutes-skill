@@ -5,7 +5,7 @@
       "mode": "reference_output_contract",
       "check": "text_contains",
       "file": "../output_contract.md",
-      "required_terms": ["契约外逃逸标题", "sentence/phrase 级 anchor", "segment/chunk/minute 级范围", "质量较高的一侧作为正文主源", "先写板块行", "Validator 只检查结构性错误", "只有名称和代码均已确认"],
+      "required_terms": ["契约外逃逸标题", "sentence/phrase 级 anchor", "segment/chunk/minute 级范围", "质量较高的一侧作为正文主源", "先写板块行", "Validator 只硬校验已显式写入的标的行代码结构", "只有名称和代码均已确认", "正文中凡经上下文判定为证券标的"],
       "forbidden_terms": ["可在正文或标题中以加粗存疑形式"]
     },
     {
@@ -21,7 +21,7 @@
       "mode": "reference_mas_orchestration_goal",
       "check": "text_contains",
       "file": "../mas_orchestration_contract.md",
-      "required_terms": ["提高端到端自动化效率", "减少人工常规参与", "提升最终纪要质量", "最终 Markdown 只由主流程生成或修改", "不引入 LangGraph"]
+      "required_terms": ["提高端到端自动化效率", "减少人工常规参与", "提升最终纪要质量", "最终 Markdown 只由主流程生成或修改", "正文中凡作为证券标的出现的实体也必须带已核验代码", "不引入 LangGraph"]
     },
     {
       "name": "MAS artifact 和决策规则检查",
@@ -248,7 +248,7 @@
       "require_artifacts": ["source_manifest", "transcript_audit", "entity_verification_report", "doubtful_items", "target_attribution_review", "fidelity_review", "export_manifest"],
       "require_artifact_owners": {"source_manifest": "Main Orchestrator", "doubtful_items": "Entity Verifier proposes; Main Orchestrator decides"},
       "require_roles": ["Transcript Auditor", "Entity Verifier", "Target Attribution Reviewer", "Fidelity Reviewer", "Contract Verifier"],
-      "required_terms": ["Do not write, modify, assemble, or export final Markdown.", "Return only JSON", "scripts/validate_mas_artifacts.py"]
+      "required_terms": ["Do not write, modify, assemble, or export final Markdown.", "For every entity used as a securities target in the body", "do not apply this to entities mentioned only as customers", "Return only JSON", "scripts/validate_mas_artifacts.py"]
     },
     {
       "name": "MAS task bundle validator 拒绝篡改 audio profile",
@@ -1175,6 +1175,14 @@
       "file": "empty_target_heading_negative.md",
       "expect_fail": true,
       "required_error_terms": ["标题不得使用空括号占位"]
+    },
+    {
+      "name": "标的行缺代码负例",
+      "mode": "target_heading_missing_code_negative",
+      "source_mode": "document",
+      "file": "target_heading_missing_code_negative.md",
+      "expect_fail": true,
+      "required_error_terms": ["标的必须包含非空代码", "中际旭创"]
     },
     {
       "name": "发言人标题上下文识别样例",

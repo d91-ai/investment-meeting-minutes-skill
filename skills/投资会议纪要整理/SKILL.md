@@ -112,11 +112,12 @@ When multiple targets are mixed, target attribution is complex, high-risk facts 
 For `多人复盘会`, target attribution and topic segmentation are semantic writing tasks that must be handled by the language model using current-session context, not by regexes, keyword lists, or deterministic content-direction validators:
 - Each `#### 【...】` segment must be one independent theme, logic chain, or coherent comparison group. Unrelated themes must be split even when they appear in one continuous speaker turn.
 - A `##### 【...】` target line may contain only securities targets with names and verified codes. It must not contain directions or sectors such as `科技｜算力`.
+- In the body, every entity used as a securities target must also be written as `canonical name(verified code)`, whether or not it belongs in the target heading. Do not apply this rule to a company mentioned only as a customer, supplier, competitor, comparable, upstream/downstream entity, or background fact.
 - Only explicit positively viewed targets belong in the target line. Do not promote negative, avoid/reduce, customer, supplier, competitor, comparable, upstream/downstream, background, or incidental mentions into the target line.
 - If several positively viewed targets share the same sector, theme, and logic chain, they may share one target line. If their themes or logic chains differ, split them into separate segments.
 - If one coherent theme contains both positive and negative targets, the segment may remain together, but the target line records only the positively viewed targets and the body preserves the negative or cautious view.
 - Do not add a company to a target line unless it appears in current-session meeting materials. External evidence may confirm a name or ticker, but must not add new meeting content.
-- Before export, run a model-based semantic review of topic segmentation and target attribution. If the review finds wrong grouping, missing primary positively viewed targets, incidental targets in headings, negative targets in target lines, or companies not present in source material, revise the Markdown body and headings before validation.
+- Before export, run a model-based semantic review of topic segmentation and target attribution. If the review finds wrong grouping, missing primary positively viewed targets, target-heading entries without verified codes, body securities-target mentions without verified codes, incidental targets in headings, negative targets in target lines, or companies not present in source material, revise the Markdown body and headings before validation.
 
 ### 4. 编辑
 

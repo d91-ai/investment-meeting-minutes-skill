@@ -156,6 +156,8 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         "checks": [
             "wrong grouping",
             "missing positive targets",
+            "missing codes for targets already included in target headings",
+            "missing codes for securities targets mentioned in the body",
             "incidental targets in heading",
             "negative targets in target line",
             "non-source companies",
@@ -458,6 +460,14 @@ def prompt_for_task(artifact_type: str, spec: dict[str, Any], run_profile: str, 
         lines.append("If entity evidence is insufficient, put the exact item in unresolved_items and doubtful_items; do not guess.")
     elif artifact_type == "target_attribution_review":
         lines.append("segments_reviewed must be a positive integer for the actual reviewed scope.")
+        lines.append(
+            "Decide whether a security belongs in a target heading from current-session context; do not promote every mention. "
+            "For every security already included in a target heading, require its verified non-empty code. "
+            "For every entity used as a securities target in the body, require its verified non-empty code even when it does "
+            "not belong in the target heading; do not apply this to entities mentioned only as customers, suppliers, "
+            "competitors, comparables, upstream/downstream entities, or background facts. Put a missing positive heading target "
+            "or heading code in missing_positive_targets, and put every body target missing a code in recommended_revisions."
+        )
         lines.append("If target attribution is unsupported, add the exact finding to recommended_revisions; do not invent a target.")
     elif artifact_type == "fidelity_review":
         lines.append("paragraphs_reviewed must be a positive integer for the actual reviewed scope.")

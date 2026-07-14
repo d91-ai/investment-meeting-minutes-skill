@@ -24,6 +24,21 @@ DEFAULT_WORKSPACE_ROOT = (
 DEFAULT_EXPORT_DIR = DEFAULT_WORKSPACE_ROOT / "01 Projects/会议纪要"
 INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]+'
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+KNOWN_REVIEW_SERIES = (
+    "东方路",
+    "程郡",
+    "舵主",
+    "科技",
+    "华鑫周会",
+    "电子",
+    "苏总",
+    "纪博",
+    "崔磊",
+    "李旦",
+    "易欢欢",
+)
+MEETING_TYPE_ALIASES = {"上市公司交流": "公司交流"}
+FILENAME_PLACEHOLDERS = {"", "会议系列", "会议类型", "未命名会议", "待确认"}
 
 
 def validate_utf8_text_file(path: Path, *, require_cjk: bool = False) -> tuple[bool, str]:
@@ -57,12 +72,47 @@ def markdown_field(markdown: str, field: str, fallback: str = "") -> str:
     return match.group(1).strip() if match else fallback
 
 
-def detect_filename_title(content: str, fallback: str) -> str:
-    meeting_series_raw = markdown_field(content, "会议系列", "").strip()
+def strip_suffix(value: str, suffixes: tuple[str, ...]) -> str:
+    cleaned = value.strip()
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if cleaned.endswith(suffix):
+            return cleaned[: -len(suffix)].strip(" -_—–｜|")
+    return cleaned
+
+
+def infer_review_series(content: str, source_name: str) -> str:
+    explicit = markdown_field(content, "会议系列", "").strip()
+    if explicit not in FILENAME_PLACEHOLDERS:
+        return sanitize_filename(explicit)
+
+    meeting_title = markdown_field(content, "会议标题", "").strip()
+    haystacks = (meeting_title, source_name)
+    matches = [series for series in KNOWN_REVIEW_SERIES if any(series in value for value in haystacks)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"多人复盘会匹配到多个会议系列: {', '.join(matches)}；请向用户确认")
+    raise ValueError("无法确定多人复盘会的会议系列；请从原始文件名匹配或向用户确认")
+
+
+def detect_filename_title(content: str, source_name: str) -> str:
     meeting_type_raw = markdown_field(content, "会议类型", "").strip()
-    meeting_series = sanitize_filename(meeting_series_raw) if meeting_series_raw else "会议系列"
-    meeting_type = sanitize_filename(meeting_type_raw) if meeting_type_raw else "会议类型"
-    return sanitize_filename(f"{meeting_series} - {meeting_type}")
+    meeting_type = MEETING_TYPE_ALIASES.get(meeting_type_raw, meeting_type_raw)
+    meeting_title = markdown_field(content, "会议标题", "").strip()
+
+    if meeting_type == "多人复盘会":
+        return infer_review_series(content, source_name)
+    if meeting_type == "公司交流":
+        company_name = strip_suffix(meeting_title, ("上市公司交流会议", "上市公司交流", "交流会议", "交流"))
+        if not company_name or company_name in FILENAME_PLACEHOLDERS:
+            raise ValueError("无法从会议标题确定公司名；请向用户确认")
+        return sanitize_filename(f"{company_name} - 上市公司交流")
+    if meeting_type == "专家交流":
+        topic = strip_suffix(meeting_title, ("专家交流会议", "专家交流"))
+        if not topic or topic in FILENAME_PLACEHOLDERS:
+            raise ValueError("无法从会议标题确定专家交流主题；请向用户确认")
+        return sanitize_filename(f"{topic} - 专家交流")
+    raise ValueError("会议类型必须是多人复盘会、公司交流或专家交流")
 
 
 def parse_meeting_date(raw: str, label: str) -> str:
@@ -125,7 +175,7 @@ def export_note(source_file: Path, export_dir: Path, date_override: str | None) 
     if not source_encoding_ok:
         raise UnicodeError(source_encoding_message)
     meeting_date = normalize_meeting_date(date_override, raw_content)
-    title = detect_filename_title(raw_content, source_file.stem)
+    title = detect_filename_title(raw_content, source_file.name)
     filename_base = f"{meeting_date} - {title}"
     export_dir = export_dir / meeting_date
     export_dir.mkdir(parents=True, exist_ok=True)

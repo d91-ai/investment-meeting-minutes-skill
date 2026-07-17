@@ -5,7 +5,7 @@
 ## 目标
 
 - 用主流程统一调度会议纪要生产线。
-- 用 specialist agents 自动处理高风险子任务和过程复核。
+- 默认启用 MAS 编排，再按当前来源和内容风险增量选择 specialist agents。
 - 用结构化 artifacts 承载中间判断、证据路径、风险和处理结果。
 - 让人工只介入证据冲突、主源不确定、高风险事实无法确认或用户业务偏好不明确的异常。
 - 保持最终 Markdown 只由主流程生成或修改。
@@ -220,9 +220,11 @@ Required fields:
 
 The receipt is valid only for the same run, current pre-final source artifacts, listed main actions, and exact Markdown bytes. It is a main-workflow record, not independent proof that each listed edit was semantically applied; the final writer still owns content review. Any later source-artifact or Markdown change invalidates the receipt and any existing `export_manifest`.
 
-## MAS Trigger Rules
+## MAS Default and Specialist Trigger Rules
 
-Use MAS when any risk is present:
+Use MAS orchestration for every meeting-minutes run. The risk matrix controls which additional specialist agents are dispatched; it does not control whether MAS is enabled.
+
+Add the relevant risk-specific specialists when any risk is present:
 - Long audio, noisy audio, unclear speaker boundaries, or timestamp alignment risk.
 - `audio_plus_document` with source conflict or unclear primary body source.
 - Multiple targets, sectors, positive/negative views, customers, suppliers, competitors, or upstream/downstream entities mixed in one meeting.
@@ -230,9 +232,9 @@ Use MAS when any risk is present:
 - High-risk public facts such as company codes, customers, orders, capacity, revenue, profit, valuation, policies, events, dates, or models; or source-fidelity risk around speaker investment actions. Public facts require external evidence, while buy/sell/add/reduce/tracking actions are verified against the current-session source span unless the action embeds a public entity, ticker, or event.
 - Prior user feedback indicates summary compression, third-person rewrite, omission, missed verification, or target-attribution drift.
 
-Do not trigger MAS by default for short, clean `fast_document` work unless one of the above risks appears.
+For short, clean `fast_document` work with none of the above risks, keep the base MAS artifacts and Contract Verifier only; do not dispatch risk-specific specialists.
 
-For mixed audio+document work, source selection is considered unresolved until the main workflow has compared the audio-derived transcript, `aligned_transcript`, and provided document. The task request should set `source_selection_status` to one of `not_compared`, `compared_clear`, `conflict`, or `uncertain`; omitted `audio_plus_document` status, or an accidental `not_applicable`, is treated as `not_compared`. If the primary body source is already clear and no other risk exists, set `source_selection_status=compared_clear` and keep the source-quality note in the main workflow instead of dispatching every MAS specialist. If MAS is used, dispatch only the phase that is ready rather than spawning all specialists at once.
+For mixed audio+document work, source selection is considered unresolved until the main workflow has compared the audio-derived transcript, `aligned_transcript`, and provided document. The task request should set `source_selection_status` to one of `not_compared`, `compared_clear`, `conflict`, or `uncertain`; omitted `audio_plus_document` status, or an accidental `not_applicable`, is treated as `not_compared`. If the primary body source is already clear and no other risk exists, set `source_selection_status=compared_clear` and keep the source-quality note in the main workflow instead of dispatching source-reconciliation or other risk-specific specialists. Dispatch only the phase that is ready rather than spawning all selected specialists at once.
 
 ## Task Bundle
 
@@ -248,7 +250,7 @@ Accepted `risk_flags` are explicit and unknown tokens fail fast:
 Artifact selection is incremental rather than all-specialist by default. Every active MAS run keeps main-owned `source_manifest` plus final `export_manifest`; audio risks add `transcript_audit`, source-selection risks add `source_reconciliation` and `fidelity_review`, entity/public-fact risks add `entity_verification_report` plus `doubtful_items`, target risks add `target_attribution_review`, and fidelity risks add `fidelity_review`. `audio_only` must use `strict_audio`, which may reach the full set through its inferred risks. A flags-only CLI call may inspect a plan without materials; `--task-dir`, `--request-json`, or explicit `--material` activates source-coverage validation. Before any prompt files are written, the bundle builder must fail fast when `audio_only` lacks audio, `document_only` lacks a readable body document, or `audio_plus_document` lacks either evidence side; a PDF attachment alone is not a body document.
 
 The task bundle must define:
-- Whether MAS is required for the current run.
+- That MAS is required for the current run, plus the risk-based specialist selection.
 - Expected artifacts for the selected risk profile.
 - Artifact owners. `source_manifest` is created by the Main Orchestrator. `doubtful_items` may be proposed by Entity Verifier, but final handling is decided by the Main Orchestrator.
 - Specialist roles, inputs, checks, required fields, JSON-only prompt, and forbidden final-output fields.

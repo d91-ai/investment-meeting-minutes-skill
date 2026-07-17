@@ -374,20 +374,24 @@
       "required_terms": ["primary body source", "Use only current-session meeting materials"]
     },
     {
-      "name": "MAS task bundle fast document 低风险跳过样例",
+      "name": "MAS task bundle fast document 低风险基础编排样例",
       "mode": "mas_task_bundle_fast_document_skip",
       "check": "mas_task_bundle",
       "file": "mas_task_request_fast_document.json",
-      "expect_mas_required": false,
+      "expect_mas_required": true,
+      "require_artifacts": ["source_manifest", "export_manifest"],
+      "require_roles": ["Contract Verifier"],
       "forbid_artifacts": ["transcript_audit", "source_reconciliation", "target_attribution_review"],
       "forbidden_terms": ["Transcript Auditor", "Source Reconciler", "Target Attribution Reviewer"]
     },
     {
-      "name": "MAS task bundle audio plus document 低风险跳过样例",
+      "name": "MAS task bundle audio plus document 主源明确基础编排样例",
       "mode": "mas_task_bundle_audio_plus_document_clear_skip",
       "check": "mas_task_bundle",
       "file": "mas_task_request_audio_plus_document_clear.json",
-      "expect_mas_required": false,
+      "expect_mas_required": true,
+      "require_artifacts": ["source_manifest", "export_manifest"],
+      "require_roles": ["Contract Verifier"],
       "forbid_artifacts": ["transcript_audit", "source_reconciliation", "target_attribution_review"],
       "forbidden_terms": ["Transcript Auditor", "Source Reconciler", "Target Attribution Reviewer"]
     },

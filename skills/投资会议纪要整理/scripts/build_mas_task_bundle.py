@@ -311,10 +311,7 @@ def should_use_mas(
     risk_flags: list[str],
     source_selection_status: str = "not_applicable",
 ) -> bool:
-    risks = set(infer_risk_flags(run_profile, source_mode, risk_flags, source_selection_status))
-    if run_profile == "fast_document" and not risks:
-        return False
-    return bool(risks)
+    return True
 
 
 def select_expected_artifacts(
@@ -329,9 +326,11 @@ def select_expected_artifacts(
         return []
 
     artifacts = {"source_manifest", "export_manifest"}
-    if risks & AUDIO_RISKS or source_mode == "audio_plus_document":
+    if risks & AUDIO_RISKS or (
+        source_mode == "audio_plus_document" and source_selection_status != "compared_clear"
+    ):
         artifacts.add("transcript_audit")
-    if source_mode == "audio_plus_document" or risks & SOURCE_RECONCILIATION_RISKS:
+    if risks & SOURCE_RECONCILIATION_RISKS:
         artifacts.add("source_reconciliation")
     if risks & TARGET_RISKS or (meeting_type == "多人复盘会" and run_profile == "strict_audio"):
         artifacts.add("target_attribution_review")

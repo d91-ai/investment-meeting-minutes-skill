@@ -50,7 +50,7 @@ def synthetic_final_markdown(artifacts: dict[str, Any]) -> str:
         "",
         "### 发言人1",
         "",
-        "#### 【科技｜合成回归】",
+        "#### 【合成回归】",
         "",
     ]
     if first is None:

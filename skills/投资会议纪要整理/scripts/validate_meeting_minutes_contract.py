@@ -257,6 +257,28 @@ def review_target_heading_code_findings(markdown: str, meeting_type: str) -> lis
     return findings
 
 
+def review_sector_heading_primary_prefix_findings(markdown: str, meeting_type: str) -> list[str]:
+    if meeting_type != "多人复盘会":
+        return []
+
+    findings: list[str] = []
+    lines = [raw_line.strip() for raw_line in body_section(markdown).splitlines()]
+    for index, line in enumerate(lines):
+        is_sector_heading = line.startswith("##### ")
+        if line.startswith("#### "):
+            next_line = next((candidate for candidate in lines[index + 1 :] if candidate), "")
+            is_sector_heading = not next_line.startswith("##### ")
+        if not is_sector_heading:
+            continue
+        match = re.fullmatch(r"#{4,5}\s*【(?P<content>[^】\n]*)】\s*", line)
+        if not match:
+            continue
+        content = match.group("content").strip()
+        if "｜" in content or "|" in content:
+            findings.append(line)
+    return findings
+
+
 def review_meeting_heading_warnings(markdown: str, meeting_type: str) -> list[str]:
     if meeting_type != "多人复盘会":
         return []
@@ -800,6 +822,10 @@ def validate_contract(
     if target_headings_without_codes:
         preview = "；".join(target_headings_without_codes[:6])
         errors.append(f"多人复盘会标的行中的每个标的必须包含非空代码: {preview}")
+    sector_headings_with_primary_prefix = review_sector_heading_primary_prefix_findings(markdown, meeting_type)
+    if sector_headings_with_primary_prefix:
+        preview = "；".join(sector_headings_with_primary_prefix[:6])
+        errors.append(f"多人复盘会板块行只展示二级板块，不得包含一级板块前缀或分隔符: {preview}")
 
     has_body_section = "## 一、发言整理" in markdown
     has_subheading = bool(re.search(r"^###(?!#)\s+", markdown, re.MULTILINE))

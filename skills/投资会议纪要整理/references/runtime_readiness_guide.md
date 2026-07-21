@@ -20,7 +20,7 @@
 - 现场安装 Python 包。
 - 从 SenseVoice 静默切换到 Whisper 或其他 ASR。
 - 根据清洗后纪要的位置估算时间戳。
-- 在 Word 导出或本地归档失败时声称已经成功。
+- 在 Markdown 导出或本地归档失败时声称已经成功。
 
 ## Readiness Profile
 
@@ -37,21 +37,15 @@ python3 scripts/check_investment_workflow_health.py --profile full --strict
 
 - `asr`：只检查本地转写前置条件、SenseVoice/Paraformer 服务和模型缓存。音频转写前使用。
 - `document`：检查 UTF-8 文本处理、DOCX 解析、本地输入/临时/输出目录权限。文档密集任务前使用。
-- `export`：检查本地 Markdown validator、`python-docx`、Word 表格/样式生成依赖和本地输出目录。最终 Markdown + Word 导出前使用。
+- `export`：检查本地 Markdown validator、Markdown 导出器、本地输出目录和同目录 hard-link 原子发布能力。最终 Markdown 导出前使用。
 - `full`：运行全部本地基础检查。用于部署验收，不建议每次会议纪要都跑。
 
-`asr` / `full` 的 strict 模式在缺少必要本地资源时应失败：
+strict 模式按 profile 检查对应资源：
 
-- `funasr`
-- `modelscope`
-- `soundfile`
-- `librosa`
-- `docx`
-- 本地 SenseVoice 模型缓存
-- 本地 Paraformer 辅助模型缓存
-- 运行中的 SenseVoice 服务上报的模型缓存路径
-- SenseVoice 转写 bridge 健康检查接口
-- 本地输入、临时、输出路径
+- `asr --strict`：缺少 `funasr`、`modelscope`、`soundfile`、`librosa`、本地 SenseVoice 主模型缓存、本地 Paraformer 辅助模型缓存、本地 fsmn-vad 模型缓存、运行中的 SenseVoice bridge 健康检查接口或服务上报的模型缓存时应失败。
+- `document --strict`：缺少 `docx`、UTF-8 文本处理、临时目录、本地输入目录或本地输出目录时应失败。
+- `export --strict`：缺少本地输出目录、Markdown validator、Markdown 导出器或安全原子发布能力时应失败。
+- `full --strict`：运行以上全部本地基础检查。
 
 当前维护的音频工作流是：SenseVoice 作为主转写来源，Paraformer 只作为辅助校对和时间戳证据。`timestamp_index.json` 可由脚本在 SenseVoice 与 Paraformer 可用时间戳 anchor 间选择，并记录 `timestamp_index_source`。Paraformer 结果不得自动替换 SenseVoice 主转写。额外 ASR 引擎、说话人分离、无关分段路径不属于当前基础 skill 合约，只有用户明确要求时才启用。
 
@@ -95,9 +89,13 @@ python3 scripts/check_investment_workflow_health.py --profile export --prepare-l
 本地路径和 Python 选择：
 
 - 设置 `INVESTMENT_MINUTES_WORKSPACE` 作为会议纪要工作流根目录；原始输入和最终输出目录都从该根目录推导。
-- 当 Markdown/Word 检查需要使用非系统默认 `python3` 时，设置 `INVESTMENT_MINUTES_PYTHON`。
+- 当 Markdown 检查需要使用非系统默认 `python3` 时，设置 `INVESTMENT_MINUTES_PYTHON`。
 - 当 ASR 检查需要使用独立转写运行时时，设置 `SENSEVOICE_PYTHON`。
 - 模型缓存优先使用 `SENSEVOICE_MODEL_CACHE`；未设置时使用 `FUNASR_MODEL_CACHE`，再退回 `$HOME/Documents/Codex/asr-model-cache`。
+- SenseVoice HTTP bridge 默认只接受不超过 `67108864` bytes（64 MiB）的 multipart 上传，可用 `SENSEVOICE_MAX_UPLOAD_BYTES` 在部署时显式调整。超过上限的音频应走本地 `transcribe_audio.py` 路径；不要为了接收大文件盲目放宽内存上限。
+- `SENSEVOICE_MAX_CONCURRENT_TRANSCRIPTIONS` 默认是 `1`，用于避免多个模型进程同时争抢内存。只有在实测内存充足且完成并发压测后才提高。
+- 同一输出目录和文件 stem 的 SenseVoice 任务会串行执行；本轮失败时保留上一轮已提交的完整输出，本轮成功后整组替换受管输出，避免跨轮混写。若进程在提交窗口被强制终止，下次同 stem 运行会先恢复遗留事务，再启动模型工作。
+- Markdown 导出和原始材料归档要求目标目录支持同目录 hard-link；若 exFAT、部分 SMB/FUSE 等文件系统不支持，脚本会安全失败而不采用可能覆盖已有文件或暴露半文件的降级方案。迁移工作区后先运行 `--profile export` readiness 检查。
 - 日志和访问控制等用户级配置应使用 `$HOME/...`、环境变量或 CLI 参数，不应写入 reusable artifact 的私有绝对路径。
 
 skill 包内应保留：

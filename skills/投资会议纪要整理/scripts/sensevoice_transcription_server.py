@@ -7,9 +7,11 @@ import argparse
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +25,7 @@ DEFAULT_PRIMARY_ENGINE = "sensevoice"
 DEFAULT_PRIMARY_MODEL = "iic/SenseVoiceSmall"
 DEFAULT_AUXILIARY_ENGINE = "paraformer"
 DEFAULT_AUXILIARY_MODEL = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+DEFAULT_VAD_MODEL = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 DEFAULT_MODEL_CACHE = os.environ.get(
     "SENSEVOICE_MODEL_CACHE",
     os.environ.get(
@@ -32,10 +35,23 @@ DEFAULT_MODEL_CACHE = os.environ.get(
 )
 DEFAULT_TRANSCRIBE_PYTHON = os.environ.get("SENSEVOICE_PYTHON", "")
 
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+MAX_UPLOAD_BYTES = _positive_env_int("SENSEVOICE_MAX_UPLOAD_BYTES", 64 * 1024 * 1024)
+MAX_CONCURRENT_TRANSCRIPTIONS = _positive_env_int("SENSEVOICE_MAX_CONCURRENT_TRANSCRIPTIONS", 1)
+TRANSCRIBE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
+
 LOG_DIR = Path(os.environ.get("KUMAAI_SYNC_LOG_DIR", str(Path.home() / "Library/Logs/kumaai-sync")))
 MODEL_REQUIREMENTS = {
     "sensevoice": ("iic/SenseVoiceSmall", ("config.yaml", "model.pt")),
     "paraformer": (DEFAULT_AUXILIARY_MODEL, ("config.yaml", "model.pt")),
+    "vad": (DEFAULT_VAD_MODEL, ("config.yaml", "model.pt")),
 }
 
 
@@ -103,6 +119,15 @@ def _parse_multipart_form(handler: BaseHTTPRequestHandler, content_type: str) ->
         charset = part.get_content_charset() or "utf-8"
         form.add_field(name, payload.decode(charset, errors="replace"))
     return form
+
+
+def require_audio_form_file(form: MultipartForm) -> UploadedFormFile:
+    file_item = form["audio"] if "audio" in form else None
+    if file_item is None or not getattr(file_item, "filename", None):
+        raise ValueError("audio field required")
+    if not hasattr(file_item, "file"):
+        raise ValueError("audio field must be a file upload")
+    return file_item
 
 
 def _model_cache_status() -> dict:
@@ -187,21 +212,32 @@ def _run_transcribe(command: list[str], output_dir: Path, stem: str, timeout: in
     env.setdefault("FUNASR_MODEL_CACHE", DEFAULT_MODEL_CACHE)
     env.setdefault("MODELSCOPE_CACHE", str(Path(DEFAULT_MODEL_CACHE).expanduser() / "modelscope"))
     env.setdefault("HF_HOME", str(Path(DEFAULT_MODEL_CACHE).expanduser() / "huggingface"))
-    completed = subprocess.run(command, text=True, capture_output=True, env=env, timeout=timeout)
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "", f"transcription timed out after {timeout} seconds"
+    except OSError as exc:
+        return False, "", f"transcription process could not start: {exc}"
     text = _read_transcript_txt(output_dir, stem)
     error = ""
     if completed.returncode != 0:
         error = (completed.stderr or completed.stdout or "transcription failed").strip()
-    return completed.returncode == 0, text, error
+    elif not text:
+        error = "transcription completed without usable text"
+    return completed.returncode == 0 and bool(text), text, error
 
 
 class SenseVoiceHandler(BaseHTTPRequestHandler):
     server_version = "SenseVoiceBridge/1.0"
 
     def log_message(self, fmt: str, *args) -> None:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with (LOG_DIR / "sensevoice-transcription-server.log").open("a", encoding="utf-8") as handle:
-            handle.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))
+        message = "%s - %s\n" % (self.log_date_time_string(), fmt % args)
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with (LOG_DIR / "sensevoice-transcription-server.log").open("a", encoding="utf-8") as handle:
+                handle.write(message)
+        except OSError:
+            sys.stderr.write(message)
 
     def do_GET(self) -> None:
         if self.path.rstrip("/") == "/health":
@@ -216,6 +252,8 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
                     "primary_model": DEFAULT_PRIMARY_MODEL,
                     "auxiliary_engine": DEFAULT_AUXILIARY_ENGINE,
                     "auxiliary_model": DEFAULT_AUXILIARY_MODEL,
+                    "max_upload_bytes": MAX_UPLOAD_BYTES,
+                    "max_concurrent_transcriptions": MAX_CONCURRENT_TRANSCRIPTIONS,
                     "model_cache": _model_cache_status(),
                 },
             )
@@ -225,6 +263,27 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path.rstrip("/") != "/transcribe":
             _json_response(self, 404, {"ok": False, "error": "not found"})
+            return
+        if not TRANSCRIBE_SEMAPHORE.acquire(blocking=False):
+            _json_response(self, 503, {"ok": False, "error": "transcription service is busy", "text": ""})
+            return
+        try:
+            self._handle_transcribe()
+        finally:
+            TRANSCRIBE_SEMAPHORE.release()
+
+    def _handle_transcribe(self) -> None:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            _json_response(self, 400, {"ok": False, "error": "invalid Content-Length", "text": ""})
+            return
+        if content_length > MAX_UPLOAD_BYTES:
+            _json_response(
+                self,
+                413,
+                {"ok": False, "error": f"upload exceeds {MAX_UPLOAD_BYTES} byte limit", "text": ""},
+            )
             return
 
         content_type = self.headers.get("Content-Type", "")
@@ -237,9 +296,10 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             _json_response(self, 400, {"ok": False, "error": str(exc), "text": ""})
             return
-        file_item = form["audio"] if "audio" in form else None
-        if file_item is None or not getattr(file_item, "filename", None):
-            _json_response(self, 200, {"ok": True, "engine": "sensevoice", "model": DEFAULT_PRIMARY_MODEL, "text": ""})
+        try:
+            file_item = require_audio_form_file(form)
+        except ValueError as exc:
+            _json_response(self, 400, {"ok": False, "error": str(exc), "text": ""})
             return
 
         filename = _clean_filename(file_item.filename)
@@ -247,11 +307,13 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
         with tempfile.TemporaryDirectory(prefix="sensevoice-local-") as tmp:
             tmp_dir = Path(tmp)
             audio_path = tmp_dir / f"input{suffix}"
-            audio_path.write_bytes(file_item.file.read())
+            with audio_path.open("wb") as audio_handle:
+                shutil.copyfileobj(file_item.file, audio_handle, length=1024 * 1024)
+            file_item.file.close()
+            del file_item
+            del form
             primary_dir = tmp_dir / "primary"
-            auxiliary_dir = tmp_dir / "auxiliary"
             primary_dir.mkdir()
-            auxiliary_dir.mkdir()
 
             command = [
                 DEFAULT_TRANSCRIBE_PYTHON
@@ -288,7 +350,9 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
                 "timestamp_segments": timestamp_segments,
                 "sentence_info": timestamp_segments,
                 "timestamp_index": primary_json.get("timestamp_index") or [],
-                "timestamp_index_path": primary_json.get("timestamp_index_path") or "",
+                # The bridge temp directory is removed before the response is
+                # consumed; callers must use the inline timestamp_index.
+                "timestamp_index_path": "",
                 "timestamp_index_source": primary_json.get("timestamp_index_source") or "",
                 "auxiliary_engine": primary_json.get("auxiliary_engine") or "",
                 "auxiliary_model": primary_json.get("auxiliary_model") or "",

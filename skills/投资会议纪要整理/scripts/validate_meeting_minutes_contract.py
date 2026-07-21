@@ -96,7 +96,7 @@ PLACEHOLDER_VALUES = {"", "-", "无", "暂无", "无存疑", "暂无存疑", "no
 MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
 MEETING_TYPE_ALIASES = {"上市公司交流": "公司交流"}
 QUESTION_LINE_RE = re.compile(r"^\*\*【[^】\n]+】\*\*\s*$", re.MULTILINE)
-REVIEW_TARGET_HEADING_RE = re.compile(r"^#####\s*【(?P<content>[^】\n]*)】\s*$")
+REVIEW_TARGET_HEADING_RE = re.compile(r"^####\s*【(?P<content>[^】\n]*)】\s*$")
 TARGET_WITH_CODE_RE = re.compile(r"^.+?(?:\([^()\n]+\)|（[^（）\n]+）)$")
 SINGLE_TIMESTAMP_RE = re.compile(r"^(?:\d{1,2}:[0-5]\d|\d{1,2}:[0-5]\d:[0-5]\d)$")
 VERIFICATION_REQUIRED_FIELDS = [
@@ -172,7 +172,7 @@ def validate_meeting_type_reference(markdown: str, meeting_type: str) -> list[st
             preview = "；".join(topic_headings[:4])
             errors.append(f"发言人标题不是标的或主题标题: {preview}")
         if "标的：" in body:
-            errors.append("多人复盘会小段标题不使用 标的： 前缀，应使用【板块】标题行和【标的(代码)】标题行")
+            errors.append("多人复盘会小段标题不使用 标的： 前缀；有明确标的时应先写【标的(代码)】标题行，再写【板块】标题行")
         if "后半段" in body:
             errors.append("多人复盘会同一发言人再次发言时保留同名标题，不使用（后半段）")
     elif normalized_meeting_type == "公司交流":
@@ -236,10 +236,13 @@ def review_target_heading_code_findings(markdown: str, meeting_type: str) -> lis
         return []
 
     findings: list[str] = []
-    for raw_line in body_section(markdown).splitlines():
-        line = raw_line.strip()
+    lines = [raw_line.strip() for raw_line in body_section(markdown).splitlines()]
+    for index, line in enumerate(lines):
         match = REVIEW_TARGET_HEADING_RE.fullmatch(line)
         if not match:
+            continue
+        next_line = next((candidate for candidate in lines[index + 1 :] if candidate), "")
+        if not next_line.startswith("##### "):
             continue
         content = match.group("content").strip()
         if not content:
@@ -273,9 +276,13 @@ def review_meeting_heading_warnings(markdown: str, meeting_type: str) -> list[st
             has_sector_heading = False
             continue
         if line.startswith("#### "):
-            has_sector_heading = True
+            match = REVIEW_TARGET_HEADING_RE.fullmatch(line)
+            content = match.group("content").strip() if match else ""
+            targets = [target.strip() for target in content.split("｜") if target.strip()]
+            has_sector_heading = not targets or not all(TARGET_WITH_CODE_RE.fullmatch(target) for target in targets)
             continue
         if line.startswith("##### "):
+            has_sector_heading = True
             continue
         if line.startswith("#"):
             continue

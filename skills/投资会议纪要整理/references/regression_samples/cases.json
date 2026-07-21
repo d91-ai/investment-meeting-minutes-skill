@@ -5,7 +5,7 @@
       "mode": "reference_output_contract",
       "check": "text_contains",
       "file": "../output_contract.md",
-      "required_terms": ["契约外逃逸标题", "sentence/phrase 级 anchor", "segment/chunk/minute 级范围", "质量较高的一侧作为正文主源", "先写板块行", "Validator 只硬校验已显式写入的标的行代码结构", "只有名称和代码均已确认", "正文中凡经上下文判定为证券标的"],
+      "required_terms": ["契约外逃逸标题", "sentence/phrase 级 anchor", "segment/chunk/minute 级范围", "质量较高的一侧作为正文主源", "先写 `#### 【标的(代码)】`", "Validator 只硬校验已显式写入的标的行代码结构", "只有名称和代码均已确认", "正文中凡经上下文判定为证券标的"],
       "forbidden_terms": ["可在正文或标题中以加粗存疑形式"]
     },
     {
@@ -1216,6 +1216,14 @@
       "file": "target_heading_missing_code_negative.md",
       "expect_fail": true,
       "required_error_terms": ["标的必须包含非空代码", "中际旭创"]
+    },
+    {
+      "name": "多人复盘会标题顺序反向负例",
+      "mode": "review_heading_order_reversed_negative",
+      "source_mode": "document",
+      "file": "review_heading_order_reversed_negative.md",
+      "expect_fail": true,
+      "required_error_terms": ["标的必须包含非空代码", "科技"]
     },
     {
       "name": "发言人标题上下文识别样例",

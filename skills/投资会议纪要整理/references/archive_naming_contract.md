@@ -1,14 +1,18 @@
 # Archive Naming Contract
 
-Use this file when archiving raw meeting inputs or exporting confirmed meeting notes. The naming contract is deterministic so local runs, Dify runs, Google Drive sync, and later manual review use the same paths.
+Use this file when archiving raw meeting inputs or exporting confirmed meeting notes. The naming contract is deterministic so local runs and later manual review use the same paths.
+
+This contract applies only when the user has allowed archive/export writes. If the user asks for read-only analysis, says not to archive, says not to modify files, or marks the run as a no-archive test, do not run archive/export writes without explicit confirmation.
 
 ## Raw Input Archive
 
 Archive root:
 
 ```text
-/Users/kumaai/Documents/Codex/workspace/投资纪要工作流/00 Inbox/会议原始记录
+$INVESTMENT_MINUTES_WORKSPACE/00 Inbox/会议原始记录
 ```
+
+If `INVESTMENT_MINUTES_WORKSPACE` is not set, local scripts default to `Path.home() / "Documents/会议纪要整理"`. Use `--archive-root` for one-off overrides.
 
 Folder pattern:
 
@@ -56,8 +60,10 @@ Rules:
 Default final-note root:
 
 ```text
-/Users/kumaai/Documents/Codex/workspace/投资纪要工作流/01 Projects/会议纪要
+$INVESTMENT_MINUTES_WORKSPACE/01 Projects/会议纪要
 ```
+
+Use `--export-dir` for one-off overrides.
 
 Final-note folder:
 
@@ -65,13 +71,36 @@ Final-note folder:
 YYYY-MM-DD/
 ```
 
-Preferred final-note filename:
+Final-note filename by meeting type:
 
 ```text
-YYYY-MM-DD - 会议标题 - 会议类型.md
-YYYY-MM-DD - 会议标题 - 会议类型.docx
+多人复盘会：YYYY-MM-DD - 会议系列.md
+公司交流：YYYY-MM-DD - 公司名 - 上市公司交流.md
+专家交流：YYYY-MM-DD - 主题 - 专家交流.md
 ```
 
-If the title already includes the meeting type, do not repeat the meeting type. If the filename collides, append a timestamp suffix and keep both files.
+Use `--meeting-date` when an explicit export date is needed; otherwise use the Markdown `会议日期` field, then the current date as the last fallback.
+
+For `多人复盘会`, fill `会议系列` before export. First match the raw input filenames against the known series below. Use the result automatically only when there is one clear match; when there is no match or more than one plausible match, ask the user to confirm instead of inventing a series or exporting a placeholder.
+
+Known meeting series:
+
+- `东方路`
+- `程郡`
+- `舵主`
+- `科技`
+- `华鑫周会`
+- `电子`
+- `苏总`
+- `纪博`
+- `崔磊`
+- `李旦`
+- `易欢欢`
+
+For `公司交流`, derive the confirmed company name from `会议标题` such as `XX公司交流会议`; remove only the exchange suffix and preserve the company name. For `专家交流`, derive the topic from `会议标题` such as `XX主题专家交流`; remove the expert-exchange suffix and preserve the topic. If the company name or topic remains unclear, ask the user before export.
+
+Do not use literal filename placeholders. The `会议标题` field controls the company name or topic only for the matching non-review meeting type. If the filename collides, append a timestamp suffix to the Markdown file.
+
+When non-person business doubts require audit records, a same-stem `.verification.json` or `.verification.jsonl` may be kept as an internal sidecar. It is not a formal deliverable.
 
 Do not expose raw archive paths or technical archive status in the human-readable note body.

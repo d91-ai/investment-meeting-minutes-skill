@@ -7,14 +7,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
+import tempfile
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-DEFAULT_ARCHIVE_ROOT = Path("/Users/kumaai/Documents/Codex/workspace/投资纪要工作流/00 Inbox/会议原始记录")
+DEFAULT_WORKSPACE_ROOT = (
+    Path(os.environ["INVESTMENT_MINUTES_WORKSPACE"]).expanduser()
+    if os.environ.get("INVESTMENT_MINUTES_WORKSPACE")
+    else Path.home() / "Documents/会议纪要整理"
+)
+DEFAULT_ARCHIVE_ROOT = DEFAULT_WORKSPACE_ROOT / "00 Inbox/会议原始记录"
 INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]+'
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TYPE_LABELS = {
@@ -22,7 +30,7 @@ TYPE_LABELS = {
     ".doc": "文稿",
     ".txt": "文稿",
     ".md": "文稿",
-    ".pdf": "文稿",
+    ".pdf": "附件",
     ".mp3": "录音",
     ".m4a": "录音",
     ".wav": "录音",
@@ -152,6 +160,44 @@ def plan_archive_files(
     }
 
 
+def archive_target_candidates(target: Path) -> list[Path]:
+    timestamp = datetime.now().strftime("%H%M%S")
+    candidates = [target]
+    candidates.extend(
+        target.with_name(
+            f"{target.stem}{f'-{timestamp}' if index == 1 else f'-{timestamp}-{index}'}{target.suffix}"
+        )
+        for index in range(1, 1000)
+    )
+    return candidates
+
+
+def publish_archive_file(part_path: Path, target: Path) -> Path:
+    """Atomically publish a completed archive file without overwriting."""
+    for candidate in archive_target_candidates(target):
+        try:
+            os.link(part_path, candidate)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise OSError(
+                exc.errno,
+                "目标文件系统不支持安全的原子无覆盖归档；未采用可能覆盖或暴露半文件的降级方案",
+                str(candidate),
+            ) from exc
+        return candidate
+    raise FileExistsError(f"无法为归档文件原子发布未占用名称: {target.name}")
+
+
+def cleanup_archive_part_file(part_path: Path | None) -> None:
+    if part_path is None:
+        return
+    try:
+        part_path.unlink(missing_ok=True)
+    except OSError as exc:
+        warnings.warn(f"已完成原始文件归档，但临时 part 文件清理失败: {part_path}: {exc}", RuntimeWarning)
+
+
 def archive_files(
     files: list[Path],
     archive_root: Path,
@@ -163,11 +209,33 @@ def archive_files(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[Path] = []
-    for item in plan["files"]:
-        source = Path(str(item["source"]))
-        target = Path(str(item["target"]))
-        shutil.copy2(source, target)
-        copied.append(target)
+    try:
+        for item in plan["files"]:
+            source = Path(str(item["source"]))
+            target = Path(str(item["target"]))
+            part_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{target.name}.",
+                    suffix=".part",
+                    dir=target_dir,
+                    delete=False,
+                ) as target_handle:
+                    part_path = Path(target_handle.name)
+                    with source.open("rb") as source_handle:
+                        shutil.copyfileobj(source_handle, target_handle)
+                shutil.copystat(source, part_path)
+                target = publish_archive_file(part_path, target)
+                copied.append(target)
+            except Exception:
+                raise
+            finally:
+                cleanup_archive_part_file(part_path)
+    except Exception:
+        for target in copied:
+            target.unlink(missing_ok=True)
+        raise
     return copied
 
 
@@ -178,7 +246,7 @@ def main() -> int:
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"), help="归档日期，格式 YYYY-MM-DD")
     parser.add_argument("--title", help="会议标题，用于生成规范归档文件名")
     parser.add_argument("--dry-run", action="store_true", help="只预览目标路径，不复制文件")
-    parser.add_argument("--json", action="store_true", help="输出 JSON，便于 Dify/自动化调用")
+    parser.add_argument("--json", action="store_true", help="输出 JSON，便于自动化调用")
     args = parser.parse_args()
 
     try:

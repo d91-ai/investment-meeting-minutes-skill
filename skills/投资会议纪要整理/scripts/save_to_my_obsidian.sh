@@ -10,7 +10,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 INPUT_FILE=$1
 MEETING_DATE=${2:-}
 
-CMD=(python3 "$SCRIPT_DIR/export_to_obsidian.py" "$INPUT_FILE")
+PYTHON_BIN=${INVESTMENT_MINUTES_PYTHON:-python3}
+CMD=("$PYTHON_BIN" "$SCRIPT_DIR/export_to_obsidian.py" "$INPUT_FILE")
 
 if [ -n "$MEETING_DATE" ]; then
   CMD+=(--meeting-date "$MEETING_DATE")

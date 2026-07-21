@@ -1,4 +1,0 @@
-interface:
-  display_name: "Meeting Minutes Sanitizer"
-  short_description: "中文投研会议纪要脱敏并生成DOCX与JSONL文件"
-  default_prompt: "Use $meeting-minutes-sanitizer to sanitize a Chinese investment meeting note and output _sanitized.docx plus _rag.jsonl files."

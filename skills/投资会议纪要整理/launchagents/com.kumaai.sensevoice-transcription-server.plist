@@ -6,36 +6,26 @@
   <string>com.kumaai.sensevoice-transcription-server</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/nananaranja/.codex/skills/investment-meeting-minutes/scripts/start_sensevoice_transcription_server.sh</string>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>exec "${HOME}/.codex/skills/investment-meeting-minutes/scripts/start_sensevoice_transcription_server.sh"</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/nananaranja/Library/Logs/kumaai-sync/sensevoice-transcription-server.out.log</string>
+  <string>/tmp/sensevoice-transcription-server.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/nananaranja/Library/Logs/kumaai-sync/sensevoice-transcription-server.err.log</string>
+  <string>/tmp/sensevoice-transcription-server.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PYTHONUTF8</key>
     <string>1</string>
     <key>PYTHONIOENCODING</key>
     <string>utf-8</string>
-    <key>FUNASR_MODEL_CACHE</key>
-    <string>/Users/nananaranja/Documents/Codex/asr-model-cache</string>
-    <key>MODELSCOPE_CACHE</key>
-    <string>/Users/nananaranja/Documents/Codex/asr-model-cache/modelscope</string>
-    <key>HF_HOME</key>
-    <string>/Users/nananaranja/Documents/Codex/asr-model-cache/huggingface</string>
-    <key>SENSEVOICE_PYTHON</key>
-    <string>/Users/nananaranja/Documents/会议纪要整理/.transcribe-venv/bin/python</string>
-    <key>SENSEVOICE_BRIDGE_AUX_ENGINE</key>
-    <string></string>
-    <key>KUMAAI_SYNC_LOG_DIR</key>
-    <string>/Users/nananaranja/Library/Logs/kumaai-sync</string>
     <key>PATH</key>
-    <string>/Users/nananaranja/Documents/会议纪要整理/.transcribe-venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>DYLD_FALLBACK_LIBRARY_PATH</key>
     <string>/opt/homebrew/opt/little-cms2/lib:/opt/homebrew/lib:/usr/local/opt/little-cms2/lib:/usr/local/lib</string>
     <key>DYLD_LIBRARY_PATH</key>

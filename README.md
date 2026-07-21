@@ -1,63 +1,118 @@
 # 投资会议纪要整理 Skill
 
-这个仓库保存 Codex 使用的中文投资会议纪要整理 skill 包，用于把投资研究场景中的会议录音、转写稿、纪要草稿或音频+文字混合材料，整理成可人工复核、可归档、可同步知识库的 Markdown 和 Word 会议纪要。
+本仓库保存 Codex 使用的中文投资会议纪要整理 skill 包，用于把投资研究场景中的会议录音、转写稿、DOCX/TXT/Markdown 文稿或音频加文字混合材料，整理成可人工复核、可本地归档的 Markdown 会议纪要。
 
-当前定位是 **risk-triggered Subagents + single final writer**：默认使用最快的单主流程路径，只有在长录音、噪音重、多人边界不清、多标的混杂、音频/文档冲突或高风险事实较多时才启用 subagent。最终 Markdown、Word、归档和同步产物只由主流程统一生成。
+当前定位是 **main orchestrator + MAS process automation + deterministic validation**。会议纪要任务默认进入 MAS 编排，由主流程根据长录音、噪音重、多人边界不清、多标的混杂、音频/文档冲突、高风险事实或遗漏风险，增量选择 specialist subagents。Subagents 只返回结构化审计 artifact；最终 Markdown 和本地归档产物只由主流程统一生成。Verification sidecar 只作为内部审计文件，不作为正式交付物。
 
 ## 核心原则
 
-- Subagent 可以在风险触发时输出结构化中间产物，例如发言整理候选、标的/代码清单、存疑核验清单、音频/文档冲突摘要和遗漏检查。
-- 主流程是最终会议纪要的唯一写作者，避免多 agent 直接拼接造成格式、口径和风格割裂。
 - 基础 skill 是唯一会议纪要 skill；会议类型只影响最终格式细节。
-- 主 workflow 固定为：转录 -> 校对 -> 识别 -> 编辑 -> 排版。
-- `发言整理` 按 `发言人/版块` 分段；每段标题覆盖该段提到的全部标的，不强制一个标的一段。
-- 非人名存疑项统一调用 `references/verification_policy.md` 中的稳定核验 prompt。
-- Validator 只检查格式、章节、表头、Word 样式、编码和样例回归，不伪验证联网核验是否真实发生。
-- Dify 只是上传、抽取/转写、人工关口、归档确认和同步 adapter；具体规则见 `skills/投资会议纪要整理/references/dify_adapter_guide.md`。
+- 主 workflow 固定为：转录 -> 校对 -> 识别 -> 联网核验 -> 编辑 -> 排版 -> 验证。
+- 主流程是最终纪要的唯一写作者，避免多流程拼接造成格式、口径和风格割裂。
+- MAS 是高风险任务的过程自动化层，不是多个 agent 拼接终稿的写作机制。
+- Specialist agents 只产出与当前风险直接对应的结构化 artifact，例如 `transcript_audit`、`source_reconciliation`、`entity_verification_report`、`target_attribution_review`、`fidelity_review` 和 `export_manifest`。
+- `发言整理` 默认是可复核原文纪要，不输出摘要、压缩稿或研报化改写。
+- 音频加文稿输入时，先完成音频转录，再比较音频转录、`aligned_transcript` 和文稿质量；以覆盖更完整、发言顺序更可靠、逐字性更强、噪声和遗漏更少的一侧作为正文主源。
+- 联网核验只确认实体、代码、术语和公开事实，不补写会议没有说过的内容。
+- 外部核验只发送候选实体、代码、术语和必要公开事实关键词，不发送原始会议长段、发言人身份、私有链接、未公开客户/订单上下文或机密 source text。
+- Validator 检查格式、章节、表头、编码、样例回归，以及可选 verification 审计 artifact 的结构完整性；它不伪验证联网核验是否真实发生，也不做看好/看空等语义硬判定。
 
-## Skill 包内容
+## 目录结构
 
-- `skills/投资会议纪要整理`：基础 skill，定义输入归档、转录、校对、识别、编辑、排版、导出和同步规则。
-- 会议类型规则内置在基础 skill 中：默认 `多人复盘会`；明确单家公司专场时用 `上市公司交流`；明确专家问答时用 `专家交流`。
-- `skills/meeting-minutes-sanitizer`：用于中文投研会议纪要脱敏。
-- `.codex/agents/transcript-auditor.toml`：转写、时间戳、发言边界和音频/文档冲突 subagent。
-- `.codex/agents/content-integrity-reviewer.toml`：内容完整性、标的归因、存疑核验和最终补漏 subagent。
+- `skills/投资会议纪要整理/SKILL.md`：主 workflow、输入边界、转录、校对、核验、编辑和导出规则。
+- `skills/投资会议纪要整理/references/output_contract.md`：最终 Markdown 格式契约和存疑表规则。
+- `skills/投资会议纪要整理/references/verification_policy.md`：公司名、代码、术语、目标归因和存疑项核验规则。
+- `skills/投资会议纪要整理/references/archive_naming_contract.md`：原始输入归档和最终文件命名规则。
+- `skills/投资会议纪要整理/references/runtime_readiness_guide.md`：本地 ASR、文稿处理和导出 readiness。
+- `skills/投资会议纪要整理/references/meeting_types/`：多人复盘会、公司交流、专家交流的正文格式依据。
+- `skills/投资会议纪要整理/references/mas_orchestration_contract.md`：MAS 编排边界、artifact schema、自动/人工决策规则。
+- `skills/投资会议纪要整理/references/regression_samples/`：合成回归样例和负例。
+- `skills/投资会议纪要整理/scripts/`：归档、转录、校对、查询、MAS 编排、验证和导出脚本。
+
+纪要脱敏和 RAG 入库准备不再内置在本仓库；需要脱敏时使用独立仓库 `d91-ai/minute-sanitization-skill`。
 
 ## 运行档位
 
-- `fast_document`：短、干净、发言人清楚、低存疑的纯文稿。文稿 -> 主流程写草稿 -> 脚本格式校验 -> 导出。
-- `standard`：普通文稿或音频+文稿。先批量本地标的候选查询；只对命中风险的片段启用 subagent 或外部核验。
-- `strict_audio_or_dify`：音频-only、长录音、噪音重、音频/文档冲突、高风险事实密集或生产 Dify 路径。执行对应 readiness profile，再进入人工关口、Subagent 审查、导出和同步。
+- `fast_document`：短、干净、发言人清楚、低存疑的纯文稿。文稿 -> 主流程写草稿 -> 非人名业务实体和高风险事实联网核验 -> 脚本格式验证 -> 导出。
+- `standard`：普通文稿或音频加文稿。音频加文稿场景先完成音频转录，再对比音频转录、`aligned_transcript` 和文稿质量，选择质量更高的一侧写正文，另一侧用于交叉对比。
+- `strict_audio`：音频-only、长录音、噪音重、音频/文档冲突或高风险事实密集。执行对应 readiness profile，再进入人工关口、主流程审查和本地导出。
 
-优先触发 subagent 的情况：长录音、噪音重、多人边界不清、音频与文档冲突、多标的混杂、名称/代码/数字/客户/供应商/术语存疑、最终成稿前需要补漏。
+需要 MAS 额外过程自动化的情况包括：长录音、噪音重、多人边界不清、音频与文档冲突、多标的混杂、名称/代码/数字/客户/供应商/术语存疑、最终成稿前需要补漏。短、干净、低风险的 `fast_document` 不默认派发风险专项 subagents。
 
-## Validators
+## 仓库级检查
 
-常用检查：
+合并、规则变更或脚本变更后优先运行：
 
 ```bash
-python3 skills/投资会议纪要整理/scripts/validate_utf8_text.py README.md skills/*/SKILL.md --require-cjk --portable-skill
+python3 skills/投资会议纪要整理/scripts/validate_utf8_text.py README.md AGENTS.md skills/投资会议纪要整理/SKILL.md --require-cjk --portable-skill
 python3 skills/投资会议纪要整理/scripts/run_meeting_minutes_regression.py --json
+python3 skills/投资会议纪要整理/scripts/validate_mas_artifacts.py skills/投资会议纪要整理/references/regression_samples/mas_artifacts_valid.json --require-artifact source_reconciliation --json
+python3 skills/投资会议纪要整理/scripts/summarize_mas_decisions.py skills/投资会议纪要整理/references/regression_samples/mas_artifacts_valid.json --require-artifact source_manifest --require-artifact source_reconciliation --require-artifact entity_verification_report --require-artifact doubtful_items --require-artifact fidelity_review --require-artifact export_manifest --json
+MAS_TMP="$(mktemp -d /tmp/mas-dry-run.XXXXXX)"
+python3 skills/投资会议纪要整理/scripts/run_mas_dry_run.py --request-json skills/投资会议纪要整理/references/regression_samples/mas_task_request_audio_plus_document.json --artifact-fixture skills/投资会议纪要整理/references/regression_samples/mas_artifacts_valid.json --task-dir "$MAS_TMP" --out "$MAS_TMP/mas_dry_run_trace.json" --json
+```
+
+具体纪要产物验证需要把 `NOTE.md` 和 sidecar 路径替换为真实文件；这些不是仓库级绿色回归：
+
+```bash
 python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py NOTE.md --json
-python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py NOTE.md --word NOTE.docx --json
+python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py NOTE.md --require-term "我没有减仓" --forbid-term "发言人认为" --json
+python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py NOTE.md --verification NOTE.verification.json --require-verification --json
+```
+
+本机运行环境 readiness 会受模型、LibreOffice、目录权限和 `INVESTMENT_MINUTES_WORKSPACE` 影响；失败表示环境未就绪，不等同于仓库回归失败：
+
+```bash
+export INVESTMENT_MINUTES_WORKSPACE="$HOME/Documents/会议纪要整理"
 python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile asr --strict
+python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile document
 python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile export
 ```
 
-`validate_meeting_minutes_contract.py` 的规则是：必须有会议元信息和 `## 一、发言整理`；只有存在真实存疑时才输出 `## 二、存疑与待确认`；存疑表必须使用固定表头并保留空白 `人工确认` 列；传入 `--word` 时同时检查 Word 导出结构和存疑词样式。
+## MAS 操作说明
+
+MAS 手动 walkthrough 使用唯一临时目录，不作为一次性全绿 validators 清单。Collector 输出必须以顶层 `ok: true` 作为继续门禁；当 `ok: false` 时，只读取 `next_action` 做补齐或修复，不消费 combined artifacts 作为有效结果。
+
+```bash
+MAS_DISPATCH="$(mktemp -d /tmp/mas-dispatch.XXXXXX)"
+python3 skills/投资会议纪要整理/scripts/run_mas_phase_operator.py --request-json skills/投资会议纪要整理/references/regression_samples/mas_task_request_audio_plus_document.json --task-dir "$MAS_DISPATCH" --through-phase pre_draft --auto-source-manifest --json
+```
+
+首轮 operator 会生成绑定当前 `run_id`/`task_id` 的 prompt 和派发清单，并停在待收集 specialist 返回的状态。不要把仓库内固定 fixture 直接当成这次 run 的返回值；subagent 必须按本次 prompt 的 identity 返回，再用 `run_mas_phase_operator.py --task-dir "$MAS_DISPATCH" --return-json RETURN.json --through-phase pre_draft --json` 继续。
+
+- `create_mas_source_manifest.py` 生成主流程自有 `source_manifest` artifact。
+- `ingest_mas_artifact.py` 接收一个 subagent 返回 JSON，校验后写入 task-dir，并保留 invalid/duplicate 返回到 `repair_history/`。
+- `collect_mas_artifacts.py` 发布 `mas_run_summary.json`、combined artifacts、next-action plan 和 operator state。
+- `plan_mas_next_action.py` 把 collector 的 `next_action` 转成可执行清单。
+- `record_mas_main_actions.py` 绑定 draft review 后的主流程修订动作、Markdown SHA-256 和 source-artifact digest。
+- `run_mas_phase_operator.py` 串联 dispatch 初始化、返回 ingest、collector 和 next-action plan；它不启动 subagent、不写最终 Markdown。
+- `run_mas_dry_run.py` 用合成 artifact 生成阶段化 MAS 执行轨迹；真实会议内容仍只能由主流程写入最终 Markdown。
+
+## 输出边界
+
+- 正式交付为最终 Markdown 会议纪要。
+- 最终文件命名按会议类型分别使用 `YYYY-MM-DD - 会议系列.md`、`YYYY-MM-DD - 公司名 - 上市公司交流.md` 或 `YYYY-MM-DD - 主题 - 专家交流.md`。
+- 无法确定会议系列、公司名或主题时，必须请用户确认，不导出占位文件名。
+- Verification sidecar 只用于内部审计，不作为正式交付物。
+- 最终交付不生成 Word 或 PDF。
+- PDF 输入只作为附件归档；正文整理应使用音频、DOCX、TXT、Markdown 或用户另行提供的可读文本。
 
 ## 隐私边界
 
 不要提交：
 
 - 真实会议材料、原始录音、正式纪要或私有转写。
-- 私有绝对路径、review URL、draft URL、token、cookie、API key、Authorization/Bearer header。
+- 外部搜索或专业数据工具查询中，不发送原始会议长段、发言人身份、私有链接、未公开客户/订单上下文或机密 source text。
+- 私有绝对路径、临时审阅链接、草稿链接、token、浏览器会话数据、API key 或认证 header。
 - ASR 模型权重、下载缓存、虚拟环境或本机私有配置。
 
 公共 fixtures 必须是合成或充分脱敏内容。
 
-## 已知限制
+## 开发与发布约束
 
-- Custom agent live spawn 可能需要重启 Codex 才能加载新 `.codex/agents` 文件。
-- 真实生产启用前仍需要脱敏 blind-run 数据验证。
-- Word 导出依赖 `python-docx`。
+- 不直接修改 `main`；所有变更通过功能分支和 PR 合并。
+- 不推送、开 PR、合并、强推、改写历史、删除分支、reset 或 stash，除非用户明确授权。
+- 不同步、覆盖或删除 active local Codex install `~/.codex/skills`，除非用户明确授权。
+- 不引入 LangGraph、CrewAI、AutoGen 等重型 Agent 框架。
+- 改业务规则时同步更新对应 reference、回归样例或验证说明。
+- 改输出格式时运行 Markdown validator 和相关回归检查。

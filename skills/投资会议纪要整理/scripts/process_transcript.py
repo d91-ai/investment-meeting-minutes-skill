@@ -17,23 +17,44 @@ import sys
 from pathlib import Path
 
 FILLER_PATTERNS = [
-    (r"(就是说)+", ""),
-    (r"(然后就是)+", "然后"),
+    (r"(就是说){2,}", "就是说"),
+    (r"(然后就是){2,}", "然后就是"),
     (r"(那个那个)+", "那个"),
-    (r"(对对对|是是是|嗯嗯嗯)", ""),
-    (r"(嗯|啊|呃|哦|哈)[，, ]*", ""),
-    (r"^(那个|就是|然后|所以)[，, ]*", ""),
+    (r"对对对", "对"),
+    (r"是是是", "是"),
+    (r"嗯嗯嗯", "嗯"),
+    (r"(^|[\s，,。！？；;：:、])(嗯|啊|呃|哦|哈)(?=$|[\s，,。！？；;：:、])[\s，,。！？；;：:、]*", r"\1"),
+    (r"^(那个|就是)[，, ]+", ""),
     (r"我跟你说[，, ]*", ""),
     (r"你知道吗?[，, ]*", ""),
     (r"怎么说呢[，, ]*", ""),
     (r"\s{2,}", " "),
 ]
 
-SPEAKER_PATTERNS = [
-    r"^(?P<speaker>[A-Za-z]{1,3}|发言人[A-Z]|主持人|分析师|嘉宾)[：:]\s*(?P<content>.+)$",
-    r"^(?P<speaker>发言人\d+|[A-Za-z]{1,3}|主持人|分析师|嘉宾)\s+(?P<timestamp>\d{1,2}:\d{2}(?::\d{2})?)\s*(?P<content>.*)$",
-    r"^(?P<speaker>[\u4e00-\u9fff]{1,8})[：:]\s*(?P<content>.+)$",
-    r"^【(?P<speaker>[^】]{1,12})】\s*(?P<content>.+)$",
+ANONYMOUS_SPEAKER = r"(?:Speaker\s*\d+|发言人(?:[A-Za-z]+|\d+|[甲乙丙丁戊己庚辛壬癸])|[A-Za-z])"
+ROLE_SPEAKER = (
+    r"(?:主持人|分析师|研究员|基金经理|嘉宾|专家|管理层|负责人|董秘|提问者)"
+    r"(?:[A-Za-z]|\d+|[甲乙丙丁戊己庚辛壬癸])?"
+)
+
+EXPLICIT_SPEAKER_PATTERNS = [
+    (re.compile(rf"^(?P<speaker>{ANONYMOUS_SPEAKER})[：:]\s*(?P<content>.+)$", re.IGNORECASE), True),
+    (
+        re.compile(
+            rf"^(?P<speaker>{ANONYMOUS_SPEAKER})\s+(?P<timestamp>\d{{1,2}}:\d{{2}}(?::\d{{2}})?)\s*(?P<content>.*)$",
+            re.IGNORECASE,
+        ),
+        True,
+    ),
+    (re.compile(rf"^【(?P<speaker>{ANONYMOUS_SPEAKER})】\s*(?P<content>.+)$", re.IGNORECASE), True),
+    (re.compile(rf"^(?P<speaker>{ROLE_SPEAKER})[：:]\s*(?P<content>.+)$"), False),
+    (
+        re.compile(
+            rf"^(?P<speaker>{ROLE_SPEAKER})\s+(?P<timestamp>\d{{1,2}}:\d{{2}}(?::\d{{2}})?)\s*(?P<content>.*)$"
+        ),
+        False,
+    ),
+    (re.compile(rf"^【(?P<speaker>{ROLE_SPEAKER})】\s*(?P<content>.+)$"), False),
 ]
 
 SYMBOL_PATTERNS = [
@@ -58,6 +79,28 @@ COMPANY_HINTS = [
     "电子",
     "汽车",
 ]
+COMPANY_CONTEXT_PREFIXES = [
+    "继续看好",
+    "重点关注",
+    "主要关注",
+    "我看好",
+    "不看好",
+    "看好",
+    "提到",
+    "讲到",
+    "关注",
+]
+
+
+def normalize_company_candidate(candidate: str, hint: str) -> str:
+    normalized = candidate.strip()
+    for prefix in COMPANY_CONTEXT_PREFIXES:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :].strip()
+            break
+    if normalized == hint or len(normalized) <= len(hint):
+        return ""
+    return normalized
 
 
 def clean_text(text: str) -> str:
@@ -68,23 +111,42 @@ def clean_text(text: str) -> str:
     return cleaned.strip()
 
 
+def anonymous_speaker_key(label: str) -> str:
+    normalized = re.sub(r"\s+", "", label).casefold()
+    matched = re.fullmatch(r"(?:speaker|发言人)(\d+)", normalized)
+    if matched:
+        return f"number:{matched.group(1)}"
+    matched = re.fullmatch(r"(?:发言人)?([a-z甲乙丙丁戊己庚辛壬癸])", normalized)
+    if matched:
+        return f"label:{matched.group(1)}"
+    return normalized
+
+
 def detect_segments(text: str, preferred_speakers: list[str] | None) -> list[tuple[str, str]]:
     lines = [line.rstrip() for line in text.splitlines()]
     segments: list[tuple[str, str]] = []
     current_speaker = ""
     buffer: list[str] = []
-
-    preferred_pattern = None
-    if preferred_speakers:
-        joined = "|".join(re.escape(name) for name in preferred_speakers)
-        preferred_pattern = re.compile(
-            rf"^(?P<speaker>{joined})[：:]\s*(?P<content>.+)$"
+    preferred_labels = {name.strip() for name in preferred_speakers or [] if name.strip()}
+    preferred_patterns: list[re.Pattern[str]] = []
+    if preferred_labels:
+        joined = "|".join(
+            re.escape(name)
+            for name in sorted(preferred_labels, key=len, reverse=True)
         )
+        preferred_patterns = [
+            re.compile(rf"^(?P<speaker>{joined})[：:]\s*(?P<content>.+)$"),
+            re.compile(
+                rf"^(?P<speaker>{joined})\s+(?P<timestamp>\d{{1,2}}:\d{{2}}(?::\d{{2}})?)\s*(?P<content>.*)$"
+            ),
+            re.compile(rf"^【(?P<speaker>{joined})】\s*(?P<content>.+)$"),
+        ]
+    anonymous_labels: dict[str, str] = {}
 
     def flush() -> None:
         nonlocal buffer, current_speaker
         if buffer:
-            speaker = current_speaker or "发言人A"
+            speaker = current_speaker or "发言人1"
             segments.append((speaker, clean_text("\n".join(buffer))))
             buffer = []
 
@@ -96,18 +158,30 @@ def detect_segments(text: str, preferred_speakers: list[str] | None) -> list[tup
             continue
 
         matched = None
-        if preferred_pattern:
-            matched = preferred_pattern.match(stripped)
+        anonymous = False
+        for pattern, is_anonymous in EXPLICIT_SPEAKER_PATTERNS:
+            matched = pattern.match(stripped)
+            if matched:
+                anonymous = is_anonymous
+                break
 
         if not matched:
-            for pattern in SPEAKER_PATTERNS:
-                matched = re.match(pattern, stripped)
+            for pattern in preferred_patterns:
+                matched = pattern.match(stripped)
                 if matched:
                     break
 
         if matched:
             flush()
-            current_speaker = matched.group("speaker")
+            raw_speaker = matched.group("speaker").strip()
+            if anonymous:
+                key = anonymous_speaker_key(raw_speaker)
+                current_speaker = anonymous_labels.setdefault(
+                    key,
+                    f"发言人{len(anonymous_labels) + 1}",
+                )
+            else:
+                current_speaker = raw_speaker
             content = matched.groupdict().get("content", "")
             if content:
                 buffer.append(content)
@@ -115,7 +189,7 @@ def detect_segments(text: str, preferred_speakers: list[str] | None) -> list[tup
             buffer.append(stripped)
 
     flush()
-    return segments or [("发言人A", clean_text(text))]
+    return segments or [("发言人1", clean_text(text))]
 
 
 def extract_candidates(text: str) -> tuple[list[str], list[str]]:
@@ -126,7 +200,10 @@ def extract_candidates(text: str) -> tuple[list[str], list[str]]:
         symbols.update(re.findall(pattern, text))
 
     for hint in COMPANY_HINTS:
-        companies.update(re.findall(rf"[\u4e00-\u9fff]{{2,8}}{re.escape(hint)}", text))
+        for match in re.findall(rf"[\u4e00-\u9fff]{{2,8}}{re.escape(hint)}", text):
+            candidate = normalize_company_candidate(match, hint)
+            if candidate:
+                companies.add(candidate)
 
     return sorted(symbols), sorted(companies)
 
@@ -159,7 +236,7 @@ def build_output(segments: list[tuple[str, str]], source_text: str) -> str:
             "## 使用提醒",
             "",
             "- 这只是预处理结果，不是最终纪要。",
-            "- 最终输出必须按发言人、板块、标的重新拆段。",
+            "- 最终输出必须按每个人的真实发言顺序整理原文；只允许删除纯口水词、明显 ASR 噪声、无意义重复和重复起手式，不得总结、改写、改变人称或补充整理者判断。",
             "- 公司名称和股票代码必须在终稿阶段再次校验。",
         ]
     )
@@ -171,7 +248,7 @@ def main() -> int:
     parser.add_argument("input_file", nargs="?", help="输入文本路径")
     parser.add_argument("--stdin", action="store_true", help="从标准输入读取")
     parser.add_argument("--output", "-o", help="输出文件路径")
-    parser.add_argument("--speakers", help="已知发言人列表，逗号分隔")
+    parser.add_argument("--speakers", help="当前会话已确认的发言人标签，逗号分隔")
     args = parser.parse_args()
 
     if args.stdin:
@@ -181,9 +258,20 @@ def main() -> int:
         if not input_path.exists():
             print(f"输入文件不存在: {input_path}", file=sys.stderr)
             return 1
-        raw_text = input_path.read_text(encoding="utf-8")
+        try:
+            raw_text = input_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            print(f"输入文件不是有效 UTF-8: {input_path}: {exc}", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"输入文件无法读取: {input_path}: {exc}", file=sys.stderr)
+            return 1
     else:
         parser.error("请提供输入文件或使用 --stdin")
+
+    if not raw_text.strip():
+        print("输入文本为空，无法预处理会议转录。", file=sys.stderr)
+        return 1
 
     preferred_speakers = (
         [item.strip() for item in args.speakers.split(",") if item.strip()]

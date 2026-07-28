@@ -59,6 +59,10 @@ from export_to_obsidian import export_note  # noqa: E402
 import archive_raw_inputs as archive_module  # noqa: E402
 import export_to_obsidian as export_module  # noqa: E402
 from process_transcript import build_output, detect_segments  # noqa: E402
+from apply_domain_glossary import (  # noqa: E402
+    correct_text as glossary_correct_text,
+    load_glossary as load_domain_glossary,
+)
 from sensevoice_transcription_server import (  # noqa: E402
     MultipartForm,
     UploadedFormFile,
@@ -391,6 +395,50 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             "errors": errors,
             "warnings": warnings,
             "segment_count": len(segments),
+        }
+    elif case.get("check") == "glossary_correction":
+        errors = []
+        warnings = []
+        corrected_text = ""
+        glossary_corrections: list[Any] = []
+        glossary_rel = str(case.get("glossary") or "../domain_glossary.tsv")
+        glossary_path = (base_dir / glossary_rel).resolve()
+        try:
+            glossary_entries = load_domain_glossary(glossary_path)
+        except Exception as exc:  # noqa: BLE001
+            glossary_entries = []
+            errors.append(f"领域词库加载失败: {exc}")
+        source_text = file_path.read_text(encoding="utf-8")
+        if glossary_entries:
+            corrected_text, glossary_corrections = glossary_correct_text(source_text, glossary_entries)
+        for term in [str(term) for term in case.get("required_terms", [])]:
+            if term not in corrected_text:
+                errors.append(f"词库纠错后缺少锚点: {term}")
+        for term in [str(term) for term in case.get("forbidden_terms", [])]:
+            if term in corrected_text:
+                errors.append(f"词库纠错后仍包含禁止锚点: {term}")
+        action_index = {
+            (item.original, item.replacement, item.action) for item in glossary_corrections
+        }
+        for spec in [str(spec) for spec in case.get("require_actions", [])]:
+            parts = spec.split("=>")
+            if len(parts) != 3:
+                errors.append(f"require_actions 格式错误（应为 误写=>标准词=>动作）: {spec}")
+                continue
+            if (parts[0], parts[1], parts[2]) not in action_index:
+                errors.append(f"词库纠错缺少预期记录: {spec}")
+        expected_corrected_count = case.get("expected_corrected_count")
+        if expected_corrected_count is not None:
+            actual_corrected_count = sum(1 for item in glossary_corrections if item.action == "corrected")
+            if actual_corrected_count != int(expected_corrected_count):
+                errors.append(
+                    f"词库自动纠正数不符合预期: expected={expected_corrected_count} actual={actual_corrected_count}"
+                )
+        result = {
+            "ok": not errors,
+            "errors": errors,
+            "warnings": warnings,
+            "correction_count": len(glossary_corrections),
         }
     elif case.get("check") == "sensevoice_bridge_form":
         errors = []

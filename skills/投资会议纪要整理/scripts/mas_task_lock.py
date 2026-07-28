@@ -4,19 +4,20 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
 from pathlib import Path
 from typing import Iterator
+
+from portable_flock import LOCK_EX, LOCK_SH, LOCK_UN, flock
 
 
 @contextmanager
 def mas_task_lock(task_dir: Path, *, exclusive: bool) -> Iterator[None]:
     task_dir.mkdir(parents=True, exist_ok=True)
     lock_path = task_dir / ".mas-task.lock"
-    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    operation = LOCK_EX if exclusive else LOCK_SH
     with lock_path.open("a+b") as handle:
-        fcntl.flock(handle.fileno(), operation)
+        flock(handle.fileno(), operation)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            flock(handle.fileno(), LOCK_UN)

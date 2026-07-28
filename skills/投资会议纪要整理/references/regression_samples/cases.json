@@ -1533,6 +1533,55 @@
       "file": "document_inline_timestamp_negative.md",
       "expect_fail": true,
       "required_error_terms": ["不应出现存疑时间戳"]
+    },
+    {
+      "name": "领域词库术语纠错正例",
+      "mode": "glossary_correction",
+      "check": "glossary_correction",
+      "file": "glossary_correction_positive.txt",
+      "required_terms": ["缩量", "SaaS", "国产化率", "金叉", "打板", "止损", "光模块", "算力", "马斯克"],
+      "forbidden_terms": ["索量", "萨斯", "国产化律", "金差", "大板", "指损", "光模快", "算例", "MaaS克"],
+      "require_actions": [
+        "索量=>缩量=>corrected",
+        "萨斯=>SaaS=>corrected",
+        "国产化律=>国产化率=>corrected",
+        "金差=>金叉=>corrected",
+        "大板=>打板=>corrected",
+        "指损=>止损=>corrected",
+        "光模快=>光模块=>corrected",
+        "算例=>算力=>corrected"
+      ]
+    },
+    {
+      "name": "领域词库歧义术语不过度纠正反例",
+      "mode": "glossary_correction_report_only_guard",
+      "check": "glossary_correction",
+      "file": "glossary_correction_report_only_guard.txt",
+      "required_terms": ["推进", "训练", "储存", "分时", "新创", "洗版", "贝塔", "阿尔法"],
+      "forbidden_terms": ["推理产能", "训炼"],
+      "require_actions": [
+        "推进=>推理=>report_only",
+        "储存=>存储=>report_only",
+        "新创=>信创=>report_only",
+        "洗版=>洗盘=>report_only",
+        "贝塔=>beta=>report_only",
+        "阿尔法=>alpha=>report_only"
+      ],
+      "expected_corrected_count": 0
+    },
+    {
+      "name": "术语词库核验政策文档检查",
+      "mode": "reference_glossary_policy",
+      "check": "text_contains",
+      "file": "../verification_policy.md",
+      "required_terms": ["references/domain_glossary.tsv", "apply_domain_glossary.py", "[report_only]", "行业术语", "不做静默覆盖", "SENSEVOICE_DOMAIN_GLOSSARY"]
+    },
+    {
+      "name": "SKILL 入口术语词库挂接检查",
+      "mode": "reference_skill_glossary",
+      "check": "text_contains",
+      "file": "../../SKILL.md",
+      "required_terms": ["references/domain_glossary.tsv", "apply_domain_glossary.py", "report_only", "doubtful_items"]
     }
   ]
 }

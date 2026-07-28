@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import difflib
-import fcntl
 import glob
 import json
 import os
@@ -18,11 +17,15 @@ import tempfile
 import warnings
 from pathlib import Path
 
+from portable_flock import LOCK_EX, LOCK_UN, flock
+
 DEFAULT_SENSEVOICE_MODEL = "iic/SenseVoiceSmall"
 DEFAULT_PARAFORMER_MODEL = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
 DEFAULT_VAD_MODEL = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 DEFAULT_LOCAL_CACHE = Path.home() / "Documents/Codex/asr-model-cache"
 DEFAULT_AUDIO_CHUNK_SECONDS = 60
+DEFAULT_DOMAIN_GLOSSARY_PATH = Path(__file__).resolve().parent.parent / "references" / "domain_glossary.tsv"
+DOMAIN_GLOSSARY_ENV = "SENSEVOICE_DOMAIN_GLOSSARY"
 MAX_RELIABLE_VAD_SEGMENT_MS = 10000
 MODEL_ALIASES = {
     "iic/SenseVoiceSmall": ("modelscope", "models/iic/SenseVoiceSmall"),
@@ -70,13 +73,27 @@ SENSEVOICE_MANAGED_OUTPUT_SUFFIXES = (
 @contextmanager
 def _sensevoice_stem_lock(output_dir: Path, stem: str):
     """Serialize model work and output commits for the same output stem."""
-    lock_path = output_dir / f".{stem}.sensevoice.lock"
+    lock_path = output_dir / f".{_windows_safe_lock_stem(stem)}.sensevoice.lock"
     with lock_path.open("a+b") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        flock(handle.fileno(), LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            flock(handle.fileno(), LOCK_UN)
+
+
+_WINDOWS_UNSAFE_CHARS = frozenset('<>:"/\\|?*')
+
+
+def _windows_safe_lock_stem(stem: str) -> str:
+    """Map stems containing Windows-illegal filename characters to a unique safe name."""
+    if os.name != "nt" or not any(ch in _WINDOWS_UNSAFE_CHARS for ch in stem):
+        return stem
+    import hashlib
+
+    digest = hashlib.sha256(stem.encode("utf-8")).hexdigest()[:16]
+    safe = "".join("_" if ch in _WINDOWS_UNSAFE_CHARS else ch for ch in stem)
+    return f"{safe}-{digest}"
 
 
 def _path_present(path: Path) -> bool:
@@ -757,10 +774,62 @@ def _select_device(requested: str = "auto") -> str:
     return "cpu"
 
 
+def _resolve_domain_glossary_path(cli_value: str = "") -> str:
+    """解析领域词库路径：--glossary 优先，其次 SENSEVOICE_DOMAIN_GLOSSARY；默认空串表示关闭。"""
+    candidate = str(cli_value or "").strip() or str(os.environ.get(DOMAIN_GLOSSARY_ENV) or "").strip()
+    if not candidate:
+        return ""
+    path = Path(candidate).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"领域词库文件不存在: {path}")
+    return str(path.resolve())
+
+
+def _build_glossary_generate_kwargs(glossary_path: str) -> dict[str, object]:
+    """把领域词库转成 funasr 1.3.22 generate() 的 postprocess_hotwords 参数。
+
+    实证结论（funasr 1.3.22 + SenseVoiceSmall）：模型级 ``hotword`` 参数会被
+    SenseVoiceSmall 静默吞进 **kwargs，不产生任何效果；同版本 generate() 内置的
+    ``postprocess_hotwords`` 显式映射（误写=>标准词）是确定性文本级纠错，
+    不需要 pypinyin（fuzzy 关闭），且能用 return_postprocess_hotword_matches
+    记录每处替换。词库中 [report_only] 的歧义术语不进入 ASR 阶段替换，
+    仍由 scripts/apply_domain_glossary.py 在校对层只报告。
+    """
+    if not glossary_path:
+        return {}
+    try:
+        from apply_domain_glossary import build_asr_hotword_map, load_glossary
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"领域词库纠错模块不可用: {exc}") from exc
+    entries = load_glossary(Path(glossary_path))
+    mapping = build_asr_hotword_map(entries)
+    if not mapping:
+        return {}
+    return {
+        "postprocess_hotwords": mapping,
+        "postprocess_hotword_fuzzy": False,
+        "return_postprocess_hotword_matches": True,
+    }
+
+
+def _extract_hotword_matches(result: object, engine: str) -> list[dict[str, object]]:
+    """从 generate() 结果中收集 postprocess hotword 替换记录，附带引擎标签。"""
+    chunks = result if isinstance(result, list) else [result]
+    matches: list[dict[str, object]] = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        for item in chunk.get("postprocess_hotword_matches") or []:
+            if isinstance(item, dict):
+                matches.append({"engine": engine, **item})
+    return matches
+
+
 def _run_paraformer_auxiliary(
     input_file: Path,
     model_name: str,
     allow_remote_model_lookup: bool,
+    glossary_generate_kwargs: dict[str, object] | None = None,
 ) -> dict[str, object]:
     try:
         from funasr import AutoModel  # type: ignore
@@ -784,9 +853,16 @@ def _run_paraformer_auxiliary(
         chunk_temp_dir, chunks = _audio_file_chunks(input_file)
         chunk_texts: list[str] = []
         sentence_info: list[dict[str, object]] = []
+        hotword_matches: list[dict[str, object]] = []
         try:
             for chunk_index, chunk_path in enumerate(chunks):
-                result = model.generate(input=str(chunk_path), batch_size_s=60, sentence_timestamp=True)
+                result = model.generate(
+                    input=str(chunk_path),
+                    batch_size_s=60,
+                    sentence_timestamp=True,
+                    **(glossary_generate_kwargs or {}),
+                )
+                hotword_matches.extend(_extract_hotword_matches(result, "paraformer"))
                 chunk_text = _extract_model_text(result)
                 if chunk_text:
                     chunk_texts.append(chunk_text)
@@ -818,6 +894,7 @@ def _run_paraformer_auxiliary(
         "timestamp_detected": _timestamp_index_has_usable_time(timestamp_index),
         "sentence_info": sentence_info,
         "timestamp_index": timestamp_index,
+        "glossary_hotword_matches": hotword_matches,
         "status": "Paraformer 辅助转写完成；仅作为校对和时间戳证据，不自动覆盖 SenseVoice 主转写。",
     }
 
@@ -829,6 +906,7 @@ def _run_sensevoice_vad_segments(
     language: str,
     allow_remote_model_lookup: bool,
     keep_raw: bool = False,
+    glossary_generate_kwargs: dict[str, object] | None = None,
 ) -> dict[str, object]:
     from funasr import AutoModel  # type: ignore
 
@@ -851,6 +929,7 @@ def _run_sensevoice_vad_segments(
     segment_dir = Path(temp_dir.name)
     records: list[dict[str, object]] = []
     raw_results: list[dict[str, object]] = []
+    hotword_matches: list[dict[str, object]] = []
     try:
         for segment_index, (start_ms, end_ms) in enumerate(segments):
             segment_path = segment_dir / f"segment_{segment_index:05d}.wav"
@@ -861,7 +940,9 @@ def _run_sensevoice_vad_segments(
                 use_itn=True,
                 batch_size_s=60,
                 sentence_timestamp=True,
+                **(glossary_generate_kwargs or {}),
             )
+            hotword_matches.extend(_extract_hotword_matches(segment_result, "sensevoice"))
             text = _extract_model_text(segment_result)
             if keep_raw:
                 raw_results.append(
@@ -904,6 +985,7 @@ def _run_sensevoice_vad_segments(
         "raw": raw_results,
         "vad_segment_count": len(raw_segments),
         "sensevoice_segment_count": len(segments),
+        "glossary_hotword_matches": hotword_matches,
     }
     if keep_raw:
         payload["vad_result"] = vad_result
@@ -921,6 +1003,7 @@ def _run_sensevoice(
     aux_engine: str,
     aux_model: str,
     aux_strict: bool,
+    glossary_path: str = "",
 ) -> int:
     if output_format not in SENSEVOICE_TEXT_FORMATS:
         print(
@@ -943,6 +1026,7 @@ def _run_sensevoice(
             aux_engine=aux_engine,
             aux_model=aux_model,
             aux_strict=aux_strict,
+            glossary_path=glossary_path,
         )
 
 
@@ -957,6 +1041,7 @@ def _run_sensevoice_locked(
     aux_engine: str,
     aux_model: str,
     aux_strict: bool,
+    glossary_path: str = "",
 ) -> int:
 
     _ensure_ffmpeg_for_current_process()
@@ -966,6 +1051,23 @@ def _run_sensevoice_locked(
     except Exception as exc:
         print(f"缺少 SenseVoice 运行依赖: {exc}", file=sys.stderr)
         return 127
+
+    glossary_generate_kwargs: dict[str, object] = {}
+    if glossary_path:
+        try:
+            glossary_generate_kwargs = _build_glossary_generate_kwargs(glossary_path)
+        except (RuntimeError, ValueError) as exc:
+            print(f"领域词库热词配置失败: {exc}", file=sys.stderr)
+            return 1
+    glossary_hotword_count = 0
+    if glossary_generate_kwargs:
+        mapping = glossary_generate_kwargs.get("postprocess_hotwords")
+        glossary_hotword_count = len(mapping) if isinstance(mapping, dict) else 0
+        print(
+            f"领域词库热词后处理已启用: {glossary_path}（{glossary_hotword_count} 条显式误写映射；"
+            "report_only 歧义术语不在 ASR 阶段替换）",
+            file=sys.stderr,
+        )
 
     base_model_kwargs: dict[str, object] = {
         "model": _resolve_model_ref(model_name, allow_remote_model_lookup=allow_remote_model_lookup),
@@ -993,6 +1095,7 @@ def _run_sensevoice_locked(
     speaker_sentences: list[dict[str, object]] = []
     output_text = ""
     sensevoice_timestamp_index: list[dict[str, object]] = []
+    sensevoice_hotword_matches: list[dict[str, object]] = []
     timestamp_index_source = ""
     sensevoice_vad_status = ""
     try:
@@ -1003,6 +1106,7 @@ def _run_sensevoice_locked(
             language=language,
             allow_remote_model_lookup=allow_remote_model_lookup,
             keep_raw=include_raw_json,
+            glossary_generate_kwargs=glossary_generate_kwargs,
         )
         output_text = str(vad_payload.get("text") or "").strip()
         speaker_sentences = (
@@ -1013,6 +1117,11 @@ def _run_sensevoice_locked(
         )
         raw_results = vad_payload.get("raw") if isinstance(vad_payload.get("raw"), list) else []
         result.extend(raw_results)
+        sensevoice_hotword_matches = (
+            vad_payload.get("glossary_hotword_matches")
+            if isinstance(vad_payload.get("glossary_hotword_matches"), list)
+            else []
+        )
         timestamp_index_source = "sensevoice_vad_segment"
         sensevoice_vad_status = "完整音频 VAD segment + SenseVoice 分段转写完成。"
     except Exception as exc:  # noqa: BLE001
@@ -1023,8 +1132,10 @@ def _run_sensevoice_locked(
         try:
             for chunk_index, chunk_path in enumerate(chunks):
                 chunk_kwargs = dict(generate_kwargs)
+                chunk_kwargs.update(glossary_generate_kwargs)
                 chunk_kwargs["input"] = str(chunk_path)
                 chunk_result = model.generate(**chunk_kwargs)
+                sensevoice_hotword_matches.extend(_extract_hotword_matches(chunk_result, "sensevoice"))
                 if include_raw_json:
                     result.append(
                         {
@@ -1054,6 +1165,7 @@ def _run_sensevoice_locked(
             input_file=input_file,
             model_name=aux_model,
             allow_remote_model_lookup=allow_remote_model_lookup,
+            glossary_generate_kwargs=glossary_generate_kwargs,
         )
         if aux_strict and not auxiliary.get("ok"):
             print(str(auxiliary.get("status") or "Paraformer auxiliary transcription failed"), file=sys.stderr)
@@ -1118,6 +1230,19 @@ def _run_sensevoice_locked(
             if auxiliary.get("ok")
             else "",
         }
+        if glossary_generate_kwargs:
+            paraformer_hotword_matches = (
+                auxiliary.get("glossary_hotword_matches")
+                if isinstance(auxiliary.get("glossary_hotword_matches"), list)
+                else []
+            )
+            glossary_hotword_matches = [*sensevoice_hotword_matches, *paraformer_hotword_matches]
+            payload["domain_glossary"] = {
+                "glossary_path": glossary_path,
+                "explicit_mapping_count": glossary_hotword_count,
+                "mechanism": "funasr postprocess_hotwords（显式误写映射；模型级 hotword 对 SenseVoiceSmall 无效）",
+                "matches": glossary_hotword_matches,
+            }
         if include_raw_json:
             payload["raw"] = result
         rendered_outputs[".json"] = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
@@ -1128,6 +1253,17 @@ def _run_sensevoice_locked(
         print(f"SenseVoice 输出提交失败，已保留上一轮完整结果: {exc}", file=sys.stderr)
         return 1
 
+    if glossary_generate_kwargs:
+        aux_hotword_matches = (
+            auxiliary.get("glossary_hotword_matches")
+            if isinstance(auxiliary.get("glossary_hotword_matches"), list)
+            else []
+        )
+        print(
+            f"领域词库热词后处理: SenseVoice 替换 {len(sensevoice_hotword_matches)} 处，"
+            f"Paraformer 替换 {len(aux_hotword_matches)} 处（详见 JSON domain_glossary.matches）",
+            file=sys.stderr,
+        )
     print(f"SenseVoice 转录完成: {output_dir / f'{stem}.txt'}")
     return 0
 
@@ -1203,6 +1339,12 @@ def main() -> int:
         action="store_true",
         help="调试时在 JSON 中额外保留模型原始返回；默认关闭以减少写盘体积",
     )
+    parser.add_argument(
+        "--glossary",
+        default="",
+        help=f"领域词库 TSV 路径；也可用 {DOMAIN_GLOSSARY_ENV} 环境变量设置。"
+        "启用后把词库误写映射作为 funasr postprocess_hotwords 传给 ASR；默认关闭，行为与之前完全一致",
+    )
     args = parser.parse_args()
 
     _configure_model_cache(args.cache_dir)
@@ -1236,6 +1378,12 @@ def main() -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        glossary_path = _resolve_domain_glossary_path(args.glossary)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     if args.engine in {"auto", "sensevoice"}:
         return _run_sensevoice(
             input_file=input_file,
@@ -1248,6 +1396,7 @@ def main() -> int:
             aux_engine="none" if args.no_aux else args.aux_engine,
             aux_model=args.aux_model,
             aux_strict=args.aux_strict,
+            glossary_path=glossary_path,
         )
 
     print("未知 ASR 引擎；只能使用 SenseVoice。", file=sys.stderr)

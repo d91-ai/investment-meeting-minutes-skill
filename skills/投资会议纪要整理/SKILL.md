@@ -90,6 +90,8 @@ When audio is long, noise is heavy, multiple-speaker boundaries are unclear, aud
 
 Before final writing, run a source-restoration pass on the working transcript: compare each cleaned turn with its source span, restore omitted substantive clauses, and keep examples, reasons, hedge words, conditions, numbers, time points, actions, and speaker uncertainty unless they are clearly filler or ASR noise. If an intermediate draft is shorter or more polished than the source span, treat it as a checklist for omissions only and rewrite the paragraph from the source span.
 
+Normalize investment/trading/tech term spelling against `references/domain_glossary.tsv`: run deterministic correction with `python3 scripts/apply_domain_glossary.py TRANSCRIPT.txt --check` (`--apply` writes `<stem>.glossary_corrected.txt`; every correction is recorded, never silent). Terms marked `[report_only]` in the glossary (ambiguous everyday words such as 训练, 存储, 推进, 信创) are only reported, not rewritten; route them through the existing doubtful flow into `doubtful_items`. Glossary correction normalizes term spelling only; it must not change viewpoints, directions, or target attribution.
+
 ### 3. Correct names and symbols
 
 Use references only when they match the uncertainty:
@@ -161,8 +163,9 @@ PDF input is not a baseline parsing capability. Archive PDF files only as attach
 
 Core scripts:
 - `archive_raw_inputs.py`: copy current raw files into the workflow archive.
-- `transcribe_audio.py`: local SenseVoiceSmall transcription plus Paraformer auxiliary proofreading and available timestamp-index preparation; no Whisper fallback.
+- `transcribe_audio.py`: local SenseVoiceSmall transcription plus Paraformer auxiliary proofreading and available timestamp-index preparation; no Whisper fallback. Optional domain-glossary term postprocess via `--glossary` / `SENSEVOICE_DOMAIN_GLOSSARY` (off by default; uses funasr `postprocess_hotwords` explicit mappings and records matches).
 - `process_transcript.py`: transcript cleanup aid.
+- `apply_domain_glossary.py`: deterministic domain-term correction from `references/domain_glossary.tsv`; records every correction and leaves `[report_only]` ambiguous terms untouched.
 - `query_symbol_candidates.py`: local symbol candidate lookup.
 - `export_to_obsidian.py`: final Markdown export.
 - `build_mas_task_bundle.py`: generate process-only MAS specialist task bundles and optional Codex-ready subagent prompt files before dispatch.

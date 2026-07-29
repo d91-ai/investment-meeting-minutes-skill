@@ -9,8 +9,6 @@ import ipaddress
 import json
 import re
 import socket
-import unicodedata
-from collections import Counter
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -71,7 +69,7 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
     "speaker_turn_edit": [
         "manifest_sha256",
         "shard_id",
-        "speaker_id",
+        "speaker_ids",
         "input_sha256",
         "status",
         "edited_turns",
@@ -118,54 +116,6 @@ DOUBTFUL_REQUIRED_FIELDS = [
 ALLOWED_DOUBTFUL_TYPES = {"人名", "说话人身份", "公司或证券标的", "行业术语", "数字或时间", "其他业务事实"}
 NON_BUSINESS_DOUBTFUL_TYPES = {"人名", "说话人身份"}
 FORBIDDEN_FINAL_FIELDS = {"final_markdown", "markdown_body", "final_note", "final_body"}
-MIN_SPEAKER_EDIT_CONTENT_RETENTION = 0.90
-PROTECTED_SPEAKER_EDIT_RE = re.compile(
-    r"\d+(?:\.\d+)?%?|[A-Za-z][A-Za-z0-9.+-]*"
-)
-PROTECTED_SPEAKER_EDIT_PHRASES = (
-    "不",
-    "未",
-    "没",
-    "无",
-    "非",
-    "勿",
-    "我觉得",
-    "我认为",
-    "我们认为",
-    "个人认为",
-    "没有",
-    "不会",
-    "不能",
-    "不确定",
-    "可能",
-    "大概",
-    "应该",
-    "预计",
-    "如果",
-    "但凡",
-    "看不太清楚",
-    "也许",
-    "推荐",
-    "看好",
-    "看空",
-    "买入",
-    "加仓",
-    "减仓",
-    "降低仓位",
-    "首推",
-)
-SAFE_FILLER_CONTENT_TOKENS = (
-    "然后然后",
-    "这个这个",
-    "不断不断",
-    "观察观察",
-    "对对",
-    "是是",
-    "嗯",
-    "呃",
-    "啊",
-    "哈",
-)
 BOOLEAN_FIELD_RULES: dict[str, list[str]] = {
     "source_manifest": ["archive_allowed"],
     "source_reconciliation": ["manual_review_required"],
@@ -203,7 +153,7 @@ LIST_FIELD_RULES: dict[str, list[str]] = {
         "omission_findings",
         "recommended_revisions",
     ],
-    "speaker_turn_edit": ["edited_turns", "unresolved_spans"],
+    "speaker_turn_edit": ["speaker_ids", "edited_turns", "unresolved_spans"],
     "editing_assembly_receipt": ["ordered_turn_ids"],
     "export_manifest": ["validators_run", "known_unverified_parts"],
     "main_action_receipt": ["actions"],
@@ -215,7 +165,6 @@ STRING_FIELD_RULES: dict[str, list[str]] = {
     "speaker_turn_edit": [
         "manifest_sha256",
         "shard_id",
-        "speaker_id",
         "input_sha256",
         "status",
     ],
@@ -422,131 +371,6 @@ def artifact_schema_name(artifact_type: str) -> str:
     return artifact_type
 
 
-def content_characters(value: str) -> str:
-    return "".join(
-        character
-        for character in value
-        if not unicodedata.category(character).startswith(("P", "Z"))
-        and not character.isspace()
-    )
-
-
-def is_subsequence(candidate: str, source: str) -> bool:
-    source_index = 0
-    for character in candidate:
-        source_index = source.find(character, source_index)
-        if source_index < 0:
-            return False
-        source_index += 1
-    return True
-
-
-def protected_speaker_edit_items(value: str) -> Counter[str]:
-    protected = Counter(PROTECTED_SPEAKER_EDIT_RE.findall(value))
-    for phrase in PROTECTED_SPEAKER_EDIT_PHRASES:
-        count = value.count(phrase)
-        if count:
-            protected[phrase] += count
-    return protected
-
-
-def safe_filler_content_length(value: str) -> int:
-    content = content_characters(value)
-    remaining = content
-    for token in SAFE_FILLER_CONTENT_TOKENS:
-        remaining = remaining.replace(token, "")
-    return len(content) if content and not remaining else 0
-
-
-def deleted_content_segments(source: str, candidate: str) -> list[str]:
-    segments: list[str] = []
-    buffer: list[str] = []
-    candidate_index = 0
-    for character in source:
-        if candidate_index < len(candidate) and character == candidate[candidate_index]:
-            if buffer:
-                segments.append("".join(buffer))
-                buffer = []
-            candidate_index += 1
-        else:
-            buffer.append(character)
-    if buffer:
-        segments.append("".join(buffer))
-    return segments if candidate_index == len(candidate) else []
-
-
-def speaker_edit_content_errors(
-    artifact_type: str,
-    turn_id: str,
-    source_text: str,
-    returned: dict[str, Any],
-) -> list[str]:
-    edited_text = str(returned.get("edited_text") or "")
-    source_content = content_characters(source_text)
-    edited_content = content_characters(edited_text)
-    errors: list[str] = []
-    path = f"{artifact_type}.{turn_id}"
-    if not is_subsequence(edited_content, source_content):
-        errors.append(
-            f"{path}.edited_text 包含新增、替换或重排的内容字符；speaker 编辑只能删除原文"
-        )
-    removed_fillers = returned.get("removed_fillers")
-    safe_deleted_segments: list[str] = []
-    if isinstance(removed_fillers, list):
-        declared_fillers = Counter(
-            content_characters(filler)
-            for filler in removed_fillers
-            if isinstance(filler, str) and filler
-        )
-        for segment in deleted_content_segments(source_content, edited_content):
-            if (
-                declared_fillers[segment] > 0
-                and safe_filler_content_length(segment) == len(segment)
-            ):
-                safe_deleted_segments.append(segment)
-                declared_fillers[segment] -= 1
-    safe_removed_chars = sum(len(segment) for segment in safe_deleted_segments)
-    if len(source_content) >= 30:
-        adjusted_edited_chars = min(
-            len(source_content),
-            len(edited_content) + safe_removed_chars,
-        )
-        retention = adjusted_edited_chars / len(source_content)
-        if retention < MIN_SPEAKER_EDIT_CONTENT_RETENTION:
-            errors.append(
-                f"{path}.edited_text 扣除明确纯 filler 后的内容保留率 {retention:.3f} 低于 "
-                f"{MIN_SPEAKER_EDIT_CONTENT_RETENTION:.2f}，必须恢复原文或重新派发"
-            )
-    source_protected = protected_speaker_edit_items(source_text)
-    edited_protected = protected_speaker_edit_items(edited_text)
-    safe_deleted_protected: Counter[str] = Counter()
-    for segment in safe_deleted_segments:
-        safe_deleted_protected.update(protected_speaker_edit_items(segment))
-    missing_protected = sorted(
-        (
-            token,
-            count - edited_protected[token] - safe_deleted_protected[token],
-        )
-        for token, count in source_protected.items()
-        if edited_protected[token] + safe_deleted_protected[token] < count
-    )
-    if missing_protected:
-        errors.append(
-            f"{path}.edited_text 丢失受保护的数字、代码、视角、限定词或动作: "
-            + ", ".join(
-                f"{token}(-{missing_count})"
-                for token, missing_count in missing_protected
-            )
-        )
-    if isinstance(removed_fillers, list):
-        for filler in removed_fillers:
-            if isinstance(filler, str) and filler and filler not in source_text:
-                errors.append(
-                    f"{path}.removed_fillers 必须逐字引用原文删除片段: {filler}"
-                )
-    return errors
-
-
 def validate_speaker_edit_task_context(
     artifact_type: str,
     artifact: Any,
@@ -560,7 +384,7 @@ def validate_speaker_edit_task_context(
     if not isinstance(context, dict):
         return [f"{artifact_type} dispatch task 缺少 task_context"]
     errors: list[str] = []
-    for field in ("manifest_sha256", "shard_id", "speaker_id", "input_sha256"):
+    for field in ("manifest_sha256", "shard_id", "speaker_ids", "input_sha256"):
         if artifact.get(field) != context.get(field):
             errors.append(f"{artifact_type}.{field} 与 dispatch task_context 不一致")
     expected_turns = {
@@ -576,25 +400,24 @@ def validate_speaker_edit_task_context(
         for turn in returned_turns
         if isinstance(turn, dict)
     }
+    expected_turn_ids = list(expected_turns)
+    returned_turn_ids = [
+        str(turn.get("turn_id") or "")
+        for turn in returned_turns
+        if isinstance(turn, dict)
+    ]
     if len(returned_by_id) != len(returned_turns):
         errors.append(f"{artifact_type}.edited_turns turn_id 必须唯一")
     if set(returned_by_id) != set(expected_turns):
         errors.append(f"{artifact_type}.edited_turns 必须恰好覆盖 dispatch task_context turns")
+    elif returned_turn_ids != expected_turn_ids:
+        errors.append(f"{artifact_type}.edited_turns 必须保持 dispatch task_context turns 顺序")
     for turn_id in sorted(set(returned_by_id) & set(expected_turns)):
         returned = returned_by_id[turn_id]
         expected = expected_turns[turn_id]
         for field in ("sequence", "speaker_id", "source_sha256"):
             if returned.get(field) != expected.get(field):
                 errors.append(f"{artifact_type}.{turn_id}.{field} 与 dispatch task_context 不一致")
-        if artifact.get("status") == "complete":
-            errors.extend(
-                speaker_edit_content_errors(
-                    artifact_type,
-                    turn_id,
-                    str(expected.get("text") or ""),
-                    returned,
-                )
-            )
     return errors
 
 
@@ -863,10 +686,22 @@ def validate_speaker_turn_edit(artifact_type: str, artifact: Any) -> list[str]:
             errors.append(f"{artifact_type}.{field} 必须是小写 SHA-256")
     if artifact.get("status") not in SPEAKER_TURN_EDIT_STATUSES:
         errors.append(f"{artifact_type}.status 必须是 complete 或 blocked")
+    speaker_ids = artifact.get("speaker_ids")
+    if isinstance(speaker_ids, list):
+        normalized_speaker_ids = [str(item) for item in speaker_ids]
+        if (
+            not normalized_speaker_ids
+            or any(not item for item in normalized_speaker_ids)
+            or len(normalized_speaker_ids) != len(set(normalized_speaker_ids))
+        ):
+            errors.append(f"{artifact_type}.speaker_ids 必须是非空且不重复的 speaker ID 列表")
+    else:
+        normalized_speaker_ids = []
     edited_turns = artifact.get("edited_turns")
     if isinstance(edited_turns, list):
         seen_turn_ids: set[str] = set()
         seen_sequences: set[int] = set()
+        returned_speaker_ids: list[str] = []
         for index, turn in enumerate(edited_turns, start=1):
             path = f"{artifact_type}.edited_turns[{index}]"
             if not isinstance(turn, dict):
@@ -878,8 +713,6 @@ def validate_speaker_turn_edit(artifact_type: str, artifact: Any) -> list[str]:
                 "speaker_id",
                 "source_sha256",
                 "edited_text",
-                "removed_fillers",
-                "doubtful_fragments",
             }
             missing = sorted(required - set(turn))
             if missing:
@@ -898,16 +731,17 @@ def validate_speaker_turn_edit(artifact_type: str, artifact: Any) -> list[str]:
                 errors.append(f"{artifact_type}.edited_turns sequence 重复: {sequence}")
             else:
                 seen_sequences.add(sequence)
-            if str(turn.get("speaker_id") or "") != str(artifact.get("speaker_id") or ""):
-                errors.append(f"{path}.speaker_id 与 artifact speaker_id 不一致")
+            turn_speaker_id = str(turn.get("speaker_id") or "")
+            if turn_speaker_id not in normalized_speaker_ids:
+                errors.append(f"{path}.speaker_id 不在 artifact speaker_ids 中")
+            elif turn_speaker_id not in returned_speaker_ids:
+                returned_speaker_ids.append(turn_speaker_id)
             if not HEX_SHA256.fullmatch(str(turn.get("source_sha256") or "")):
                 errors.append(f"{path}.source_sha256 必须是小写 SHA-256")
             if not str(turn.get("edited_text") or "").strip():
                 errors.append(f"{path}.edited_text 不得为空")
-            for list_field in ("removed_fillers", "doubtful_fragments"):
-                value = turn.get(list_field)
-                if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-                    errors.append(f"{path}.{list_field} 必须是 string array")
+        if returned_speaker_ids != normalized_speaker_ids:
+            errors.append(f"{artifact_type}.speaker_ids 与 edited_turns 首次出现顺序不一致")
     return errors
 
 

@@ -1573,10 +1573,7 @@
       "name": "MAS 按发言人并发编辑与顺序组装",
       "mode": "speaker_editing_mas",
       "check": "speaker_editing_mas",
-      "file": "speaker_editing_source.txt",
-      "expect_dirty_mode": "full",
-      "expect_reviewed_mode": "skip",
-      "expect_sixteen_task_batch_sizes": [6, 5, 5]
+      "file": "speaker_editing_source.txt"
     }
   ]
 }

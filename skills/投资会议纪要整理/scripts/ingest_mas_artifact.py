@@ -311,6 +311,84 @@ def load_json_input(input_path: Path | None) -> tuple[Any | None, str, str, list
         return None, source, raw_text, [f"无法解析 subagent artifact JSON: {exc}"]
 
 
+def expand_speaker_edit_response(
+    response: Any,
+    task_dir: Path,
+    task_id: str,
+) -> dict[str, Any]:
+    """Bind a minimal editor response to trusted dispatch metadata."""
+    bundle = read_json(task_dir.expanduser() / "mas_task_bundle.json")
+    if not isinstance(bundle, dict):
+        raise ValueError("MAS task bundle 必须是 JSON object")
+    matches = [
+        task
+        for task in bundle.get("tasks", [])
+        if isinstance(task, dict) and str(task.get("task_id") or "") == task_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"speaker task_id 未唯一匹配当前 dispatch task: {task_id}")
+    task = matches[0]
+    if task.get("artifact_schema") != "speaker_turn_edit":
+        raise ValueError(f"task_id 不是 Speaker Turn Editor task: {task_id}")
+    context = task.get("task_context")
+    if not isinstance(context, dict):
+        raise ValueError("Speaker Turn Editor task 缺少 task_context")
+    if not isinstance(response, list):
+        raise ValueError('Speaker Turn Editor 返回必须是 [{"turn_id":"...","edited_text":"..."}] JSON array')
+
+    expected_turns = [
+        turn
+        for turn in context.get("turns", [])
+        if isinstance(turn, dict)
+    ]
+    if len(response) != len(expected_turns):
+        raise ValueError("Speaker Turn Editor 返回数量必须与 assigned turns 完全一致")
+
+    edited_turns: list[dict[str, Any]] = []
+    for index, (returned, expected) in enumerate(zip(response, expected_turns), start=1):
+        if not isinstance(returned, dict):
+            raise ValueError(f"Speaker Turn Editor 第 {index} 项必须是 JSON object")
+        if set(returned) != {"turn_id", "edited_text"}:
+            raise ValueError(
+                f"Speaker Turn Editor 第 {index} 项只能包含 turn_id 和 edited_text"
+            )
+        expected_turn_id = str(expected.get("turn_id") or "")
+        if returned.get("turn_id") != expected_turn_id:
+            raise ValueError(
+                "Speaker Turn Editor 必须按 assigned turns 原顺序返回: "
+                f"expected={expected_turn_id} actual={returned.get('turn_id')}"
+            )
+        edited_text = returned.get("edited_text")
+        if not isinstance(edited_text, str) or not edited_text.strip():
+            raise ValueError(f"Speaker Turn Editor {expected_turn_id}.edited_text 不得为空")
+        edited_turns.append(
+            {
+                "turn_id": expected_turn_id,
+                "sequence": expected.get("sequence"),
+                "speaker_id": str(expected.get("speaker_id") or ""),
+                "source_sha256": str(expected.get("source_sha256") or ""),
+                "edited_text": edited_text,
+            }
+        )
+
+    return {
+        "run_id": str(bundle.get("run_id") or ""),
+        "task_id": task_id,
+        "dispatch_phase": str(task.get("dispatch_phase") or ""),
+        "artifact_owner": str(task.get("artifact_owner") or task.get("role") or ""),
+        "artifact_type": str(task.get("artifact_type") or ""),
+        "artifact": {
+            "manifest_sha256": str(context.get("manifest_sha256") or ""),
+            "shard_id": str(context.get("shard_id") or ""),
+            "speaker_ids": [str(item) for item in context.get("speaker_ids", [])],
+            "input_sha256": str(context.get("input_sha256") or ""),
+            "status": "complete",
+            "edited_turns": edited_turns,
+            "unresolved_spans": [],
+        },
+    }
+
+
 def collector_command(task_dir: Path, through_phase: str | None = None) -> str:
     script_path = Path(__file__).with_name("collect_mas_artifacts.py")
     command = f"python3 {shlex.quote(str(script_path))} {shlex.quote(str(task_dir))} --json"
@@ -600,6 +678,7 @@ def ingest_mas_artifact_file(
     task_dir: Path,
     through_phase: str | None = None,
     replace_existing: bool = False,
+    speaker_task_id: str | None = None,
 ) -> dict[str, Any]:
     payload, input_source, raw_text, parse_errors = load_json_input(input_path)
     if parse_errors:
@@ -630,6 +709,38 @@ def ingest_mas_artifact_file(
             "errors": parse_errors,
             "warnings": [],
         }
+    if speaker_task_id:
+        try:
+            payload = expand_speaker_edit_response(payload, task_dir, speaker_task_id)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            errors = [f"无法绑定 Speaker Turn Editor 返回: {exc}"]
+            task_dir = task_dir.expanduser()
+            repair_dir = task_dir / "repair_history"
+            repair_path = write_repair_record(
+                repair_dir,
+                "invalid_speaker_response",
+                input_source,
+                payload,
+                errors,
+                [],
+                [],
+            )
+            return {
+                "schema_version": "1.0",
+                "ok": False,
+                "ingest_status": "invalid_speaker_response_not_written",
+                "input_source": input_source,
+                "task_dir": str(task_dir),
+                "artifact_dir": str(task_dir / "artifacts"),
+                "repair_history_dir": str(repair_dir),
+                "artifact_types": [],
+                "written_artifacts": [],
+                "repair_history_file": str(repair_path),
+                "validation": {"ok": False, "errors": errors, "warnings": []},
+                "next_collector_command": collector_command(task_dir, through_phase=through_phase),
+                "errors": errors,
+                "warnings": [],
+            }
     return ingest_mas_artifact(
         payload,
         task_dir,
@@ -645,6 +756,10 @@ def main() -> int:
     parser.add_argument("--task-dir", required=True, help="包含 MAS dispatch files 的任务目录")
     parser.add_argument("--through-phase", choices=sorted(PHASE_ORDER), help="建议下一次 collector 校验到的 phase")
     parser.add_argument("--replace-existing", action="store_true", help="显式替换同 run/task 的已有 artifact，并先归档旧值")
+    parser.add_argument(
+        "--speaker-task-id",
+        help="将极简 Speaker Turn Editor JSON array 绑定到此 dispatch task 后再 ingest",
+    )
     parser.add_argument("--json", action="store_true", help="输出 JSON；默认也是 JSON")
     args = parser.parse_args()
 
@@ -654,6 +769,7 @@ def main() -> int:
         Path(args.task_dir),
         through_phase=args.through_phase,
         replace_existing=bool(args.replace_existing),
+        speaker_task_id=args.speaker_task_id,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["ok"] else 1

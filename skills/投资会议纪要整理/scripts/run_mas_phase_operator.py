@@ -15,6 +15,8 @@ from ingest_mas_artifact import ingest_mas_artifact_file
 from mas_task_lock import mas_task_lock
 from plan_mas_next_action import plan_from_summary
 
+DEFAULT_MAX_PARALLEL = 3
+
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,7 +169,7 @@ def run_mas_phase_operator(
     overwrite_dispatch: bool = False,
     auto_source_manifest: bool = False,
     replace_existing: bool = False,
-    max_parallel: int = 4,
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
 ) -> dict[str, Any]:
     task_dir = task_dir.expanduser()
     return_paths = return_paths or []
@@ -292,7 +294,12 @@ def main() -> int:
     parser.add_argument("--overwrite-dispatch", action="store_true", help="Allow replacing an existing dispatch bundle")
     parser.add_argument("--replace-existing", action="store_true", help="Archive and replace same-task returned artifacts")
     parser.add_argument("--auto-source-manifest", action="store_true", help="Create source_manifest if missing")
-    parser.add_argument("--max-parallel", type=int, default=4, help="speaker editing 并发 agent 槽位（1-8，默认 4）")
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=DEFAULT_MAX_PARALLEL,
+        help=f"speaker editing 并发 agent 槽位（1-8，默认 {DEFAULT_MAX_PARALLEL}）",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON; default is also JSON")
     args = parser.parse_args()
 

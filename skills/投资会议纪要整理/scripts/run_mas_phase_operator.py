@@ -127,6 +127,8 @@ def operator_status(plan: dict[str, Any], ingest_results: list[dict[str, Any]]) 
         if has_dispatch:
             return "dispatch_subagent_tasks"
         return "collect_phase_artifacts"
+    if plan_status == "assemble_speaker_turns":
+        return "assemble_speaker_turns"
     if plan_status == "ask_user":
         return "ask_user"
     if plan_status == "apply_main_actions":
@@ -145,6 +147,7 @@ def stop_reason_for(status: str) -> str:
         "create_main_owned_artifacts": "waiting_for_main_owned_artifacts",
         "dispatch_subagent_tasks": "waiting_for_subagent_returns",
         "collect_phase_artifacts": "waiting_for_phase_artifact_collection",
+        "assemble_speaker_turns": "main_workflow_must_assemble_speaker_turns",
         "ask_user": "user_confirmation_required",
         "apply_main_actions": "main_workflow_must_apply_actions",
         "continue_main_workflow": "continue_without_user_intervention",
@@ -164,6 +167,7 @@ def run_mas_phase_operator(
     overwrite_dispatch: bool = False,
     auto_source_manifest: bool = False,
     replace_existing: bool = False,
+    max_parallel: int = 4,
 ) -> dict[str, Any]:
     task_dir = task_dir.expanduser()
     return_paths = return_paths or []
@@ -221,7 +225,7 @@ def run_mas_phase_operator(
             )
             write_json(summary_path, summary)
             write_json(combined_path, combined_payload)
-            plan = plan_from_summary(summary)
+            plan = plan_from_summary(summary, max_parallel=max_parallel)
             write_json(plan_path, plan)
             warnings.extend(combined_errors)
 
@@ -259,6 +263,9 @@ def run_mas_phase_operator(
             "next_action_type": plan.get("next_action_type") if plan else "",
             "phase": plan.get("phase") if plan else "",
             "dispatch_tasks": plan.get("dispatch_tasks", []) if plan else [],
+            "dispatch_batches": plan.get("dispatch_batches", []) if plan else [],
+            "dispatch_waves": plan.get("dispatch_waves", []) if plan else [],
+            "max_parallel": max_parallel,
             "main_owned_missing_artifacts": plan.get("main_owned_missing_artifacts", []) if plan else [],
             "repair_errors": plan.get("repair_errors", []) if plan else [],
             "main_actions": plan.get("main_actions", []) if plan else [],
@@ -285,6 +292,7 @@ def main() -> int:
     parser.add_argument("--overwrite-dispatch", action="store_true", help="Allow replacing an existing dispatch bundle")
     parser.add_argument("--replace-existing", action="store_true", help="Archive and replace same-task returned artifacts")
     parser.add_argument("--auto-source-manifest", action="store_true", help="Create source_manifest if missing")
+    parser.add_argument("--max-parallel", type=int, default=4, help="speaker editing 并发 agent 槽位（1-8，默认 4）")
     parser.add_argument("--json", action="store_true", help="Print JSON; default is also JSON")
     args = parser.parse_args()
 
@@ -301,6 +309,7 @@ def main() -> int:
             overwrite_dispatch=bool(args.overwrite_dispatch),
             auto_source_manifest=bool(args.auto_source_manifest),
             replace_existing=bool(args.replace_existing),
+            max_parallel=args.max_parallel,
         )
     except Exception as exc:
         result = {

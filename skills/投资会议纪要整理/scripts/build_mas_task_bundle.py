@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -16,15 +17,34 @@ from validate_mas_artifacts import (
     BOOLEAN_FIELD_RULES,
     DOUBTFUL_REQUIRED_FIELDS,
     FORBIDDEN_FINAL_FIELDS,
+    HEX_SHA256,
     LIST_FIELD_RULES,
     REQUIRED_FIELDS,
+    SAFE_DYNAMIC_ARTIFACT,
+    SPEAKER_TURN_EDIT_PREFIX,
     STRING_FIELD_RULES,
+    artifact_schema_name,
+    canonical_json_digest,
 )
 
 RUN_PROFILES = {"fast_document", "standard", "strict_audio"}
 SOURCE_MODES = {"document_only", "audio_only", "audio_plus_document"}
 MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
 SOURCE_SELECTION_STATUSES = {"not_applicable", "not_compared", "compared_clear", "conflict", "uncertain"}
+SPEAKER_EDITING_MODES = {"auto", "skip", "full"}
+REVIEWED_SOURCE_MARKERS = ("已核对", "人工校对", "已校对", "reviewed")
+HIGH_CONFIDENCE_FILLER_MARKERS = (
+    "嗯",
+    "呃",
+    "额",
+    "然后然后",
+    "这个这个",
+    "对对",
+    "是是",
+    "不断不断",
+    "观察观察",
+)
+AUTO_SKIP_FILLERS_PER_1000 = 1.0
 PRIMARY_SOURCE_ALIASES_BY_MODE = {
     "audio_only": {"aligned_transcript", "audio_transcript", "transcript"},
     "document_only": {"document", "provided_document", "provided_transcript", "transcript"},
@@ -77,12 +97,18 @@ FIDELITY_RISKS = {
     "third_person_rewrite",
     "prior_user_feedback",
 }
+EDITING_RISKS = {
+    "speaker_turn_editing",
+    "long_transcript",
+    "filler_cleanup",
+}
 KNOWN_RISK_FLAGS = (
     AUDIO_RISKS
     | SOURCE_RECONCILIATION_RISKS
     | ENTITY_RISKS
     | TARGET_RISKS
     | FIDELITY_RISKS
+    | EDITING_RISKS
 )
 
 ROLE_SPECS: dict[str, dict[str, Any]] = {
@@ -180,6 +206,25 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
             "speaker-order drift",
         ],
     },
+    "speaker_turn_edit": {
+        "role": "Speaker Turn Editor",
+        "dispatch_phase": "editing",
+        "objective": "Clean only the assigned speaker turns while preserving source order, viewpoint, uncertainty, conditions, numbers, and reasoning.",
+        "inputs": [
+            "speaker_turn_manifest",
+            "assigned speaker shard",
+            "current-session entity and doubtful-item context when available",
+        ],
+        "checks": [
+            "pure filler words",
+            "meaningless repetitions",
+            "repeated false starts",
+            "obvious ASR noise",
+            "first-person perspective",
+            "negation and uncertainty",
+            "numbers, dates, conditions, and reasoning chain",
+        ],
+    },
     "export_manifest": {
         "role": "Contract Verifier",
         "dispatch_phase": "final_verification",
@@ -206,6 +251,10 @@ DISPATCH_PHASES: dict[str, dict[str, str]] = {
     "pre_draft": {
         "when": "After current-session source materials are prepared and before final-note drafting.",
         "materials": "Audio/transcript/document excerpts, timestamp indexes, entity candidates, and source-quality notes relevant to the assigned role.",
+    },
+    "editing": {
+        "when": "After pre-draft source decisions and before the main workflow assembles the draft body.",
+        "materials": "Only the assigned speaker-turn shard from the current speaker_turn_manifest plus narrowly relevant current-session context.",
     },
     "draft_review": {
         "when": "After the main workflow has a draft and before final validation.",
@@ -242,6 +291,171 @@ def normalized_flags(flags: Any) -> list[str]:
     if unknown:
         raise ValueError("未知 risk_flags: " + ", ".join(unknown))
     return normalized
+
+
+def normalized_speaker_turn_manifest(value: Any) -> dict[str, Any] | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("speaker_turn_manifest 必须是 JSON object")
+    manifest = copy.deepcopy(value)
+    if manifest.get("schema_version") != "1.0":
+        raise ValueError("speaker_turn_manifest schema_version 必须是 1.0")
+    turns = manifest.get("turns")
+    shards = manifest.get("shards")
+    if not isinstance(turns, list) or not turns:
+        raise ValueError("speaker_turn_manifest.turns 必须是非空 JSON array")
+    if not isinstance(shards, list) or not shards:
+        raise ValueError("speaker_turn_manifest.shards 必须是非空 JSON array")
+    turn_by_id: dict[str, dict[str, Any]] = {}
+    sequences: set[int] = set()
+    for index, turn in enumerate(turns, start=1):
+        if not isinstance(turn, dict):
+            raise ValueError(f"speaker_turn_manifest.turns[{index}] 必须是 JSON object")
+        turn_id = str(turn.get("turn_id") or "")
+        speaker_id = str(turn.get("speaker_id") or "")
+        sequence = turn.get("sequence")
+        if not turn_id or turn_id in turn_by_id:
+            raise ValueError("speaker_turn_manifest turn_id 必须唯一且非空")
+        if not speaker_id:
+            raise ValueError(f"speaker_turn_manifest {turn_id} speaker_id 不得为空")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0 or sequence in sequences:
+            raise ValueError("speaker_turn_manifest sequence 必须是唯一正整数")
+        source_sha256 = str(turn.get("source_sha256") or "")
+        text = str(turn.get("text") or "")
+        if not HEX_SHA256.fullmatch(source_sha256):
+            raise ValueError(f"speaker_turn_manifest {turn_id} source_sha256 必须是小写 SHA-256")
+        if not text.strip():
+            raise ValueError(f"speaker_turn_manifest {turn_id} text 不得为空")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != source_sha256:
+            raise ValueError(f"speaker_turn_manifest {turn_id} source_sha256 与 text 不一致")
+        turn_by_id[turn_id] = turn
+        sequences.add(sequence)
+    if sequences != set(range(1, len(turns) + 1)):
+        raise ValueError("speaker_turn_manifest sequence 必须从 1 连续递增")
+
+    assigned_turns: list[str] = []
+    artifact_types: set[str] = set()
+    shard_ids: set[str] = set()
+    for index, shard in enumerate(shards, start=1):
+        if not isinstance(shard, dict):
+            raise ValueError(f"speaker_turn_manifest.shards[{index}] 必须是 JSON object")
+        shard_id = str(shard.get("shard_id") or "")
+        artifact_type = str(shard.get("artifact_type") or "")
+        speaker_id = str(shard.get("speaker_id") or "")
+        turn_ids = shard.get("turn_ids")
+        if not shard_id or shard_id in shard_ids:
+            raise ValueError("speaker_turn_manifest shard_id 必须唯一且非空")
+        if (
+            not artifact_type.startswith(SPEAKER_TURN_EDIT_PREFIX)
+            or not SAFE_DYNAMIC_ARTIFACT.fullmatch(artifact_type)
+            or artifact_type in artifact_types
+        ):
+            raise ValueError("speaker_turn_manifest artifact_type 必须是唯一安全的 speaker_turn_edit__ key")
+        if not isinstance(turn_ids, list) or not turn_ids:
+            raise ValueError(f"speaker_turn_manifest shard {shard_id} turn_ids 必须是非空 array")
+        normalized_turn_ids = [str(item) for item in turn_ids]
+        if len(normalized_turn_ids) != len(set(normalized_turn_ids)):
+            raise ValueError(f"speaker_turn_manifest shard {shard_id} turn_ids 不得重复")
+        unknown = sorted(set(normalized_turn_ids) - set(turn_by_id))
+        if unknown:
+            raise ValueError(f"speaker_turn_manifest shard {shard_id} 包含未知 turn_id: {', '.join(unknown)}")
+        if any(str(turn_by_id[turn_id].get("speaker_id") or "") != speaker_id for turn_id in normalized_turn_ids):
+            raise ValueError(f"speaker_turn_manifest shard {shard_id} 混入其他 speaker")
+        speaker_label = str(shard.get("speaker_label") or "")
+        if any(str(turn_by_id[turn_id].get("speaker_label") or "") != speaker_label for turn_id in normalized_turn_ids):
+            raise ValueError(f"speaker_turn_manifest shard {shard_id} speaker_label 与 turns 不一致")
+        input_payload = {
+            "source_name": str(manifest.get("source_name") or ""),
+            "source_sha256": str(manifest.get("source_sha256") or ""),
+            "speaker_id": speaker_id,
+            "speaker_label": speaker_label,
+            "turns": [turn_by_id[turn_id] for turn_id in normalized_turn_ids],
+        }
+        if str(shard.get("input_sha256") or "") != canonical_json_digest(input_payload):
+            raise ValueError(f"speaker_turn_manifest shard {shard_id} input_sha256 与内容不一致")
+        assigned_turns.extend(normalized_turn_ids)
+        artifact_types.add(artifact_type)
+        shard_ids.add(shard_id)
+    if len(assigned_turns) != len(set(assigned_turns)) or set(assigned_turns) != set(turn_by_id):
+        raise ValueError("speaker_turn_manifest shards 必须恰好覆盖全部 turns 一次")
+    if manifest.get("turn_count") != len(turns) or manifest.get("shard_count") != len(shards):
+        raise ValueError("speaker_turn_manifest turn_count/shard_count 与内容不一致")
+    declared_digest = str(manifest.get("manifest_sha256") or "")
+    digest_payload = {key: item for key, item in manifest.items() if key != "manifest_sha256"}
+    if declared_digest != canonical_json_digest(digest_payload):
+        raise ValueError("speaker_turn_manifest manifest_sha256 与内容不一致")
+    return manifest
+
+
+def material_display_names(materials: list[Any]) -> list[str]:
+    names: list[str] = []
+    for material in materials:
+        if isinstance(material, dict):
+            value = material.get("name") or material.get("path") or ""
+        else:
+            value = material
+        text = str(value or "").strip()
+        if text:
+            names.append(Path(text).name)
+    return names
+
+
+def resolve_speaker_editing(
+    requested_mode: Any,
+    manifest: dict[str, Any] | None,
+    materials: list[Any],
+) -> dict[str, Any]:
+    mode = str(requested_mode or "auto").strip()
+    validate_choice("speaker_editing_mode", mode, SPEAKER_EDITING_MODES)
+    if manifest is None:
+        if mode != "auto":
+            raise ValueError("speaker_editing_mode=skip/full 必须提供 speaker_turn_manifest")
+        return {
+            "requested_mode": mode,
+            "effective_mode": "not_applicable",
+            "reason": "speaker_turn_manifest_not_provided",
+            "reviewed_source_hint": False,
+            "high_confidence_filler_count": 0,
+            "high_confidence_fillers_per_1000": 0.0,
+        }
+
+    source_text = "\n".join(
+        str(turn.get("text") or "")
+        for turn in manifest.get("turns", [])
+        if isinstance(turn, dict)
+    )
+    content_chars = max(1, len(source_text))
+    filler_count = sum(source_text.count(marker) for marker in HIGH_CONFIDENCE_FILLER_MARKERS)
+    filler_density = round(filler_count * 1000 / content_chars, 4)
+    names = [
+        str(manifest.get("source_name") or ""),
+        *material_display_names(materials),
+    ]
+    reviewed_hint = any(
+        marker.casefold() in name.casefold()
+        for name in names
+        for marker in REVIEWED_SOURCE_MARKERS
+    )
+
+    if mode == "auto":
+        if reviewed_hint and filler_density <= AUTO_SKIP_FILLERS_PER_1000:
+            effective_mode = "skip"
+            reason = "reviewed_source_with_low_high_confidence_filler_density"
+        else:
+            effective_mode = "full"
+            reason = "source_requires_deletion_only_speaker_editing"
+    else:
+        effective_mode = mode
+        reason = "explicit_request"
+    return {
+        "requested_mode": mode,
+        "effective_mode": effective_mode,
+        "reason": reason,
+        "reviewed_source_hint": reviewed_hint,
+        "high_confidence_filler_count": filler_count,
+        "high_confidence_fillers_per_1000": filler_density,
+    }
 
 
 def validate_choice(name: str, value: str, allowed: set[str]) -> None:
@@ -347,7 +561,10 @@ def output_shape_for(
     secondary_artifacts: list[str],
     identity: dict[str, str] | None = None,
     source_mode: str = "audio_plus_document",
+    task_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    artifact_schema = artifact_schema_name(artifact_type)
+
     def placeholder(field: str) -> Any:
         artifact_examples: dict[str, dict[str, Any]] = {
             "transcript_audit": {
@@ -364,6 +581,27 @@ def output_shape_for(
             },
             "target_attribution_review": {"segments_reviewed": 1},
             "fidelity_review": {"paragraphs_reviewed": 1},
+            "speaker_turn_edit": {
+                "manifest_sha256": str((task_context or {}).get("manifest_sha256") or "0" * 64),
+                "shard_id": str((task_context or {}).get("shard_id") or "speaker_001__part_01"),
+                "speaker_id": str((task_context or {}).get("speaker_id") or "speaker_001"),
+                "input_sha256": str((task_context or {}).get("input_sha256") or "0" * 64),
+                "status": "complete",
+                "edited_turns": [
+                    {
+                        "turn_id": str(turn.get("turn_id") or ""),
+                        "sequence": turn.get("sequence", 1),
+                        "speaker_id": str(turn.get("speaker_id") or ""),
+                        "source_sha256": str(turn.get("source_sha256") or ""),
+                        "edited_text": str(turn.get("text") or ""),
+                        "removed_fillers": [],
+                        "doubtful_fragments": [],
+                    }
+                    for turn in (task_context or {}).get("turns", [])
+                    if isinstance(turn, dict)
+                ],
+                "unresolved_spans": [],
+            },
             "export_manifest": {
                 "markdown_path": "NOTE.md",
                 "markdown_sha256": "0" * 64,
@@ -381,13 +619,13 @@ def output_shape_for(
                 "main_actions_verified": False,
             },
         }
-        if field in artifact_examples.get(artifact_type, {}):
-            return copy.deepcopy(artifact_examples[artifact_type][field])
-        if field in BOOLEAN_FIELD_RULES.get(artifact_type, []):
+        if field in artifact_examples.get(artifact_schema, {}):
+            return copy.deepcopy(artifact_examples[artifact_schema][field])
+        if field in BOOLEAN_FIELD_RULES.get(artifact_schema, []):
             return False
-        if field in LIST_FIELD_RULES.get(artifact_type, []):
+        if field in LIST_FIELD_RULES.get(artifact_schema, []):
             return []
-        if field in STRING_FIELD_RULES.get(artifact_type, []):
+        if field in STRING_FIELD_RULES.get(artifact_schema, []):
             return ""
         if field in {"segments_reviewed", "paragraphs_reviewed"}:
             return 1
@@ -400,7 +638,7 @@ def output_shape_for(
         shape: dict[str, Any] = {
             **identity,
             "artifacts": {
-                artifact_type: {field: placeholder(field) for field in REQUIRED_FIELDS[artifact_type]},
+                artifact_type: {field: placeholder(field) for field in REQUIRED_FIELDS[artifact_schema]},
             }
         }
         for secondary in secondary_artifacts:
@@ -410,12 +648,19 @@ def output_shape_for(
     return {
         **identity,
         "artifact_type": artifact_type,
-        "artifact": {field: placeholder(field) for field in REQUIRED_FIELDS[artifact_type]},
+        "artifact": {field: placeholder(field) for field in REQUIRED_FIELDS[artifact_schema]},
     }
 
 
-def prompt_for_task(artifact_type: str, spec: dict[str, Any], run_profile: str, source_mode: str) -> str:
-    required_fields = REQUIRED_FIELDS[artifact_type]
+def prompt_for_task(
+    artifact_type: str,
+    spec: dict[str, Any],
+    run_profile: str,
+    source_mode: str,
+    task_context: dict[str, Any] | None = None,
+) -> str:
+    artifact_schema = artifact_schema_name(artifact_type)
+    required_fields = REQUIRED_FIELDS[artifact_schema]
     secondary = [str(item) for item in spec.get("secondary_artifacts", [])]
     lines = [
         "Use $investment-meeting-minutes for this process-only specialist task.",
@@ -468,16 +713,33 @@ def prompt_for_task(artifact_type: str, spec: dict[str, Any], run_profile: str, 
             "or heading code in missing_positive_targets, and put every body target missing a code in recommended_revisions."
         )
         lines.append("If target attribution is unsupported, add the exact finding to recommended_revisions; do not invent a target.")
-    elif artifact_type == "fidelity_review":
+    elif artifact_schema == "fidelity_review":
         lines.append("paragraphs_reviewed must be a positive integer for the actual reviewed scope.")
         lines.append("If source mapping is insufficient, add the exact paragraph to source_mapping_failures; do not infer missing speech.")
-    elif artifact_type == "export_manifest":
+    elif artifact_schema == "speaker_turn_edit":
+        lines.extend(
+            [
+                "Edit only the assigned turns in task_context; do not merge, omit, reorder, summarize, or add turns.",
+                "Deletion-only rule: edited_text may only delete source content; punctuation and whitespace may be normalized.",
+                "Do not insert, replace, reorder, canonicalize, or repair any content word, entity, number, date, code, unit, polarity, or conclusion.",
+                "Delete only pure filler words, meaningless repetitions, repeated false starts, and obvious ASR noise.",
+                "Preserve first-person wording, negation, uncertainty, judgment strength, conditions, numbers, dates, position actions, and reasoning.",
+                "Do not silently canonicalize an uncertain entity; keep it in edited_text and list it in doubtful_fragments.",
+                "Every removed_fillers item must quote an exact removed source span; do not return abstract cleanup categories.",
+                "Return every assigned turn exactly once with unchanged turn_id, sequence, speaker_id, and source_sha256.",
+                "Set status=blocked when exact coverage cannot be completed; explain the span in unresolved_spans.",
+                "The main workflow alone assembles turns by global sequence and writes Markdown.",
+                "Assigned task_context JSON follows:",
+                json.dumps(task_context or {}, ensure_ascii=False, sort_keys=True),
+            ]
+        )
+    elif artifact_schema == "export_manifest":
         lines.append("Return markdown_sha256 for markdown_path and set main_actions_verified as a boolean.")
         lines.append("validators_run must contain exactly validate_utf8_text.py and validate_meeting_minutes_contract.py with boolean ok.")
         lines.append("regression_result must contain name=run_meeting_minutes_regression.py, a positive integer case_count, and boolean ok.")
         lines.append("Set export_status to exactly one of: passed, failed, blocked.")
     lines.append(f"Forbidden final-output fields: {', '.join(sorted(FORBIDDEN_FINAL_FIELDS))}.")
-    if artifact_type not in {"entity_verification_report", "target_attribution_review", "fidelity_review"}:
+    if artifact_schema not in {"entity_verification_report", "target_attribution_review", "fidelity_review", "speaker_turn_edit"}:
         lines.append("If evidence is insufficient or conflicting, use this artifact's conflict or failure fields instead of guessing.")
     return "\n".join(lines)
 
@@ -505,6 +767,7 @@ def prompt_markdown(bundle: dict[str, Any], task: dict[str, Any]) -> str:
             f"- source_mode: `{bundle['source_mode']}`",
             f"- meeting_type: `{bundle['meeting_type']}`",
             f"- artifact_type: `{artifact_type}`",
+            f"- artifact_schema: `{task.get('artifact_schema', artifact_schema_name(artifact_type))}`",
             f"- dispatch_phase: `{dispatch_phase}`",
             f"- run_id: `{bundle.get('run_id', '')}`",
             f"- task_id: `{task.get('task_id', '')}`",
@@ -534,10 +797,16 @@ def prompt_markdown(bundle: dict[str, Any], task: dict[str, Any]) -> str:
     )
 
 
-def build_task(artifact_type: str, run_profile: str, source_mode: str) -> dict[str, Any]:
-    spec = ROLE_SPECS[artifact_type]
+def build_task(
+    artifact_type: str,
+    run_profile: str,
+    source_mode: str,
+    task_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    artifact_schema = artifact_schema_name(artifact_type)
+    spec = ROLE_SPECS[artifact_schema]
     inputs = [str(item) for item in spec.get("inputs", [])]
-    if artifact_type == "fidelity_review" and source_mode != "audio_plus_document":
+    if artifact_schema == "fidelity_review" and source_mode != "audio_plus_document":
         inputs = [
             "selected primary body source and source-selection rationale"
             if item == "source_reconciliation"
@@ -550,21 +819,31 @@ def build_task(artifact_type: str, run_profile: str, source_mode: str) -> dict[s
     task = {
         "role": spec["role"],
         "artifact_type": artifact_type,
+        "artifact_schema": artifact_schema,
         "dispatch_phase": dispatch_phase,
         "secondary_artifacts": secondary_artifacts,
         "objective": spec["objective"],
         "inputs": inputs,
         "checks": spec["checks"],
-        "required_fields": REQUIRED_FIELDS[artifact_type],
+        "required_fields": REQUIRED_FIELDS[artifact_schema],
         "forbidden_final_fields": sorted(FORBIDDEN_FINAL_FIELDS),
         "expected_output_shape": output_shape_for(
             artifact_type,
             secondary_artifacts,
             source_mode=source_mode,
+            task_context=task_context,
         ),
-        "prompt": prompt_for_task(artifact_type, prompt_spec, run_profile, source_mode),
+        "prompt": prompt_for_task(
+            artifact_type,
+            prompt_spec,
+            run_profile,
+            source_mode,
+            task_context=task_context,
+        ),
         "material_handoff": DISPATCH_PHASES[dispatch_phase]["materials"],
     }
+    if task_context is not None:
+        task["task_context"] = copy.deepcopy(task_context)
     if "doubtful_items" in secondary_artifacts:
         task["secondary_required_fields"] = {"doubtful_items": DOUBTFUL_REQUIRED_FIELDS}
     return task
@@ -596,6 +875,7 @@ def bind_dispatch_identity(bundle: dict[str, Any]) -> dict[str, Any]:
                         "artifact_owner": owner,
                     },
                     source_mode=str(bound.get("source_mode") or "audio_plus_document"),
+                    task_context=task.get("task_context") if isinstance(task.get("task_context"), dict) else None,
                 ),
             }
         )
@@ -626,12 +906,12 @@ def dispatch_protocol() -> dict[str, Any]:
 def artifact_owners(expected_artifacts: list[str]) -> dict[str, str]:
     owners: dict[str, str] = {}
     for artifact in expected_artifacts:
-        if artifact == "source_manifest":
+        if artifact in {"source_manifest", "editing_assembly_receipt"}:
             owners[artifact] = "Main Orchestrator"
         elif artifact == "doubtful_items":
             owners[artifact] = "Entity Verifier proposes; Main Orchestrator decides"
-        elif artifact in ROLE_SPECS:
-            owners[artifact] = str(ROLE_SPECS[artifact]["role"])
+        elif artifact_schema_name(artifact) in ROLE_SPECS:
+            owners[artifact] = str(ROLE_SPECS[artifact_schema_name(artifact)]["role"])
         else:
             owners[artifact] = "Main Orchestrator"
     return owners
@@ -658,7 +938,24 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
     )
     if configuration_errors:
         raise ValueError("; ".join(configuration_errors))
+    speaker_turn_manifest = normalized_speaker_turn_manifest(request.get("speaker_turn_manifest"))
+    if (
+        speaker_turn_manifest is not None
+        and source_mode == "audio_plus_document"
+        and source_selection_status != "compared_clear"
+    ):
+        raise ValueError("audio_plus_document 必须先确认正文主源，再生成 speaker_turn_manifest")
+    if set(risk_flags) & EDITING_RISKS and speaker_turn_manifest is None:
+        raise ValueError("speaker 编辑风险必须提供 speaker_turn_manifest")
+    speaker_editing = resolve_speaker_editing(
+        request.get("speaker_editing_mode"),
+        speaker_turn_manifest,
+        materials,
+    )
+    speaker_editing_enabled = speaker_editing["effective_mode"] == "full"
     inferred_risks = infer_risk_flags(run_profile, source_mode, risk_flags, source_selection_status)
+    if speaker_editing_enabled:
+        inferred_risks = sorted(set(inferred_risks) | {"speaker_turn_editing"})
     expected_artifacts = select_expected_artifacts(
         run_profile,
         source_mode,
@@ -666,15 +963,49 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
         risk_flags,
         source_selection_status,
     )
+    if speaker_editing_enabled:
+        expected_artifacts = sorted(
+            set(expected_artifacts)
+            | {"editing_assembly_receipt"}
+            | {
+                str(shard.get("artifact_type") or "")
+                for shard in speaker_turn_manifest.get("shards", [])
+                if isinstance(shard, dict)
+            }
+        )
     task_artifacts = [
         artifact
         for artifact in expected_artifacts
-        if artifact not in {"source_manifest", "doubtful_items"}
+        if artifact not in {"source_manifest", "editing_assembly_receipt", "doubtful_items"}
     ]
-    tasks = sorted(
-        (build_task(artifact, run_profile, source_mode) for artifact in task_artifacts),
-        key=lambda task: (PHASE_ORDER[str(task["dispatch_phase"])], str(task["artifact_type"])),
-    )
+    turn_by_id = {
+        str(turn.get("turn_id") or ""): turn
+        for turn in (speaker_turn_manifest or {}).get("turns", [])
+        if isinstance(turn, dict)
+    }
+    shard_by_artifact = {
+        str(shard.get("artifact_type") or ""): shard
+        for shard in (speaker_turn_manifest or {}).get("shards", [])
+        if isinstance(shard, dict)
+    }
+    tasks = []
+    for artifact in task_artifacts:
+        task_context = None
+        if artifact_schema_name(artifact) == "speaker_turn_edit":
+            shard = shard_by_artifact[artifact]
+            task_context = {
+                "manifest_sha256": str(speaker_turn_manifest.get("manifest_sha256") or ""),
+                "shard_id": str(shard.get("shard_id") or ""),
+                "speaker_id": str(shard.get("speaker_id") or ""),
+                "speaker_label": str(shard.get("speaker_label") or ""),
+                "input_sha256": str(shard.get("input_sha256") or ""),
+                "turns": [
+                    copy.deepcopy(turn_by_id[str(turn_id)])
+                    for turn_id in shard.get("turn_ids", [])
+                ],
+            }
+        tasks.append(build_task(artifact, run_profile, source_mode, task_context=task_context))
+    tasks.sort(key=lambda task: (PHASE_ORDER[str(task["dispatch_phase"])], str(task["artifact_type"])))
 
     return {
         "schema_version": "1.0",
@@ -685,6 +1016,8 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
         "mas_required": should_use_mas(run_profile, source_mode, risk_flags, source_selection_status),
         "risk_flags": inferred_risks,
         "materials": copy.deepcopy(materials),
+        "speaker_turn_manifest": speaker_turn_manifest,
+        "speaker_editing": speaker_editing,
         "main_orchestrator": {
             "final_writer_only": True,
             "must_not_delegate": [
@@ -762,6 +1095,17 @@ def validate_bundle(
     if len(expected_list) != len(expected_set):
         errors.append("MAS task bundle expected_artifacts 不得重复")
     risk_flags: list[str] = []
+    speaker_turn_manifest: dict[str, Any] | None = None
+    try:
+        speaker_turn_manifest = normalized_speaker_turn_manifest(bundle.get("speaker_turn_manifest"))
+    except ValueError as exc:
+        errors.append(str(exc))
+    if (
+        speaker_turn_manifest is not None
+        and source_mode == "audio_plus_document"
+        and source_selection_status != "compared_clear"
+    ):
+        errors.append("audio_plus_document 必须先确认正文主源，再生成 speaker_turn_manifest")
     try:
         risk_flags = normalized_flags(bundle.get("risk_flags"))
     except ValueError as exc:
@@ -769,6 +1113,23 @@ def validate_bundle(
     else:
         if risk_flags != bundle.get("risk_flags"):
             errors.append("MAS task bundle risk_flags 必须去重并排序")
+        if set(risk_flags) & EDITING_RISKS and speaker_turn_manifest is None:
+            errors.append("speaker 编辑风险必须绑定有效 speaker_turn_manifest")
+    speaker_editing: dict[str, Any] = {}
+    try:
+        declared_speaker_editing = bundle.get("speaker_editing")
+        if not isinstance(declared_speaker_editing, dict):
+            raise ValueError("MAS task bundle speaker_editing 必须是 JSON object")
+        speaker_editing = resolve_speaker_editing(
+            declared_speaker_editing.get("requested_mode"),
+            speaker_turn_manifest,
+            list(bundle.get("materials") or []),
+        )
+        if declared_speaker_editing != speaker_editing:
+            errors.append("MAS task bundle speaker_editing 与 manifest/materials 自适应判定不一致")
+    except ValueError as exc:
+        errors.append(str(exc))
+    speaker_editing_enabled = speaker_editing.get("effective_mode") == "full"
     if not isinstance(bundle.get("mas_required"), bool):
         errors.append("MAS task bundle mas_required 必须是 boolean")
     if not configuration_errors and isinstance(bundle.get("mas_required"), bool):
@@ -789,6 +1150,13 @@ def validate_bundle(
                 source_selection_status,
             )
         )
+        if speaker_editing_enabled:
+            canonical_expected.add("editing_assembly_receipt")
+            canonical_expected.update(
+                str(shard.get("artifact_type") or "")
+                for shard in speaker_turn_manifest.get("shards", [])
+                if isinstance(shard, dict)
+            )
         if expected_set != canonical_expected:
             errors.append(
                 "MAS task bundle expected_artifacts 与 risk matrix 不一致: "
@@ -802,17 +1170,51 @@ def validate_bundle(
         errors.append("audio_plus_document fidelity_review 缺少 source_reconciliation 依赖")
     produced_artifacts = {"source_manifest"} if bundle.get("mas_required") else set()
     producer_counts: dict[str, int] = {"source_manifest": 1} if bundle.get("mas_required") else {}
+    if speaker_editing_enabled:
+        produced_artifacts.add("editing_assembly_receipt")
+        producer_counts["editing_assembly_receipt"] = 1
+    manifest_turn_by_id = {
+        str(turn.get("turn_id") or ""): turn
+        for turn in (speaker_turn_manifest or {}).get("turns", [])
+        if isinstance(turn, dict)
+    }
+    canonical_edit_contexts = {
+        str(shard.get("artifact_type") or ""): {
+            "manifest_sha256": str((speaker_turn_manifest or {}).get("manifest_sha256") or ""),
+            "shard_id": str(shard.get("shard_id") or ""),
+            "speaker_id": str(shard.get("speaker_id") or ""),
+            "speaker_label": str(shard.get("speaker_label") or ""),
+            "input_sha256": str(shard.get("input_sha256") or ""),
+            "turns": [
+                copy.deepcopy(manifest_turn_by_id[str(turn_id)])
+                for turn_id in shard.get("turn_ids", [])
+                if str(turn_id) in manifest_turn_by_id
+            ],
+        }
+        for shard in (speaker_turn_manifest or {}).get("shards", [])
+        if isinstance(shard, dict)
+    }
     for task in tasks:
         if not isinstance(task, dict):
             errors.append("MAS task bundle task 必须是 JSON object")
             continue
         artifact_type = str(task.get("artifact_type") or "")
-        if artifact_type not in ROLE_SPECS:
+        artifact_schema = artifact_schema_name(artifact_type)
+        if artifact_schema not in ROLE_SPECS:
             errors.append(f"未知 MAS task artifact_type: {artifact_type}")
             continue
-        expected_task = build_task(artifact_type, run_profile, source_mode)
+        canonical_task_context = canonical_edit_contexts.get(artifact_type)
+        if artifact_schema == "speaker_turn_edit" and task.get("task_context") != canonical_task_context:
+            errors.append(f"{artifact_type} task_context 与 speaker_turn_manifest 不一致")
+        expected_task = build_task(
+            artifact_type,
+            run_profile,
+            source_mode,
+            task_context=canonical_task_context,
+        )
         for field in (
             "role",
+            "artifact_schema",
             "dispatch_phase",
             "secondary_artifacts",
             "objective",
@@ -822,6 +1224,7 @@ def validate_bundle(
             "forbidden_final_fields",
             "prompt",
             "material_handoff",
+            "task_context",
         ):
             if task.get(field) != expected_task.get(field):
                 errors.append(f"{artifact_type} task {field} 与角色契约不一致")
@@ -838,7 +1241,7 @@ def validate_bundle(
         if artifact_type not in expected_set:
             errors.append(f"task artifact_type 不在 expected_artifacts 中: {artifact_type}")
         required_fields = task.get("required_fields")
-        if artifact_type in REQUIRED_FIELDS and required_fields != REQUIRED_FIELDS[artifact_type]:
+        if artifact_schema in REQUIRED_FIELDS and required_fields != REQUIRED_FIELDS[artifact_schema]:
             errors.append(f"{artifact_type} task required_fields 与 artifact schema 不一致")
         dispatch_phase = str(task.get("dispatch_phase") or "")
         if dispatch_phase not in DISPATCH_PHASES:
@@ -882,7 +1285,7 @@ def _write_dispatch_files_unlocked(
         for path in [
             task_dir / "mas_task_bundle.json",
             task_dir / "dispatch_manifest.json",
-            *task_dir.glob("[0-9][0-9]-*.prompt.md"),
+            *task_dir.glob("[0-9]*-*.prompt.md"),
         ]
         if path.exists()
     ]
@@ -897,7 +1300,7 @@ def _write_dispatch_files_unlocked(
             "or finish/repair the existing MAS run before generating a new bundle"
         )
     if overwrite_prompts:
-        for path in task_dir.glob("[0-9][0-9]-*.prompt.md"):
+        for path in task_dir.glob("[0-9]*-*.prompt.md"):
             path.unlink()
     bundle = bind_dispatch_identity(bundle)
     bundle_path = task_dir / "mas_task_bundle.json"
@@ -916,6 +1319,7 @@ def _write_dispatch_files_unlocked(
                 "task_id": str(task.get("task_id") or ""),
                 "artifact_owner": str(task.get("artifact_owner") or task.get("role") or ""),
                 "artifact_type": str(task.get("artifact_type") or ""),
+                "artifact_schema": str(task.get("artifact_schema") or ""),
                 "dispatch_phase": str(task.get("dispatch_phase") or ""),
                 "secondary_artifacts": [str(item) for item in task.get("secondary_artifacts", [])],
                 "path": task_path.name,
@@ -975,6 +1379,8 @@ def main() -> int:
     parser.add_argument("--meeting-type", choices=sorted(MEETING_TYPES), default=None)
     parser.add_argument("--risk", action="append", default=[], help="风险标记，可重复")
     parser.add_argument("--material", action="append", default=[], help="当前会议材料路径，可重复")
+    parser.add_argument("--speaker-turn-manifest", help="由 build_speaker_turn_manifest.py 生成的 JSON")
+    parser.add_argument("--speaker-editing-mode", choices=sorted(SPEAKER_EDITING_MODES), help="发言人编辑路由：auto/skip/full")
     parser.add_argument("--out", help="写入 JSON 文件；默认输出到 stdout")
     parser.add_argument("--task-dir", help="写入 Codex-ready subagent prompt 文件和 dispatch manifest")
     parser.add_argument("--overwrite-dispatch", action="store_true", help="显式覆盖无 artifact 的已有 dispatch 文件")
@@ -1000,6 +1406,10 @@ def main() -> int:
             if not isinstance(existing_materials, list):
                 raise ValueError("materials 必须是 JSON array")
             request["materials"] = [*existing_materials, *args.material]
+        if args.speaker_turn_manifest:
+            request["speaker_turn_manifest"] = read_json(Path(args.speaker_turn_manifest))
+        if args.speaker_editing_mode:
+            request["speaker_editing_mode"] = args.speaker_editing_mode
 
         bundle = build_bundle_from_request(request)
         errors = validate_bundle(

@@ -438,8 +438,8 @@
       "check": "mas_dry_run",
       "file": "mas_task_request_audio_plus_document.json",
       "artifact_file": "mas_artifacts_valid.json",
-      "expect_phase_order": ["pre_draft", "draft_review", "final_verification"],
-      "expect_completed_phase_order": ["pre_draft", "draft_review", "final_verification"],
+      "expect_phase_order": ["pre_draft", "editing", "draft_review", "final_verification"],
+      "expect_completed_phase_order": ["pre_draft", "editing", "draft_review", "final_verification"],
       "expect_stop_reason": "completed",
       "expect_phase_next_actions": [
         {"phase": "pre_draft", "type": "collect_or_dispatch_phase_artifacts", "next_phase": "draft_review"},
@@ -1568,6 +1568,15 @@
       "file": "document_inline_timestamp_negative.md",
       "expect_fail": true,
       "required_error_terms": ["不应出现存疑时间戳"]
+    },
+    {
+      "name": "MAS 按发言人并发编辑与顺序组装",
+      "mode": "speaker_editing_mas",
+      "check": "speaker_editing_mas",
+      "file": "speaker_editing_source.txt",
+      "expect_dirty_mode": "full",
+      "expect_reviewed_mode": "skip",
+      "expect_sixteen_task_batch_sizes": [6, 5, 5]
     }
   ]
 }

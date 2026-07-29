@@ -20,6 +20,7 @@ from validate_meeting_minutes_contract import (
 from validate_mas_artifacts import (
     artifact_mapping,
     artifact_set_digest,
+    canonical_json_digest,
     file_sha256,
     forbidden_field_errors,
     has_items,
@@ -29,7 +30,7 @@ from validate_mas_artifacts import (
     validate_payload,
 )
 
-PHASE_ORDER = {"pre_draft": 0, "draft_review": 1, "final_verification": 2}
+PHASE_ORDER = {"pre_draft": 0, "editing": 1, "draft_review": 2, "final_verification": 3}
 BODY_MATERIAL_KINDS_BY_MODE = {
     "audio_only": {"audio"},
     "document_only": {"document"},
@@ -59,6 +60,8 @@ def required_artifacts_for_phase(bundle: dict[str, Any], through_phase: str | No
     required: set[str] = set()
     if "source_manifest" in expected:
         required.add("source_manifest")
+    if "editing_assembly_receipt" in expected and phase_index >= PHASE_ORDER["editing"]:
+        required.add("editing_assembly_receipt")
     for task in bundle.get("tasks", []):
         if not isinstance(task, dict):
             continue
@@ -325,6 +328,97 @@ def artifact_context_errors(
 ) -> list[str]:
     """Bind specialist claims to the current dispatch and its sidecar files."""
     errors: list[str] = []
+    speaker_manifest = bundle.get("speaker_turn_manifest")
+    dynamic_edit_types = {
+        str(artifact_type)
+        for artifact_type in artifacts
+        if str(artifact_type).startswith("speaker_turn_edit__")
+    }
+    if dynamic_edit_types and not isinstance(speaker_manifest, dict):
+        errors.append("speaker_turn_edit artifact 缺少当前 bundle 的 speaker_turn_manifest")
+    if isinstance(speaker_manifest, dict):
+        turn_by_id = {
+            str(turn.get("turn_id") or ""): turn
+            for turn in speaker_manifest.get("turns", [])
+            if isinstance(turn, dict)
+        }
+        expected_edit_types: set[str] = set()
+        all_returned_turn_ids: list[str] = []
+        for shard in speaker_manifest.get("shards", []):
+            if not isinstance(shard, dict):
+                continue
+            artifact_type = str(shard.get("artifact_type") or "")
+            expected_edit_types.add(artifact_type)
+            artifact = artifacts.get(artifact_type)
+            if not isinstance(artifact, dict):
+                continue
+            if artifact.get("status") != "complete":
+                errors.append(f"{artifact_type}.status 未完成，不能进入 draft_review")
+            for field, expected in (
+                ("manifest_sha256", speaker_manifest.get("manifest_sha256")),
+                ("shard_id", shard.get("shard_id")),
+                ("speaker_id", shard.get("speaker_id")),
+                ("input_sha256", shard.get("input_sha256")),
+            ):
+                if artifact.get(field) != expected:
+                    errors.append(f"{artifact_type}.{field} 与 speaker_turn_manifest 不一致")
+            returned_turns = artifact.get("edited_turns")
+            if not isinstance(returned_turns, list):
+                continue
+            returned_by_id = {
+                str(turn.get("turn_id") or ""): turn
+                for turn in returned_turns
+                if isinstance(turn, dict)
+            }
+            expected_turn_ids = [str(turn_id) for turn_id in shard.get("turn_ids", [])]
+            if len(returned_by_id) != len(returned_turns):
+                errors.append(f"{artifact_type}.edited_turns turn_id 必须唯一")
+            if set(returned_by_id) != set(expected_turn_ids):
+                errors.append(f"{artifact_type}.edited_turns 必须恰好覆盖当前 shard turn_ids")
+            for turn_id in expected_turn_ids:
+                returned = returned_by_id.get(turn_id)
+                source = turn_by_id.get(turn_id)
+                if not isinstance(returned, dict) or not isinstance(source, dict):
+                    continue
+                for field in ("sequence", "speaker_id", "source_sha256"):
+                    if returned.get(field) != source.get(field):
+                        errors.append(f"{artifact_type}.{turn_id}.{field} 与 speaker_turn_manifest 不一致")
+                all_returned_turn_ids.append(turn_id)
+        unexpected = sorted(dynamic_edit_types - expected_edit_types)
+        if unexpected:
+            errors.append("存在未由 speaker_turn_manifest 授权的编辑 artifact: " + ", ".join(unexpected))
+        if expected_edit_types <= set(artifacts):
+            expected_turn_ids = set(turn_by_id)
+            if len(all_returned_turn_ids) != len(set(all_returned_turn_ids)):
+                errors.append("speaker_turn_edit 全局 turn_id 重复")
+            if set(all_returned_turn_ids) != expected_turn_ids:
+                errors.append("speaker_turn_edit artifacts 未恰好覆盖 speaker_turn_manifest 全部 turns")
+        receipt = artifacts.get("editing_assembly_receipt")
+        if isinstance(receipt, dict):
+            ordered_turn_ids = [
+                str(turn.get("turn_id") or "")
+                for turn in sorted(
+                    (turn for turn in speaker_manifest.get("turns", []) if isinstance(turn, dict)),
+                    key=lambda turn: int(turn.get("sequence") or 0),
+                )
+            ]
+            edit_artifacts = {
+                artifact_type: artifacts[artifact_type]
+                for artifact_type in sorted(expected_edit_types)
+                if artifact_type in artifacts
+            }
+            for field, expected in (
+                ("manifest_sha256", speaker_manifest.get("manifest_sha256")),
+                ("edit_artifact_digest", canonical_json_digest(edit_artifacts)),
+                ("ordered_turn_ids", ordered_turn_ids),
+            ):
+                if receipt.get(field) != expected:
+                    errors.append(f"editing_assembly_receipt.{field} 与当前编辑 artifacts 不一致")
+            assembled_path = resolve_runtime_path(task_dir, receipt.get("assembled_draft_path"))
+            if not assembled_path.is_file():
+                errors.append(f"editing_assembly_receipt 工作稿不存在: {assembled_path}")
+            elif file_sha256(assembled_path) != str(receipt.get("assembled_draft_sha256") or ""):
+                errors.append("editing_assembly_receipt 工作稿哈希与当前文件不一致")
     source_manifest = artifacts.get("source_manifest")
     if isinstance(source_manifest, dict):
         if source_manifest.get("source_mode") != bundle.get("source_mode"):
@@ -529,6 +623,16 @@ def next_action(
     required_actions = action_names(decision) if decision.get("ok") else []
     for gate in gates:
         if gate["status"] in {"ready_for_dispatch_or_collection", "blocked_by_previous_phase"}:
+            if (
+                gate["phase"] == "editing"
+                and gate["current_phase_missing_artifacts"] == ["editing_assembly_receipt"]
+            ):
+                return {
+                    "type": "assemble_edited_turns_before_draft_review",
+                    "phase": "editing",
+                    "main_actions": ["run assemble_speaker_turn_edits.py"],
+                    "main_owned_missing_artifacts": ["editing_assembly_receipt"],
+                }
             if gate["phase"] == "final_verification" and required_actions and not receipt_state.get("valid"):
                 return {
                     "type": "apply_main_actions_before_final_verification",

@@ -33,6 +33,7 @@ from validate_meeting_minutes_contract import (  # noqa: E402
 )
 from validate_mas_artifacts import (  # noqa: E402
     file_sha256,
+    speaker_edit_content_errors,
     validate_file as validate_mas_artifacts_file,
     validate_payload as validate_mas_artifacts_payload,
 )
@@ -44,6 +45,8 @@ from build_mas_task_bundle import (  # noqa: E402
 from create_mas_source_manifest import create_source_manifest, source_manifest_artifact  # noqa: E402
 from summarize_mas_decisions import summarize_file as summarize_mas_decision_file  # noqa: E402
 from collect_mas_artifacts import collect_mas_run  # noqa: E402
+from assemble_speaker_turn_edits import assemble_speaker_turn_edits  # noqa: E402
+from build_speaker_turn_manifest import build_manifest as build_speaker_turn_manifest  # noqa: E402
 from ingest_mas_artifact import ingest_mas_artifact_file  # noqa: E402
 import ingest_mas_artifact as ingest_mas_artifact_module  # noqa: E402
 from plan_mas_next_action import plan_from_summary  # noqa: E402
@@ -725,6 +728,432 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                         f"expected={sorted(expected_materials)} actual={sorted(actual_materials)}"
                     )
             result = {"ok": not errors, "errors": errors, "warnings": []}
+    elif case.get("check") == "speaker_editing_mas":
+        errors = []
+        warnings: list[str] = []
+        source_text = file_path.read_text(encoding="utf-8")
+        speaker_manifest = build_speaker_turn_manifest(file_path, source_text, max_chars=45)
+        request_payload = {
+            "run_profile": "standard",
+            "source_mode": "document_only",
+            "meeting_type": "多人复盘会",
+            "risk_flags": ["long_transcript", "filler_cleanup"],
+            "materials": [{"kind": "document", "name": file_path.name}],
+            "speaker_turn_manifest": speaker_manifest,
+        }
+        bundle = build_mas_task_bundle_from_request(request_payload)
+        errors.extend(validate_mas_task_bundle(bundle))
+        edit_tasks = [
+            task
+            for task in bundle.get("tasks", [])
+            if isinstance(task, dict) and task.get("artifact_schema") == "speaker_turn_edit"
+        ]
+        if len(edit_tasks) != speaker_manifest.get("shard_count") or len(edit_tasks) < 3:
+            errors.append("speaker editing 未按 speaker/长度生成预期数量的唯一 shards")
+        edit_types = [str(task.get("artifact_type") or "") for task in edit_tasks]
+        if len(edit_types) != len(set(edit_types)):
+            errors.append("speaker editing artifact_type 不唯一")
+        if any(task.get("dispatch_phase") != "editing" for task in edit_tasks):
+            errors.append("speaker editing task 未进入 editing phase")
+        if bundle.get("speaker_editing", {}).get("effective_mode") != str(
+            case.get("expect_dirty_mode") or "full"
+        ):
+            errors.append("未核对且含 filler 的 speaker source 未进入 full editing")
+
+        clean_manifest = build_speaker_turn_manifest(
+            Path("2026-07-26 华鑫周会（已核对）.md"),
+            "发言人1：我认为需求可能改善。\n发言人2：我们没有减仓，继续观察。",
+            max_chars=100,
+        )
+        clean_bundle = build_mas_task_bundle_from_request(
+            {
+                "run_profile": "standard",
+                "source_mode": "document_only",
+                "meeting_type": "多人复盘会",
+                "risk_flags": ["long_transcript", "filler_cleanup"],
+                "materials": [{"kind": "document", "name": "2026-07-26 华鑫周会（已核对）.md"}],
+                "speaker_turn_manifest": clean_manifest,
+            }
+        )
+        errors.extend(validate_mas_task_bundle(clean_bundle))
+        if clean_bundle.get("speaker_editing", {}).get("effective_mode") != str(
+            case.get("expect_reviewed_mode") or "skip"
+        ):
+            errors.append("已核对且低 filler 的 source 未被 auto 路由为 skip")
+        if any(
+            isinstance(task, dict) and task.get("artifact_schema") == "speaker_turn_edit"
+            for task in clean_bundle.get("tasks", [])
+        ):
+            errors.append("skip editing 仍生成 speaker edit task")
+        if "editing_assembly_receipt" in clean_bundle.get("expected_artifacts", []):
+            errors.append("skip editing 仍要求 editing_assembly_receipt")
+        if clean_bundle.get("speaker_turn_manifest") != clean_manifest:
+            errors.append("skip editing 未保留 speaker manifest 审计绑定")
+
+        stress_text = "\n".join(
+            f"发言人{speaker}：第{round_index}轮，我保留数字{speaker}和条件判断。"
+            for round_index in range(1, 6)
+            for speaker in range(1, 21)
+        )
+        stress_manifest = build_speaker_turn_manifest(
+            Path("speaker-editing-stress.txt"),
+            stress_text,
+            max_chars=20,
+        )
+        stress_bundle = build_mas_task_bundle_from_request(
+            {
+                "run_profile": "standard",
+                "source_mode": "document_only",
+                "meeting_type": "多人复盘会",
+                "risk_flags": ["long_transcript"],
+                "materials": [{"kind": "document", "name": "speaker-editing-stress.txt"}],
+                "speaker_turn_manifest": stress_manifest,
+            }
+        )
+        errors.extend(validate_mas_task_bundle(stress_bundle))
+        with tempfile.TemporaryDirectory(prefix="mas-speaker-stress-") as stress_tmpdir:
+            stress_dispatch = write_mas_dispatch_files(stress_bundle, Path(stress_tmpdir))
+            prompt_names = [Path(path).name for path in stress_dispatch["task_files"]]
+            edit_prompt_names = [
+                name for name in prompt_names if "speaker_turn_edit__" in name
+            ]
+            if len(edit_prompt_names) != 100 or len(edit_prompt_names) != len(set(edit_prompt_names)):
+                errors.append("100-shard speaker editing 压力样例未生成唯一 prompt")
+            if not any(name.startswith("100-") for name in prompt_names):
+                errors.append("100+ task prompt 编号未覆盖三位数")
+            stress_dispatch_manifest = json.loads(
+                (Path(stress_tmpdir) / "dispatch_manifest.json").read_text(encoding="utf-8")
+            )
+            first_sixteen = [
+                item
+                for item in stress_dispatch_manifest.get("task_files", [])
+                if isinstance(item, dict)
+                and str(item.get("artifact_type") or "").startswith("speaker_turn_edit__")
+            ][:16]
+            batch_plan = plan_from_summary(
+                {
+                    "schema_version": "1.0",
+                    "ok": False,
+                    "task_dir": stress_tmpdir,
+                    "next_action": {
+                        "type": "collect_or_dispatch_phase_artifacts",
+                        "phase": "editing",
+                        "task_files": first_sixteen,
+                    },
+                    "warnings": [],
+                },
+                max_parallel=4,
+            )
+            batches = batch_plan.get("dispatch_batches", [])
+            batched_types = [
+                str(task.get("artifact_type") or "")
+                for batch in batches
+                for task in batch.get("tasks", [])
+            ]
+            expected_types = [str(item.get("artifact_type") or "") for item in first_sixteen]
+            batch_sizes = [len(batch.get("tasks", [])) for batch in batches]
+            expected_batch_sizes = [
+                int(item)
+                for item in case.get("expect_sixteen_task_batch_sizes", [6, 5, 5])
+            ]
+            if batch_sizes != expected_batch_sizes:
+                errors.append("16 个 speaker tasks 未规划为受限容量的平衡 agent 批次")
+            if sorted(batched_types) != sorted(expected_types) or len(batched_types) != len(set(batched_types)):
+                errors.append("speaker editing dispatch_batches 未恰好覆盖 task identity 一次")
+            all_edit_files = [
+                item
+                for item in stress_dispatch_manifest.get("task_files", [])
+                if isinstance(item, dict)
+                and str(item.get("artifact_type") or "").startswith("speaker_turn_edit__")
+            ]
+            stress_batch_plan = plan_from_summary(
+                {
+                    "schema_version": "1.0",
+                    "ok": False,
+                    "task_dir": stress_tmpdir,
+                    "next_action": {
+                        "type": "collect_or_dispatch_phase_artifacts",
+                        "phase": "editing",
+                        "task_files": all_edit_files,
+                    },
+                    "warnings": [],
+                },
+                max_parallel=4,
+            )
+            stress_batches = stress_batch_plan.get("dispatch_batches", [])
+            stress_waves = stress_batch_plan.get("dispatch_waves", [])
+            if len(stress_batches) != 17 or any(
+                len(batch.get("tasks", [])) > 6
+                for batch in stress_batches
+            ):
+                errors.append("100 个 speaker tasks 未遵守每 agent 最多 6 个 task")
+            if len(stress_waves) != 5 or any(
+                len(wave.get("batch_ids", [])) > 4
+                for wave in stress_waves
+            ):
+                errors.append("speaker editing dispatch_waves 未遵守 max_parallel=4")
+
+        with tempfile.TemporaryDirectory(prefix="mas-speaker-editing-") as tmpdir:
+            task_dir = Path(tmpdir)
+            write_mas_dispatch_files(bundle, task_dir)
+            bound_bundle, dispatch_manifest = dispatch_context(task_dir)
+            run_id = str(bound_bundle.get("run_id") or "")
+            source_artifact = create_source_manifest(bound_bundle)[0]
+            source_payload = {
+                "run_id": run_id,
+                "task_id": f"{run_id}:main:source_manifest",
+                "dispatch_phase": "pre_draft",
+                "artifact_owner": "Main Orchestrator",
+                "artifact_type": "source_manifest",
+                "artifact": source_artifact,
+            }
+            artifact_dir = task_dir / "artifacts"
+            artifact_dir.mkdir()
+            (artifact_dir / "source_manifest.json").write_text(
+                json.dumps(source_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            invalid_ingest_checked = False
+            semantic_gates_checked = False
+            for task in bound_bundle.get("tasks", []):
+                if not isinstance(task, dict) or task.get("artifact_schema") != "speaker_turn_edit":
+                    continue
+                payload = json.loads(json.dumps(task.get("expected_output_shape"), ensure_ascii=False))
+                if not invalid_ingest_checked:
+                    invalid_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+                    invalid_payload["artifact"]["edited_turns"] = []
+                    invalid_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                        invalid_payload,
+                        task_dir,
+                        through_phase="editing",
+                    )
+                    invalid_path = artifact_dir / f"{task.get('artifact_type')}.json"
+                    if invalid_result.get("ok") or invalid_path.exists():
+                        errors.append("缺 turn 的 speaker edit artifact 未在 ingest 落盘前拒绝")
+                    if not any(
+                        "task_context" in str(item)
+                        for item in invalid_result.get("errors", [])
+                    ):
+                        errors.append("speaker edit ingest 拒绝未指出 task_context 绑定失败")
+                    invalid_ingest_checked = True
+                if not semantic_gates_checked:
+                    inserted_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+                    inserted_payload["artifact"]["edited_turns"][0]["edited_text"] += "新增结论"
+                    inserted_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                        inserted_payload,
+                        task_dir,
+                        through_phase="editing",
+                    )
+                    if inserted_result.get("ok") or not any(
+                        "只能删除原文" in str(item)
+                        for item in inserted_result.get("errors", [])
+                    ):
+                        errors.append("speaker edit 新增内容字符未在 ingest 拒绝")
+
+                    protected_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+                    protected_turn = protected_payload["artifact"]["edited_turns"][0]
+                    protected_turn["edited_text"] = str(protected_turn["edited_text"]).replace("我觉得", "")
+                    protected_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                        protected_payload,
+                        task_dir,
+                        through_phase="editing",
+                    )
+                    if protected_result.get("ok") or not any(
+                        "丢失受保护" in str(item)
+                        for item in protected_result.get("errors", [])
+                    ):
+                        errors.append("speaker edit 删除第一人称/限定词未在 ingest 拒绝")
+
+                    repeated_protected_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+                    repeated_turn = repeated_protected_payload["artifact"]["edited_turns"][0]
+                    repeated_turn["edited_text"] = str(repeated_turn["edited_text"]).replace("可能", "", 1)
+                    repeated_protected_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                        repeated_protected_payload,
+                        task_dir,
+                        through_phase="editing",
+                    )
+                    if repeated_protected_result.get("ok") or not any(
+                        "可能(-1)" in str(item)
+                        for item in repeated_protected_result.get("errors", [])
+                    ):
+                        errors.append("speaker edit 重复受保护词逐次丢失未在 ingest 拒绝")
+
+                    negation_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+                    negation_turn = negation_payload["artifact"]["edited_turns"][0]
+                    negation_turn["edited_text"] = str(negation_turn["edited_text"]).replace("不", "", 1)
+                    negation_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                        negation_payload,
+                        task_dir,
+                        through_phase="editing",
+                    )
+                    if negation_result.get("ok") or not any(
+                        "不(-1)" in str(item)
+                        for item in negation_result.get("errors", [])
+                    ):
+                        errors.append("speaker edit 单字否定丢失未在 ingest 拒绝")
+
+                    filler_heavy_source = "嗯，" * 15 + "我们继续观察订单变化和盈利兑现情况。"
+                    filler_heavy_errors = speaker_edit_content_errors(
+                        "speaker_turn_edit__synthetic__part_01",
+                        "turn_synthetic",
+                        filler_heavy_source,
+                        {
+                            "edited_text": "我们继续观察订单变化和盈利兑现情况。",
+                            "removed_fillers": ["嗯，" * 15],
+                        },
+                    )
+                    if any("内容保留率" in item for item in filler_heavy_errors):
+                        errors.append("高 filler 脏稿的明确纯 filler 删除被 retention gate 误拒绝")
+                    overlapping_credit_errors = speaker_edit_content_errors(
+                        "speaker_turn_edit__synthetic__part_01",
+                        "turn_synthetic_overlap",
+                        "嗯" * 10 + "这是需要完整保留的正文内容和原因链以及后续动作。",
+                        {
+                            "edited_text": "正文动作",
+                            "removed_fillers": ["嗯" * count for count in range(1, 11)],
+                        },
+                    )
+                    if not any("内容保留率" in item for item in overlapping_credit_errors):
+                        errors.append("removed_fillers 嵌套片段重复领取 retention credit 未被拒绝")
+                    repeated_negation_filler_errors = speaker_edit_content_errors(
+                        "speaker_turn_edit__synthetic__part_01",
+                        "turn_synthetic_repeated_negation",
+                        "不断不断，行业景气仍然较高。",
+                        {
+                            "edited_text": "行业景气仍然较高。",
+                            "removed_fillers": ["不断不断，"],
+                        },
+                    )
+                    if repeated_negation_filler_errors:
+                        errors.append("安全重复 filler 中的否定字被 protected gate 误拒绝")
+
+                    low_retention_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+                    low_retention_payload["artifact"]["edited_turns"][0]["edited_text"] = "需求较强"
+                    low_retention_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                        low_retention_payload,
+                        task_dir,
+                        through_phase="editing",
+                    )
+                    if low_retention_result.get("ok") or not any(
+                        "内容保留率" in str(item)
+                        for item in low_retention_result.get("errors", [])
+                    ):
+                        errors.append("speaker edit 低保留率未在 ingest 拒绝")
+
+                    abstract_filler_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+                    abstract_filler_payload["artifact"]["edited_turns"][0]["removed_fillers"] = [
+                        "语气词及冗余句式"
+                    ]
+                    abstract_filler_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                        abstract_filler_payload,
+                        task_dir,
+                        through_phase="editing",
+                    )
+                    if abstract_filler_result.get("ok") or not any(
+                        "逐字引用原文" in str(item)
+                        for item in abstract_filler_result.get("errors", [])
+                    ):
+                        errors.append("speaker edit 抽象 removed_fillers 未在 ingest 拒绝")
+                    semantic_gates_checked = True
+                artifact = payload.get("artifact", {})
+                for turn in artifact.get("edited_turns", []):
+                    if isinstance(turn, dict):
+                        edited = str(turn.get("edited_text") or "")
+                        for filler in ("嗯，那个，", "呃，", "然后然后，"):
+                            edited = edited.replace(filler, "")
+                        turn["edited_text"] = edited
+                        turn["removed_fillers"] = [
+                            filler.rstrip("，")
+                            for filler in ("嗯，那个，", "呃，", "然后然后，")
+                            if filler in str(
+                                next(
+                                    (
+                                        source.get("text")
+                                        for source in speaker_manifest.get("turns", [])
+                                        if isinstance(source, dict)
+                                        and source.get("turn_id") == turn.get("turn_id")
+                                    ),
+                                    "",
+                                )
+                            )
+                        ]
+                ingest_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                    payload,
+                    task_dir,
+                    through_phase="editing",
+                )
+                if not ingest_result.get("ok"):
+                    errors.append(
+                        "speaker edit artifact ingest 失败: "
+                        + "; ".join(str(item) for item in ingest_result.get("errors", []))
+                    )
+
+            before_assembly = collect_mas_run(task_dir, through_phase="editing")
+            if before_assembly.get("next_action", {}).get("type") != "assemble_edited_turns_before_draft_review":
+                errors.append("全部 speaker edit 到齐后未进入主流程组装 gate")
+            try:
+                assembly = assemble_speaker_turn_edits(task_dir)
+            except Exception as exc:
+                errors.append(f"speaker edit assembly 失败: {exc}")
+                assembly = {}
+            after_assembly = collect_mas_run(task_dir, through_phase="editing")
+            if not after_assembly.get("ok"):
+                errors.append(
+                    "speaker edit assembly receipt 未通过 collector: "
+                    + "; ".join(str(item) for item in after_assembly.get("errors", []))
+                )
+            working_path = Path(str(assembly.get("working_draft") or ""))
+            if working_path.is_file():
+                working_text = working_path.read_text(encoding="utf-8")
+                for forbidden in ("嗯，那个，", "呃，", "然后然后，"):
+                    if forbidden in working_text:
+                        errors.append(f"speaker edit 工作稿仍保留目标 filler: {forbidden}")
+                preserved = ("我觉得需求还是比较强", "我们没有减仓", "当前仓位是两成", "我不会加仓")
+                if any(term not in working_text for term in preserved):
+                    errors.append("speaker edit 工作稿丢失第一人称、否定、数字或条件")
+                positions = [working_text.find(term) for term in preserved]
+                if positions != sorted(positions) or any(position < 0 for position in positions):
+                    errors.append("speaker edit 工作稿未按全局 sequence 组装")
+            else:
+                errors.append("speaker edit assembly 未生成工作稿")
+
+            first_edit_path = artifact_dir / f"{edit_types[0]}.json"
+            if first_edit_path.is_file():
+                replaced = json.loads(first_edit_path.read_text(encoding="utf-8"))
+                replaced["artifact"]["edited_turns"][0]["edited_text"] += "。"
+                first_edit_path.write_text(
+                    json.dumps(replaced, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                stale_summary = collect_mas_run(task_dir, through_phase="editing")
+                if stale_summary.get("ok") or not any(
+                    "edit_artifact_digest" in str(item)
+                    for item in stale_summary.get("errors", [])
+                ):
+                    errors.append("speaker edit artifact 变化后旧 assembly receipt 未失效")
+
+            forbidden_payload = json.loads(
+                json.dumps(
+                    next(
+                        task.get("expected_output_shape")
+                        for task in bound_bundle.get("tasks", [])
+                        if isinstance(task, dict) and task.get("artifact_schema") == "speaker_turn_edit"
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+            forbidden_payload["artifact"]["final_markdown"] = "# forbidden"
+            forbidden_result = validate_mas_artifacts_payload(forbidden_payload)
+            if forbidden_result.get("ok"):
+                errors.append("speaker edit artifact 携带 final_markdown 未被拒绝")
+
+        result = {
+            "ok": not errors,
+            "errors": errors,
+            "warnings": warnings,
+            "turn_count": speaker_manifest.get("turn_count"),
+            "shard_count": speaker_manifest.get("shard_count"),
+        }
     elif case.get("check") == "mas_task_bundle":
         request_payload = json.loads(file_path.read_text(encoding="utf-8"))
         if not isinstance(request_payload, dict):
@@ -946,7 +1375,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 manifest_paths.append(path_name)
                 if not (Path(tmpdir) / path_name).exists():
                     errors.append(f"dispatch_manifest task file path 不存在: {path_name}")
-                if str(item.get("dispatch_phase") or "") not in {"pre_draft", "draft_review", "final_verification"}:
+                if str(item.get("dispatch_phase") or "") not in {"pre_draft", "editing", "draft_review", "final_verification"}:
                     errors.append(f"dispatch_manifest task dispatch_phase 不合法: {item.get('dispatch_phase')}")
             actual_names = [path.name for path in task_files]
             if manifest_paths != actual_names:

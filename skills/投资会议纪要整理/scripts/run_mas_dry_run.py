@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from build_mas_task_bundle import build_bundle_from_request, validate_bundle, write_dispatch_files
+from assemble_speaker_turn_edits import assemble_speaker_turn_edits
 from collect_mas_artifacts import collect_mas_run, merge_artifact_files, required_artifacts_for_phase
 from record_mas_main_actions import record_main_actions
 from validate_mas_artifacts import file_sha256
 
-PHASES = ("pre_draft", "draft_review", "final_verification")
+PHASES = ("pre_draft", "editing", "draft_review", "final_verification")
 DRY_RUN_MARKER = ".mas-dry-run-marker"
 
 
@@ -115,6 +116,13 @@ def artifact_identity(manifest: dict[str, Any], artifact_type: str) -> dict[str,
             "dispatch_phase": "pre_draft",
             "artifact_owner": "Main Orchestrator",
         }
+    if artifact_type == "editing_assembly_receipt":
+        return {
+            "run_id": run_id,
+            "task_id": f"{run_id}:main:editing_assembly_receipt",
+            "dispatch_phase": "editing",
+            "artifact_owner": "Main Orchestrator",
+        }
     for task in manifest.get("task_files", []):
         if not isinstance(task, dict):
             continue
@@ -201,10 +209,28 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
         for artifact_type in required_now:
             if artifact_type in emitted_artifacts:
                 continue
-            if artifact_type not in fixture_artifacts:
+            if artifact_type == "editing_assembly_receipt":
+                continue
+            if artifact_type in fixture_artifacts:
+                artifact = copy.deepcopy(fixture_artifacts[artifact_type])
+            elif artifact_type.startswith("speaker_turn_edit__"):
+                task = next(
+                    (
+                        item
+                        for item in bundle.get("tasks", [])
+                        if isinstance(item, dict) and item.get("artifact_type") == artifact_type
+                    ),
+                    None,
+                )
+                shape = task.get("expected_output_shape") if isinstance(task, dict) else None
+                artifact = shape.get("artifact") if isinstance(shape, dict) else None
+                if not isinstance(artifact, dict):
+                    errors.append(f"MAS dry-run cannot synthesize speaker edit artifact: {artifact_type}")
+                    continue
+                artifact = copy.deepcopy(artifact)
+            else:
                 errors.append(f"MAS dry-run fixture missing artifact: {artifact_type}")
                 continue
-            artifact = copy.deepcopy(fixture_artifacts[artifact_type])
             if artifact_type == "export_manifest" and isinstance(artifact, dict):
                 artifact["markdown_path"] = str(synthetic_markdown)
                 artifact["markdown_sha256"] = file_sha256(synthetic_markdown)
@@ -213,6 +239,19 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
             emitted_artifacts.add(artifact_type)
             emitted_this_phase.append(artifact_type)
             artifact_files.append({"artifact_type": artifact_type, "path": str(artifact_path)})
+        if phase == "editing" and "editing_assembly_receipt" in required_now:
+            try:
+                assembly_result = assemble_speaker_turn_edits(task_dir)
+                emitted_artifacts.add("editing_assembly_receipt")
+                emitted_this_phase.append("editing_assembly_receipt")
+                artifact_files.append(
+                    {
+                        "artifact_type": "editing_assembly_receipt",
+                        "path": str(assembly_result["receipt"]),
+                    }
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                errors.append(f"MAS dry-run speaker edit assembly failed: {exc}")
 
         summary = collect_mas_run(task_dir, through_phase=phase)
         summary_path = task_dir / f"mas_run_summary.{phase}.json"

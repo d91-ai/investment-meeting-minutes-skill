@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shlex
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,7 @@ MAIN_ACTION_SPECS: dict[str, dict[str, Any]] = {
         "output": "next main-workflow step",
     },
 }
+MAX_TASKS_PER_AGENT_BATCH = 6
 
 
 def read_json(path: Path) -> Any:
@@ -143,9 +145,16 @@ def prompt_path(task_dir: Path, relative_path: str) -> str:
     return str(task_dir / path)
 
 
+def speaker_edit_assembly_command(task_dir: Path) -> str:
+    script_path = Path(__file__).with_name("assemble_speaker_turn_edits.py")
+    return quote_command(["python3", str(script_path), str(task_dir), "--json"])
+
+
 def plan_status_for(action_type: str) -> str:
     if action_type == "collect_or_dispatch_phase_artifacts":
         return "dispatch_or_collect_phase"
+    if action_type == "assemble_edited_turns_before_draft_review":
+        return "assemble_speaker_turns"
     if action_type in {
         "repair_missing_artifacts",
         "repair_invalid_or_duplicate_artifacts",
@@ -184,7 +193,78 @@ def main_action_checklist(main_actions: list[str]) -> list[dict[str, Any]]:
     return checklist
 
 
-def plan_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
+def build_speaker_edit_batches(
+    dispatch_tasks: list[dict[str, str]],
+    max_parallel: int,
+) -> list[dict[str, Any]]:
+    if max_parallel < 1 or max_parallel > 8:
+        raise ValueError("max_parallel 必须在 1 到 8 之间")
+    if len(dispatch_tasks) < 2 or any(
+        task.get("dispatch_phase") != "editing"
+        or not task.get("artifact_type", "").startswith("speaker_turn_edit__")
+        for task in dispatch_tasks
+    ):
+        return []
+
+    weighted: list[tuple[int, str, dict[str, str]]] = []
+    for task in dispatch_tasks:
+        prompt = Path(task["prompt_path"])
+        try:
+            weight = prompt.stat().st_size
+        except OSError:
+            weight = 0
+        weighted.append((weight, task["artifact_type"], task))
+    weighted.sort(key=lambda item: (-item[0], item[1]))
+
+    batch_count = math.ceil(len(weighted) / MAX_TASKS_PER_AGENT_BATCH)
+    bins = [
+        {
+            "batch_id": f"editing_batch_{index + 1:02d}",
+            "total_prompt_bytes": 0,
+            "tasks": [],
+        }
+        for index in range(batch_count)
+    ]
+    for weight, _, task in weighted:
+        available_bins = [
+            batch
+            for batch in bins
+            if len(batch["tasks"]) < MAX_TASKS_PER_AGENT_BATCH
+        ]
+        target = min(
+            available_bins,
+            key=lambda batch: (
+                int(batch["total_prompt_bytes"]),
+                len(batch["tasks"]),
+                str(batch["batch_id"]),
+            ),
+        )
+        target["tasks"].append(task)
+        target["total_prompt_bytes"] = int(target["total_prompt_bytes"]) + weight
+    for batch in bins:
+        batch["tasks"].sort(key=lambda task: task["artifact_type"])
+        if len(batch["tasks"]) > MAX_TASKS_PER_AGENT_BATCH:
+            raise ValueError("speaker editing agent batch 超过单 agent task 上限")
+    return bins
+
+
+def build_dispatch_waves(
+    dispatch_batches: list[dict[str, Any]],
+    max_parallel: int,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "wave_id": f"editing_wave_{index // max_parallel + 1:02d}",
+            "batch_ids": [
+                str(batch["batch_id"])
+                for batch in dispatch_batches[index : index + max_parallel]
+            ],
+        }
+        for index in range(0, len(dispatch_batches), max_parallel)
+    ]
+
+
+def plan_from_summary(summary: dict[str, Any], max_parallel: int = 4) -> dict[str, Any]:
     errors: list[str] = []
     if summary.get("schema_version") != "1.0":
         errors.append(f"MAS run summary schema_version 不符合预期: {summary.get('schema_version')}")
@@ -228,18 +308,41 @@ def plan_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
     main_actions = [str(item) for item in next_action.get("main_actions", []) if str(item)]
     checklist = main_action_checklist(main_actions)
     repair_errors = [str(item) for item in next_action.get("errors", []) if str(item)]
+    dispatch_batches = build_speaker_edit_batches(dispatch_tasks, max_parallel)
+    dispatch_waves = build_dispatch_waves(dispatch_batches, max_parallel)
 
     recommended_steps: list[dict[str, Any]] = []
     if action_type == "collect_or_dispatch_phase_artifacts":
+        if dispatch_batches:
+            for batch in dispatch_batches:
+                recommended_steps.append(
+                    {
+                        "action": "dispatch_subagent_batch",
+                        "batch_id": batch["batch_id"],
+                        "wave_id": next(
+                            wave["wave_id"]
+                            for wave in dispatch_waves
+                            if batch["batch_id"] in wave["batch_ids"]
+                        ),
+                        "role": "Speaker Turn Editor",
+                        "prompt_paths": [
+                            task["prompt_path"]
+                            for task in batch["tasks"]
+                        ],
+                        "return_contract": "one independent JSON return per prompt/task identity",
+                    }
+                )
+        else:
+            for task in dispatch_tasks:
+                recommended_steps.append(
+                    {
+                        "action": "dispatch_subagent_prompt",
+                        "artifact_type": task["artifact_type"],
+                        "role": task["role"],
+                        "prompt_path": task["prompt_path"],
+                    }
+                )
         for task in dispatch_tasks:
-            recommended_steps.append(
-                {
-                    "action": "dispatch_subagent_prompt",
-                    "artifact_type": task["artifact_type"],
-                    "role": task["role"],
-                    "prompt_path": task["prompt_path"],
-                }
-            )
             recommended_steps.append(
                 {
                     "action": "ingest_returned_artifact",
@@ -259,6 +362,20 @@ def plan_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
             {
                 "action": "run_collector_after_phase_inputs",
                 "command": collector_command(task_dir, phase_for_commands),
+            }
+        )
+    elif action_type == "assemble_edited_turns_before_draft_review":
+        recommended_steps.append(
+            {
+                "action": "assemble_edited_turns_before_draft_review",
+                "owner": "Main Orchestrator",
+                "command": speaker_edit_assembly_command(task_dir),
+            }
+        )
+        recommended_steps.append(
+            {
+                "action": "run_collector_after_speaker_edit_assembly",
+                "command": collector_command(task_dir, "editing"),
             }
         )
     elif action_type in {
@@ -325,6 +442,10 @@ def plan_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "phase": phase,
         "plan_status": plan_status_for(action_type),
         "dispatch_tasks": dispatch_tasks,
+        "dispatch_batches": dispatch_batches,
+        "dispatch_waves": dispatch_waves,
+        "max_parallel": max_parallel,
+        "max_tasks_per_agent_batch": MAX_TASKS_PER_AGENT_BATCH,
         "main_owned_missing_artifacts": main_owned_missing,
         "missing_artifacts": missing_artifacts,
         "repair_errors": repair_errors,
@@ -355,13 +476,14 @@ def main() -> int:
     parser.add_argument("--summary-json", help="直接读取 collect_mas_artifacts.py 输出的 run summary")
     parser.add_argument("--artifact-dir", help="artifact JSON 目录；仅在从 task_dir 现场收集时使用")
     parser.add_argument("--through-phase", choices=sorted(PHASE_ORDER), help="现场收集时只校验截至指定 phase")
+    parser.add_argument("--max-parallel", type=int, default=4, help="speaker editing 并发 agent 槽位（1-8，默认 4）")
     parser.add_argument("--out", help="写入 next-action plan JSON")
     parser.add_argument("--json", action="store_true", help="输出 JSON；默认也是 JSON")
     args = parser.parse_args()
 
     try:
         summary = load_summary(args)
-        result = plan_from_summary(summary)
+        result = plan_from_summary(summary, max_parallel=args.max_parallel)
     except Exception as exc:
         result = {
             "schema_version": "1.0",

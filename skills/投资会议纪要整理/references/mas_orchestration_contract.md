@@ -92,6 +92,24 @@
 检查：
 - 总结化、第三人称改写、删减原因链/数字/时间/仓位动作/不确定表达、合并多轮发言、改变发言顺序。
 
+### Speaker Turn Editor
+
+输入：
+- 主流程从未编辑正文源生成的 `speaker_turn_manifest`。
+- 只属于一个 speaker 的一个 shard；同一 speaker 过长时允许拆成多个 shard。
+
+输出：
+- 当前任务唯一的 `speaker_turn_edit__speaker_###__part_##` JSON artifact。
+
+检查与边界：
+- 只删除纯语气词、无意义重复、重复起手式和明显 ASR 噪声；除标点和空白规范化外，`edited_text` 的内容字符必须是原文内容字符的子序列。
+- 禁止新增、替换、重排、规范化或猜测修复实体、术语、数字、日期、代码、单位、方向和结论。
+- 必须保留第一人称、否定、不确定程度、判断强度、条件、数字、时间、仓位动作和原因链。
+- `removed_fillers` 必须逐字引用实际删除的原文片段，不得填写抽象清理类别。
+- 每个已分配 `turn_id` 恰好返回一次，且 `sequence`、`speaker_id`、`source_sha256` 不变。
+- 不得合并、遗漏、重排或新增 turn，不得输出或修改 Markdown。
+- 不确定实体不得静默标准化；保留原词并写入 `doubtful_fragments`。
+
 ### Contract Verifier
 
 输入：
@@ -113,6 +131,12 @@ Every specialist return uses a dispatch-bound envelope with:
 - `artifact_type` + `artifact`, or `artifacts` for the exact primary/secondary artifact set assigned to that task.
 
 The ingest and collector layers must reject stale-run, cross-task, cross-phase, cross-owner, unexpected, or incomplete task returns. `task_artifact_set` and `ingested_split` are reserved fields and must never appear in a returned or collected artifact; the collector derives the allowed primary/secondary set from the bound dispatch manifest.
+
+`speaker_editing_mode=auto|skip|full` is a bundle-level routing decision, not an artifact schema. `auto` may resolve to `skip` only when the current source name/material records an explicit reviewed marker and the manifest text has low high-confidence-filler density. `skip` retains the manifest and routing metrics but produces no edit artifact or assembly receipt. `full` uses the existing shard artifacts.
+
+`speaker_turn_edit` is a shared schema, not a reusable artifact key. Every shard must have a unique safe key such as `speaker_turn_edit__speaker_001__part_01`; the existing one-producer-per-key rule, duplicate detection, transactional ingest, and exact task identity remain unchanged. Ingest must reject non-deletion content edits, protected-number/code/viewpoint/uncertainty/action loss, content retention below the configured threshold, and non-verbatim `removed_fillers`. The collector must compare the full shard set with `speaker_turn_manifest`, reject missing/duplicate/foreign turns or changed sequence/hash/speaker identity, and require `status=complete`.
+
+After all edit artifacts pass, the Main Orchestrator runs `assemble_speaker_turn_edits.py`. The script assembles only by global `sequence` and creates main-owned `editing_assembly_receipt` bound to the manifest hash, current edit-artifact digest, ordered turn IDs, working-draft path, and working-draft hash. Missing or stale receipt blocks `draft_review`; replacing any edit artifact invalidates the prior receipt.
 
 ### source_manifest
 
@@ -231,6 +255,7 @@ Add the relevant risk-specific specialists when any risk is present:
 - Numerous non-person business doubtful items.
 - High-risk public facts such as company codes, customers, orders, capacity, revenue, profit, valuation, policies, events, dates, or models; or source-fidelity risk around speaker investment actions. Public facts require external evidence, while buy/sell/add/reduce/tracking actions are verified against the current-session source span unless the action embeds a public entity, ticker, or event.
 - Prior user feedback indicates summary compression, third-person rewrite, omission, missed verification, or target-attribution drift.
+- Long transcript, multi-speaker weekly meeting, filler-heavy source, or prior filler-retention failure. These require `speaker_turn_manifest` and the `editing` phase; a risk flag without a manifest fails closed.
 
 For short, clean `fast_document` work with none of the above risks, keep the base MAS artifacts and Contract Verifier only; do not dispatch risk-specific specialists.
 
@@ -246,8 +271,9 @@ Accepted `risk_flags` are explicit and unknown tokens fail fast:
 - Entity/public fact: `entity_verification`, `high_risk_facts`, `many_doubtful_items`, `company_codes`, `customers_suppliers`, `numbers_dates`.
 - Target attribution: `target_attribution`, `multi_target`, `mixed_targets`, `positive_negative_views`.
 - Fidelity: `fidelity_review`, `omission_risk`, `summary_compression`, `third_person_rewrite`, `prior_user_feedback`.
+- Speaker editing: `speaker_turn_editing`, `long_transcript`, `filler_cleanup`.
 
-Artifact selection is incremental rather than all-specialist by default. Every active MAS run keeps main-owned `source_manifest` plus final `export_manifest`; audio risks add `transcript_audit`, source-selection risks add `source_reconciliation` and `fidelity_review`, entity/public-fact risks add `entity_verification_report` plus `doubtful_items`, target risks add `target_attribution_review`, and fidelity risks add `fidelity_review`. `audio_only` must use `strict_audio`, which may reach the full set through its inferred risks. A flags-only CLI call may inspect a plan without materials; `--task-dir`, `--request-json`, or explicit `--material` activates source-coverage validation. Before any prompt files are written, the bundle builder must fail fast when `audio_only` lacks audio, `document_only` lacks a readable body document, or `audio_plus_document` lacks either evidence side; a PDF attachment alone is not a body document.
+Artifact selection is incremental rather than all-specialist by default. Every active MAS run keeps main-owned `source_manifest` plus final `export_manifest`; audio risks add `transcript_audit`, source-selection risks add `source_reconciliation` and `fidelity_review`, entity/public-fact risks add `entity_verification_report` plus `doubtful_items`, target risks add `target_attribution_review`, and fidelity risks add `fidelity_review`. A bound speaker manifest adds one unique edit artifact per shard plus main-owned `editing_assembly_receipt`. `audio_only` must use `strict_audio`, which may reach the full set through its inferred risks. A flags-only CLI call may inspect a plan without materials; `--task-dir`, `--request-json`, or explicit `--material` activates source-coverage validation.
 
 The task bundle must define:
 - That MAS is required for the current run, plus the risk-based specialist selection.
@@ -271,15 +297,30 @@ MAS_DISPATCH="$(mktemp -d /tmp/mas-dispatch.XXXXXX)"
 python3 scripts/build_mas_task_bundle.py --request-json REQUEST.json --task-dir "$MAS_DISPATCH"
 ```
 
+For a speaker-editing run, prepare the unedited source first:
+
+```bash
+python3 scripts/build_speaker_turn_manifest.py SELECTED_TRANSCRIPT.txt \
+  --out "$MAS_DISPATCH/speaker_turn_manifest.json"
+python3 scripts/build_mas_task_bundle.py \
+  --request-json REQUEST.json \
+  --speaker-turn-manifest "$MAS_DISPATCH/speaker_turn_manifest.json" \
+  --speaker-editing-mode auto \
+  --task-dir "$MAS_DISPATCH"
+```
+
+For `audio_plus_document`, do not build this manifest while source selection is unresolved. Complete source comparison first and use `source_selection_status=compared_clear`; a manifest bound to `not_compared`, `conflict`, or `uncertain` fails closed so editors cannot clean the wrong body source.
+
 Use a fresh dispatch directory for each meeting or pilot run. Do not reuse a prior dispatch directory with old `artifacts/` unless the collector has explicitly told you to continue that same run. Use one generated `*.prompt.md` file per specialist subagent. Each subagent should receive only its assigned prompt plus the minimum current-session source materials needed for that role. Do not pass the expected answer, prior diagnosis, or final Markdown draft unless that draft is explicitly required by the role.
 
 Generated task files include a `dispatch_phase`:
 - `pre_draft`: run after current-session source materials are prepared and before final-note drafting. Typical tasks: transcript audit, source reconciliation, entity verification.
+- `editing`: after pre-draft decisions, dispatch deletion-only speaker editors. `plan_mas_next_action.py --max-parallel N` balances at most six prompts into each agent batch, then groups at most `N` agent batches into each dispatch wave while preserving one JSON return per prompt/task identity. When all returns pass, the main workflow runs `assemble_speaker_turn_edits.py`; a valid assembly receipt is required before continuing.
 - `draft_review`: run only after the main workflow has a draft and role-relevant source spans. Typical tasks: target attribution and fidelity review.
 - `final_verification`: run only after final Markdown, sidecars, export logs, and validators exist. Typical task: contract/export verification.
 
 Subagent execution rules:
-- Spawn one process-only specialist per generated prompt file only when that task's `dispatch_phase` is ready.
+- Dispatch one process-only specialist per generated prompt file, or one specialist per generated `dispatch_batches` entry, only when that task's `dispatch_phase` is ready. A batched specialist must still return one independent JSON envelope per prompt.
 - Tasks in the same phase may run in parallel; tasks across phases must wait for their prerequisites.
 - Keep subagents read-only toward repository files and meeting-note files unless a future task explicitly assigns a private artifact output path.
 - Require each subagent to return only the JSON artifact shape requested in its prompt.
@@ -292,7 +333,7 @@ Subagent execution rules:
 - Run `scripts/collect_mas_artifacts.py "$MAS_DISPATCH" --out "$MAS_DISPATCH/mas_run_summary.json" --combined-out "$MAS_DISPATCH/mas_artifacts_collected.json"` to merge artifacts, detect duplicates, check required artifacts from the bundle, validate field structure, produce the decision summary, and emit phase gates plus the next main-workflow action. A pending ingest transaction blocks collection until ingest recovery completes. Consume combined artifacts only when the collector summary has top-level `ok: true`; failed combined outputs are partial diagnostics.
 - Run `scripts/plan_mas_next_action.py --summary-json "$MAS_DISPATCH/mas_run_summary.json" --json` to turn `next_action` into the next executable checklist: prompt files to dispatch, ingest commands to run after returns, main-owned artifact gaps, repair actions, narrow user-confirmation actions, or final `main_action_checklist`.
 - Prefer `scripts/run_mas_phase_operator.py` when operating a live dispatch directory repeatedly. It initializes dispatch files from a request JSON when needed, ingests returned artifact JSON files, and publishes the collector summary, combined artifacts, next-action plan, and `mas_operator_state.json` as one locked artifact generation.
-- For a partial phase gate, pass `--through-phase pre_draft`, `--through-phase draft_review`, or `--through-phase final_verification` so the collector only requires artifacts whose phase is ready.
+- For a partial phase gate, pass `--through-phase pre_draft`, `--through-phase editing`, `--through-phase draft_review`, or `--through-phase final_verification` so the collector only requires artifacts whose phase is ready.
 - Gate on collector top-level `ok`. Treat the embedded `decision` as actionable only when collector output is `ok: true`; otherwise repair/regenerate invalid, duplicate, or missing artifacts before final delivery.
 - Apply final writing, doubtful marking, export, and user-facing decisions only in the Main Orchestrator.
 - If draft-review or doubtful actions can change Markdown, apply them before `final_verification`, run `record_mas_main_actions.py` against that Markdown, then rerun collector. Do not dispatch Contract Verifier until collector accepts the receipt.

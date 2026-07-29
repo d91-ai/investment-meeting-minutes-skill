@@ -9,6 +9,8 @@ import ipaddress
 import json
 import re
 import socket
+import unicodedata
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -66,6 +68,23 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
         "omission_findings",
         "recommended_revisions",
     ],
+    "speaker_turn_edit": [
+        "manifest_sha256",
+        "shard_id",
+        "speaker_id",
+        "input_sha256",
+        "status",
+        "edited_turns",
+        "unresolved_spans",
+    ],
+    "editing_assembly_receipt": [
+        "manifest_sha256",
+        "edit_artifact_digest",
+        "ordered_turn_ids",
+        "assembled_draft_path",
+        "assembled_draft_sha256",
+        "status",
+    ],
     "export_manifest": [
         "markdown_path",
         "markdown_sha256",
@@ -99,6 +118,54 @@ DOUBTFUL_REQUIRED_FIELDS = [
 ALLOWED_DOUBTFUL_TYPES = {"人名", "说话人身份", "公司或证券标的", "行业术语", "数字或时间", "其他业务事实"}
 NON_BUSINESS_DOUBTFUL_TYPES = {"人名", "说话人身份"}
 FORBIDDEN_FINAL_FIELDS = {"final_markdown", "markdown_body", "final_note", "final_body"}
+MIN_SPEAKER_EDIT_CONTENT_RETENTION = 0.90
+PROTECTED_SPEAKER_EDIT_RE = re.compile(
+    r"\d+(?:\.\d+)?%?|[A-Za-z][A-Za-z0-9.+-]*"
+)
+PROTECTED_SPEAKER_EDIT_PHRASES = (
+    "不",
+    "未",
+    "没",
+    "无",
+    "非",
+    "勿",
+    "我觉得",
+    "我认为",
+    "我们认为",
+    "个人认为",
+    "没有",
+    "不会",
+    "不能",
+    "不确定",
+    "可能",
+    "大概",
+    "应该",
+    "预计",
+    "如果",
+    "但凡",
+    "看不太清楚",
+    "也许",
+    "推荐",
+    "看好",
+    "看空",
+    "买入",
+    "加仓",
+    "减仓",
+    "降低仓位",
+    "首推",
+)
+SAFE_FILLER_CONTENT_TOKENS = (
+    "然后然后",
+    "这个这个",
+    "不断不断",
+    "观察观察",
+    "对对",
+    "是是",
+    "嗯",
+    "呃",
+    "啊",
+    "哈",
+)
 BOOLEAN_FIELD_RULES: dict[str, list[str]] = {
     "source_manifest": ["archive_allowed"],
     "source_reconciliation": ["manual_review_required"],
@@ -136,6 +203,8 @@ LIST_FIELD_RULES: dict[str, list[str]] = {
         "omission_findings",
         "recommended_revisions",
     ],
+    "speaker_turn_edit": ["edited_turns", "unresolved_spans"],
+    "editing_assembly_receipt": ["ordered_turn_ids"],
     "export_manifest": ["validators_run", "known_unverified_parts"],
     "main_action_receipt": ["actions"],
 }
@@ -143,6 +212,20 @@ STRING_FIELD_RULES: dict[str, list[str]] = {
     "source_manifest": ["source_mode", "archive_status", "skipped_reason"],
     "transcript_audit": ["asr_primary", "asr_auxiliary", "timestamp_index_status", "recommended_action"],
     "source_reconciliation": ["primary_body_source", "primary_source_reason", "cross_check_source"],
+    "speaker_turn_edit": [
+        "manifest_sha256",
+        "shard_id",
+        "speaker_id",
+        "input_sha256",
+        "status",
+    ],
+    "editing_assembly_receipt": [
+        "manifest_sha256",
+        "edit_artifact_digest",
+        "assembled_draft_path",
+        "assembled_draft_sha256",
+        "status",
+    ],
     "export_manifest": [
         "markdown_path",
         "markdown_sha256",
@@ -180,7 +263,10 @@ PUBLIC_SOURCE_IDS = {
 }
 REQUIRED_VALIDATOR_NAMES = {"validate_utf8_text.py", "validate_meeting_minutes_contract.py"}
 REGRESSION_VALIDATOR_NAME = "run_meeting_minutes_regression.py"
-MAIN_OWNED_ARTIFACTS = {"source_manifest", "main_action_receipt"}
+MAIN_OWNED_ARTIFACTS = {"source_manifest", "editing_assembly_receipt", "main_action_receipt"}
+SPEAKER_TURN_EDIT_PREFIX = "speaker_turn_edit__"
+SPEAKER_TURN_EDIT_STATUSES = {"complete", "blocked"}
+SAFE_DYNAMIC_ARTIFACT = re.compile(r"^speaker_turn_edit__[a-z0-9_]+$")
 SENSITIVE_QUERY_KEYS = {
     "access_token",
     "api_key",
@@ -312,7 +398,7 @@ def artifact_set_digest(artifacts: dict[str, Any]) -> str:
     stable = {
         key: value
         for key, value in artifacts.items()
-        if key not in {"export_manifest", "main_action_receipt"}
+        if key not in {"export_manifest", "editing_assembly_receipt", "main_action_receipt"}
     }
     return canonical_json_digest(stable)
 
@@ -328,6 +414,188 @@ def artifact_mapping(payload: Any) -> tuple[dict[str, Any], list[str]]:
             return {artifact_type: payload["artifact"]}, []
         return {artifact_type: {key: value for key, value in payload.items() if key != "artifact_type"}}, []
     return {}, ["MAS artifact 文件必须包含 artifacts object 或 artifact_type"]
+
+
+def artifact_schema_name(artifact_type: str) -> str:
+    if artifact_type.startswith(SPEAKER_TURN_EDIT_PREFIX):
+        return "speaker_turn_edit"
+    return artifact_type
+
+
+def content_characters(value: str) -> str:
+    return "".join(
+        character
+        for character in value
+        if not unicodedata.category(character).startswith(("P", "Z"))
+        and not character.isspace()
+    )
+
+
+def is_subsequence(candidate: str, source: str) -> bool:
+    source_index = 0
+    for character in candidate:
+        source_index = source.find(character, source_index)
+        if source_index < 0:
+            return False
+        source_index += 1
+    return True
+
+
+def protected_speaker_edit_items(value: str) -> Counter[str]:
+    protected = Counter(PROTECTED_SPEAKER_EDIT_RE.findall(value))
+    for phrase in PROTECTED_SPEAKER_EDIT_PHRASES:
+        count = value.count(phrase)
+        if count:
+            protected[phrase] += count
+    return protected
+
+
+def safe_filler_content_length(value: str) -> int:
+    content = content_characters(value)
+    remaining = content
+    for token in SAFE_FILLER_CONTENT_TOKENS:
+        remaining = remaining.replace(token, "")
+    return len(content) if content and not remaining else 0
+
+
+def deleted_content_segments(source: str, candidate: str) -> list[str]:
+    segments: list[str] = []
+    buffer: list[str] = []
+    candidate_index = 0
+    for character in source:
+        if candidate_index < len(candidate) and character == candidate[candidate_index]:
+            if buffer:
+                segments.append("".join(buffer))
+                buffer = []
+            candidate_index += 1
+        else:
+            buffer.append(character)
+    if buffer:
+        segments.append("".join(buffer))
+    return segments if candidate_index == len(candidate) else []
+
+
+def speaker_edit_content_errors(
+    artifact_type: str,
+    turn_id: str,
+    source_text: str,
+    returned: dict[str, Any],
+) -> list[str]:
+    edited_text = str(returned.get("edited_text") or "")
+    source_content = content_characters(source_text)
+    edited_content = content_characters(edited_text)
+    errors: list[str] = []
+    path = f"{artifact_type}.{turn_id}"
+    if not is_subsequence(edited_content, source_content):
+        errors.append(
+            f"{path}.edited_text 包含新增、替换或重排的内容字符；speaker 编辑只能删除原文"
+        )
+    removed_fillers = returned.get("removed_fillers")
+    safe_deleted_segments: list[str] = []
+    if isinstance(removed_fillers, list):
+        declared_fillers = Counter(
+            content_characters(filler)
+            for filler in removed_fillers
+            if isinstance(filler, str) and filler
+        )
+        for segment in deleted_content_segments(source_content, edited_content):
+            if (
+                declared_fillers[segment] > 0
+                and safe_filler_content_length(segment) == len(segment)
+            ):
+                safe_deleted_segments.append(segment)
+                declared_fillers[segment] -= 1
+    safe_removed_chars = sum(len(segment) for segment in safe_deleted_segments)
+    if len(source_content) >= 30:
+        adjusted_edited_chars = min(
+            len(source_content),
+            len(edited_content) + safe_removed_chars,
+        )
+        retention = adjusted_edited_chars / len(source_content)
+        if retention < MIN_SPEAKER_EDIT_CONTENT_RETENTION:
+            errors.append(
+                f"{path}.edited_text 扣除明确纯 filler 后的内容保留率 {retention:.3f} 低于 "
+                f"{MIN_SPEAKER_EDIT_CONTENT_RETENTION:.2f}，必须恢复原文或重新派发"
+            )
+    source_protected = protected_speaker_edit_items(source_text)
+    edited_protected = protected_speaker_edit_items(edited_text)
+    safe_deleted_protected: Counter[str] = Counter()
+    for segment in safe_deleted_segments:
+        safe_deleted_protected.update(protected_speaker_edit_items(segment))
+    missing_protected = sorted(
+        (
+            token,
+            count - edited_protected[token] - safe_deleted_protected[token],
+        )
+        for token, count in source_protected.items()
+        if edited_protected[token] + safe_deleted_protected[token] < count
+    )
+    if missing_protected:
+        errors.append(
+            f"{path}.edited_text 丢失受保护的数字、代码、视角、限定词或动作: "
+            + ", ".join(
+                f"{token}(-{missing_count})"
+                for token, missing_count in missing_protected
+            )
+        )
+    if isinstance(removed_fillers, list):
+        for filler in removed_fillers:
+            if isinstance(filler, str) and filler and filler not in source_text:
+                errors.append(
+                    f"{path}.removed_fillers 必须逐字引用原文删除片段: {filler}"
+                )
+    return errors
+
+
+def validate_speaker_edit_task_context(
+    artifact_type: str,
+    artifact: Any,
+    task: dict[str, Any],
+) -> list[str]:
+    if artifact_schema_name(artifact_type) != "speaker_turn_edit":
+        return []
+    if not isinstance(artifact, dict):
+        return [f"{artifact_type} 必须是 JSON object"]
+    context = task.get("task_context")
+    if not isinstance(context, dict):
+        return [f"{artifact_type} dispatch task 缺少 task_context"]
+    errors: list[str] = []
+    for field in ("manifest_sha256", "shard_id", "speaker_id", "input_sha256"):
+        if artifact.get(field) != context.get(field):
+            errors.append(f"{artifact_type}.{field} 与 dispatch task_context 不一致")
+    expected_turns = {
+        str(turn.get("turn_id") or ""): turn
+        for turn in context.get("turns", [])
+        if isinstance(turn, dict)
+    }
+    returned_turns = artifact.get("edited_turns")
+    if not isinstance(returned_turns, list):
+        return errors
+    returned_by_id = {
+        str(turn.get("turn_id") or ""): turn
+        for turn in returned_turns
+        if isinstance(turn, dict)
+    }
+    if len(returned_by_id) != len(returned_turns):
+        errors.append(f"{artifact_type}.edited_turns turn_id 必须唯一")
+    if set(returned_by_id) != set(expected_turns):
+        errors.append(f"{artifact_type}.edited_turns 必须恰好覆盖 dispatch task_context turns")
+    for turn_id in sorted(set(returned_by_id) & set(expected_turns)):
+        returned = returned_by_id[turn_id]
+        expected = expected_turns[turn_id]
+        for field in ("sequence", "speaker_id", "source_sha256"):
+            if returned.get(field) != expected.get(field):
+                errors.append(f"{artifact_type}.{turn_id}.{field} 与 dispatch task_context 不一致")
+        if artifact.get("status") == "complete":
+            errors.extend(
+                speaker_edit_content_errors(
+                    artifact_type,
+                    turn_id,
+                    str(expected.get("text") or ""),
+                    returned,
+                )
+            )
+    return errors
 
 
 def validate_dispatch_identity(
@@ -377,6 +645,7 @@ def validate_dispatch_identity(
             errors.append("Main-owned MAS artifact task_id 与当前 run/artifact 不匹配")
         expected_phase_by_type = {
             "source_manifest": "pre_draft",
+            "editing_assembly_receipt": "editing",
             "main_action_receipt": "draft_review",
         }
         expected_phases = {expected_phase_by_type[artifact_type] for artifact_type in artifact_types}
@@ -402,6 +671,12 @@ def validate_dispatch_identity(
     if len(matched) != 1:
         return errors + [f"MAS artifact task_id 未唯一匹配当前 dispatch task: {task_id}"]
     task = matched[0]
+    bundle_task_matches = [
+        item
+        for item in bundle.get("tasks", [])
+        if isinstance(item, dict) and str(item.get("task_id") or "") == task_id
+    ]
+    context_task = bundle_task_matches[0] if len(bundle_task_matches) == 1 else task
     task_run_id = str(task.get("run_id") or "")
     if task_run_id != expected_run_id:
         errors.append(
@@ -423,6 +698,8 @@ def validate_dispatch_identity(
             "MAS artifact 文件包含 task 权限之外的 artifact: "
             f"expected={sorted(expected_types)} actual={sorted(artifact_types)}"
         )
+    for artifact_type, artifact in artifacts.items():
+        errors.extend(validate_speaker_edit_task_context(str(artifact_type), artifact, context_task))
     if dispatch_phase != expected_phase:
         errors.append(f"MAS artifact dispatch_phase 不匹配: expected={expected_phase} actual={dispatch_phase}")
     if owner != expected_owner:
@@ -506,6 +783,7 @@ def validate_dispatch_context(bundle: Any, manifest: Any) -> list[str]:
         for field, left, right in [
             ("run_id", str(task.get("run_id") or ""), str(manifest_task.get("run_id") or "")),
             ("artifact_type", task_artifact, str(manifest_task.get("artifact_type") or "")),
+            ("artifact_schema", str(task.get("artifact_schema") or ""), str(manifest_task.get("artifact_schema") or "")),
             ("dispatch_phase", str(task.get("dispatch_phase") or ""), str(manifest_task.get("dispatch_phase") or "")),
             ("artifact_owner", task_owner, manifest_owner),
         ]:
@@ -570,6 +848,85 @@ def validate_field_types(artifact_type: str, artifact: Any) -> list[str]:
             not isinstance(value, int) or isinstance(value, bool) or value <= 0
         ):
             errors.append(f"{artifact_type}.{field} 必须是正整数")
+    return errors
+
+
+def validate_speaker_turn_edit(artifact_type: str, artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    errors: list[str] = []
+    if not SAFE_DYNAMIC_ARTIFACT.fullmatch(artifact_type):
+        errors.append(f"{artifact_type} 动态 artifact key 不安全")
+    for field in ("manifest_sha256", "input_sha256"):
+        value = str(artifact.get(field) or "")
+        if not HEX_SHA256.fullmatch(value):
+            errors.append(f"{artifact_type}.{field} 必须是小写 SHA-256")
+    if artifact.get("status") not in SPEAKER_TURN_EDIT_STATUSES:
+        errors.append(f"{artifact_type}.status 必须是 complete 或 blocked")
+    edited_turns = artifact.get("edited_turns")
+    if isinstance(edited_turns, list):
+        seen_turn_ids: set[str] = set()
+        seen_sequences: set[int] = set()
+        for index, turn in enumerate(edited_turns, start=1):
+            path = f"{artifact_type}.edited_turns[{index}]"
+            if not isinstance(turn, dict):
+                errors.append(f"{path} 必须是 JSON object")
+                continue
+            required = {
+                "turn_id",
+                "sequence",
+                "speaker_id",
+                "source_sha256",
+                "edited_text",
+                "removed_fillers",
+                "doubtful_fragments",
+            }
+            missing = sorted(required - set(turn))
+            if missing:
+                errors.append(f"{path} 缺少字段: {', '.join(missing)}")
+                continue
+            turn_id = str(turn.get("turn_id") or "")
+            if not turn_id:
+                errors.append(f"{path}.turn_id 不得为空")
+            elif turn_id in seen_turn_ids:
+                errors.append(f"{artifact_type}.edited_turns turn_id 重复: {turn_id}")
+            seen_turn_ids.add(turn_id)
+            sequence = turn.get("sequence")
+            if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
+                errors.append(f"{path}.sequence 必须是正整数")
+            elif sequence in seen_sequences:
+                errors.append(f"{artifact_type}.edited_turns sequence 重复: {sequence}")
+            else:
+                seen_sequences.add(sequence)
+            if str(turn.get("speaker_id") or "") != str(artifact.get("speaker_id") or ""):
+                errors.append(f"{path}.speaker_id 与 artifact speaker_id 不一致")
+            if not HEX_SHA256.fullmatch(str(turn.get("source_sha256") or "")):
+                errors.append(f"{path}.source_sha256 必须是小写 SHA-256")
+            if not str(turn.get("edited_text") or "").strip():
+                errors.append(f"{path}.edited_text 不得为空")
+            for list_field in ("removed_fillers", "doubtful_fragments"):
+                value = turn.get(list_field)
+                if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                    errors.append(f"{path}.{list_field} 必须是 string array")
+    return errors
+
+
+def validate_editing_assembly_receipt(artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    errors: list[str] = []
+    for field in ("manifest_sha256", "edit_artifact_digest", "assembled_draft_sha256"):
+        if not HEX_SHA256.fullmatch(str(artifact.get(field) or "")):
+            errors.append(f"editing_assembly_receipt.{field} 必须是小写 SHA-256")
+    if artifact.get("status") != "assembled":
+        errors.append("editing_assembly_receipt.status 必须是 assembled")
+    turn_ids = artifact.get("ordered_turn_ids")
+    if isinstance(turn_ids, list):
+        normalized = [str(item) for item in turn_ids]
+        if not normalized or any(not item for item in normalized):
+            errors.append("editing_assembly_receipt.ordered_turn_ids 不得为空")
+        elif len(normalized) != len(set(normalized)):
+            errors.append("editing_assembly_receipt.ordered_turn_ids 不得重复")
     return errors
 
 
@@ -848,22 +1205,27 @@ def validate_payload(payload: Any, required_artifacts: list[str] | None = None) 
 
     for artifact_type, artifact in artifacts.items():
         path = f"artifacts.{artifact_type}"
+        artifact_schema = artifact_schema_name(str(artifact_type))
         if artifact_type == "doubtful_items":
             errors.extend(validate_doubtful_items(artifact))
-        elif artifact_type in REQUIRED_FIELDS:
-            errors.extend(validate_required_fields(artifact_type, artifact))
-            errors.extend(validate_field_types(artifact_type, artifact))
-            if artifact_type == "source_manifest":
+        elif artifact_schema in REQUIRED_FIELDS:
+            errors.extend(validate_required_fields(artifact_schema, artifact))
+            errors.extend(validate_field_types(artifact_schema, artifact))
+            if artifact_schema == "source_manifest":
                 errors.extend(validate_source_manifest(artifact))
-            elif artifact_type == "transcript_audit":
+            elif artifact_schema == "transcript_audit":
                 errors.extend(validate_transcript_audit(artifact))
-            elif artifact_type == "source_reconciliation":
+            elif artifact_schema == "source_reconciliation":
                 errors.extend(validate_source_reconciliation(artifact))
-            elif artifact_type == "entity_verification_report":
+            elif artifact_schema == "entity_verification_report":
                 errors.extend(validate_entity_verification_report(artifact))
-            elif artifact_type == "export_manifest":
+            elif artifact_schema == "speaker_turn_edit":
+                errors.extend(validate_speaker_turn_edit(str(artifact_type), artifact))
+            elif artifact_schema == "editing_assembly_receipt":
+                errors.extend(validate_editing_assembly_receipt(artifact))
+            elif artifact_schema == "export_manifest":
                 errors.extend(validate_export_manifest(artifact))
-            elif artifact_type == "main_action_receipt":
+            elif artifact_schema == "main_action_receipt":
                 errors.extend(validate_main_action_receipt(artifact))
         else:
             errors.append(f"未知 MAS artifact 类型: {artifact_type}")

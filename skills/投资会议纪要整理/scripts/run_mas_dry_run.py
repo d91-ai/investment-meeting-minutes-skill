@@ -228,6 +228,17 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
                     errors.append(f"MAS dry-run cannot synthesize speaker edit artifact: {artifact_type}")
                     continue
                 artifact = copy.deepcopy(artifact)
+                context_turns = {
+                    str(turn.get("turn_id") or ""): turn
+                    for turn in task.get("task_context", {}).get("turns", [])
+                    if isinstance(turn, dict)
+                }
+                for returned_turn in artifact.get("edited_turns", []):
+                    if not isinstance(returned_turn, dict):
+                        continue
+                    source_turn = context_turns.get(str(returned_turn.get("turn_id") or ""))
+                    if isinstance(source_turn, dict):
+                        returned_turn["edited_text"] = str(source_turn.get("text") or "")
             else:
                 errors.append(f"MAS dry-run fixture missing artifact: {artifact_type}")
                 continue

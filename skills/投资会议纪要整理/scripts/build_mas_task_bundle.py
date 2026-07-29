@@ -32,19 +32,9 @@ SOURCE_MODES = {"document_only", "audio_only", "audio_plus_document"}
 MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
 SOURCE_SELECTION_STATUSES = {"not_applicable", "not_compared", "compared_clear", "conflict", "uncertain"}
 SPEAKER_EDITING_MODES = {"auto", "skip", "full"}
-REVIEWED_SOURCE_MARKERS = ("已核对", "人工校对", "已校对", "reviewed")
-HIGH_CONFIDENCE_FILLER_MARKERS = (
-    "嗯",
-    "呃",
-    "额",
-    "然后然后",
-    "这个这个",
-    "对对",
-    "是是",
-    "不断不断",
-    "观察观察",
-)
-AUTO_SKIP_FILLERS_PER_1000 = 1.0
+AUTO_PARALLEL_SOURCE_CHARS = 16_000
+MAX_SPEAKER_EDIT_SHARD_CHARS = 16_000
+SKILL_INSTRUCTION_PATH = Path(__file__).resolve().parent.parent / "SKILL.md"
 PRIMARY_SOURCE_ALIASES_BY_MODE = {
     "audio_only": {"aligned_transcript", "audio_transcript", "transcript"},
     "document_only": {"document", "provided_document", "provided_transcript", "transcript"},
@@ -209,20 +199,14 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
     "speaker_turn_edit": {
         "role": "Speaker Turn Editor",
         "dispatch_phase": "editing",
-        "objective": "Clean only the assigned speaker turns while preserving source order, viewpoint, uncertainty, conditions, numbers, and reasoning.",
+        "objective": "Apply the main workflow's exact base SKILL.md to one assigned source shard.",
         "inputs": [
-            "speaker_turn_manifest",
-            "assigned speaker shard",
-            "current-session entity and doubtful-item context when available",
+            "one assigned shard from the current speaker_turn_manifest",
         ],
         "checks": [
-            "pure filler words",
-            "meaningless repetitions",
-            "repeated false starts",
-            "obvious ASR noise",
-            "first-person perspective",
-            "negation and uncertainty",
-            "numbers, dates, conditions, and reasoning chain",
+            "exact base SKILL.md version",
+            "exact assigned-turn coverage and order",
+            "assigned shard only",
         ],
     },
     "export_manifest": {
@@ -281,6 +265,10 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def skill_instruction_sha256() -> str:
+    return hashlib.sha256(SKILL_INSTRUCTION_PATH.read_bytes()).hexdigest()
+
+
 def normalized_flags(flags: Any) -> list[str]:
     if flags is None:
         return []
@@ -337,12 +325,14 @@ def normalized_speaker_turn_manifest(value: Any) -> dict[str, Any] | None:
     assigned_turns: list[str] = []
     artifact_types: set[str] = set()
     shard_ids: set[str] = set()
+    previous_shard_last_sequence = 0
     for index, shard in enumerate(shards, start=1):
         if not isinstance(shard, dict):
             raise ValueError(f"speaker_turn_manifest.shards[{index}] 必须是 JSON object")
         shard_id = str(shard.get("shard_id") or "")
         artifact_type = str(shard.get("artifact_type") or "")
-        speaker_id = str(shard.get("speaker_id") or "")
+        speaker_ids = shard.get("speaker_ids")
+        speaker_labels = shard.get("speaker_labels")
         turn_ids = shard.get("turn_ids")
         if not shard_id or shard_id in shard_ids:
             raise ValueError("speaker_turn_manifest shard_id 必须唯一且非空")
@@ -360,20 +350,53 @@ def normalized_speaker_turn_manifest(value: Any) -> dict[str, Any] | None:
         unknown = sorted(set(normalized_turn_ids) - set(turn_by_id))
         if unknown:
             raise ValueError(f"speaker_turn_manifest shard {shard_id} 包含未知 turn_id: {', '.join(unknown)}")
-        if any(str(turn_by_id[turn_id].get("speaker_id") or "") != speaker_id for turn_id in normalized_turn_ids):
-            raise ValueError(f"speaker_turn_manifest shard {shard_id} 混入其他 speaker")
-        speaker_label = str(shard.get("speaker_label") or "")
-        if any(str(turn_by_id[turn_id].get("speaker_label") or "") != speaker_label for turn_id in normalized_turn_ids):
-            raise ValueError(f"speaker_turn_manifest shard {shard_id} speaker_label 与 turns 不一致")
+        shard_sequences = [
+            int(turn_by_id[turn_id].get("sequence") or 0)
+            for turn_id in normalized_turn_ids
+        ]
+        if shard_sequences != sorted(shard_sequences):
+            raise ValueError(f"speaker_turn_manifest shard {shard_id} turn_ids 必须保持全局 sequence 顺序")
+        if shard_sequences != list(range(shard_sequences[0], shard_sequences[-1] + 1)):
+            raise ValueError(f"speaker_turn_manifest shard {shard_id} 只能包含连续 sequence")
+        if shard_sequences[0] <= previous_shard_last_sequence:
+            raise ValueError("speaker_turn_manifest shards 必须按全局 sequence 排列")
+        previous_shard_last_sequence = shard_sequences[-1]
+        expected_speaker_ids = list(
+            dict.fromkeys(
+                str(turn_by_id[turn_id].get("speaker_id") or "")
+                for turn_id in normalized_turn_ids
+            )
+        )
+        expected_speaker_labels = list(
+            dict.fromkeys(
+                str(turn_by_id[turn_id].get("speaker_label") or "")
+                for turn_id in normalized_turn_ids
+            )
+        )
+        if speaker_ids != expected_speaker_ids:
+            raise ValueError(
+                f"speaker_turn_manifest shard {shard_id} speaker_ids 与 turns 不一致"
+            )
+        if speaker_labels != expected_speaker_labels:
+            raise ValueError(
+                f"speaker_turn_manifest shard {shard_id} speaker_labels 与 turns 不一致"
+            )
         input_payload = {
             "source_name": str(manifest.get("source_name") or ""),
             "source_sha256": str(manifest.get("source_sha256") or ""),
-            "speaker_id": speaker_id,
-            "speaker_label": speaker_label,
+            "speaker_ids": expected_speaker_ids,
+            "speaker_labels": expected_speaker_labels,
             "turns": [turn_by_id[turn_id] for turn_id in normalized_turn_ids],
         }
         if str(shard.get("input_sha256") or "") != canonical_json_digest(input_payload):
             raise ValueError(f"speaker_turn_manifest shard {shard_id} input_sha256 与内容不一致")
+        actual_char_count = sum(len(str(turn_by_id[turn_id].get("text") or "")) for turn_id in normalized_turn_ids)
+        if shard.get("char_count") != actual_char_count:
+            raise ValueError(f"speaker_turn_manifest shard {shard_id} char_count 与内容不一致")
+        if actual_char_count > MAX_SPEAKER_EDIT_SHARD_CHARS:
+            raise ValueError(
+                f"speaker_turn_manifest shard {shard_id} 超过 {MAX_SPEAKER_EDIT_SHARD_CHARS} 字符硬上限"
+            )
         assigned_turns.extend(normalized_turn_ids)
         artifact_types.add(artifact_type)
         shard_ids.add(shard_id)
@@ -388,73 +411,63 @@ def normalized_speaker_turn_manifest(value: Any) -> dict[str, Any] | None:
     return manifest
 
 
-def material_display_names(materials: list[Any]) -> list[str]:
-    names: list[str] = []
-    for material in materials:
-        if isinstance(material, dict):
-            value = material.get("name") or material.get("path") or ""
-        else:
-            value = material
-        text = str(value or "").strip()
-        if text:
-            names.append(Path(text).name)
-    return names
-
-
 def resolve_speaker_editing(
     requested_mode: Any,
     manifest: dict[str, Any] | None,
     materials: list[Any],
 ) -> dict[str, Any]:
+    del materials
     mode = str(requested_mode or "auto").strip()
     validate_choice("speaker_editing_mode", mode, SPEAKER_EDITING_MODES)
     if manifest is None:
-        if mode != "auto":
-            raise ValueError("speaker_editing_mode=skip/full 必须提供 speaker_turn_manifest")
+        if mode == "full":
+            raise ValueError("speaker_editing_mode=full 必须提供 speaker_turn_manifest")
         return {
             "requested_mode": mode,
-            "effective_mode": "not_applicable",
-            "reason": "speaker_turn_manifest_not_provided",
-            "reviewed_source_hint": False,
-            "high_confidence_filler_count": 0,
-            "high_confidence_fillers_per_1000": 0.0,
+            "effective_mode": "skip" if mode == "skip" else "not_applicable",
+            "reason": (
+                "explicit_main_workflow_editing"
+                if mode == "skip"
+                else "speaker_turn_manifest_not_provided"
+            ),
+            "source_char_count": 0,
+            "shard_count": 0,
+            "max_shard_chars": 0,
+            "parallel_threshold_chars": AUTO_PARALLEL_SOURCE_CHARS,
         }
 
-    source_text = "\n".join(
-        str(turn.get("text") or "")
+    source_char_count = sum(
+        len(str(turn.get("text") or ""))
         for turn in manifest.get("turns", [])
         if isinstance(turn, dict)
     )
-    content_chars = max(1, len(source_text))
-    filler_count = sum(source_text.count(marker) for marker in HIGH_CONFIDENCE_FILLER_MARKERS)
-    filler_density = round(filler_count * 1000 / content_chars, 4)
-    names = [
-        str(manifest.get("source_name") or ""),
-        *material_display_names(materials),
+    shard_char_counts = [
+        int(shard.get("char_count") or 0)
+        for shard in manifest.get("shards", [])
+        if isinstance(shard, dict)
     ]
-    reviewed_hint = any(
-        marker.casefold() in name.casefold()
-        for name in names
-        for marker in REVIEWED_SOURCE_MARKERS
-    )
-
     if mode == "auto":
-        if reviewed_hint and filler_density <= AUTO_SKIP_FILLERS_PER_1000:
-            effective_mode = "skip"
-            reason = "reviewed_source_with_low_high_confidence_filler_density"
-        else:
+        if source_char_count > AUTO_PARALLEL_SOURCE_CHARS:
             effective_mode = "full"
-            reason = "source_requires_deletion_only_speaker_editing"
+            reason = "source_exceeds_parallel_context_threshold"
+        else:
+            effective_mode = "skip"
+            reason = "source_fits_main_workflow_context"
     else:
         effective_mode = mode
-        reason = "explicit_request"
+        reason = (
+            "explicit_parallel_editing"
+            if mode == "full"
+            else "explicit_main_workflow_editing"
+        )
     return {
         "requested_mode": mode,
         "effective_mode": effective_mode,
         "reason": reason,
-        "reviewed_source_hint": reviewed_hint,
-        "high_confidence_filler_count": filler_count,
-        "high_confidence_fillers_per_1000": filler_density,
+        "source_char_count": source_char_count,
+        "shard_count": len(shard_char_counts),
+        "max_shard_chars": max(shard_char_counts, default=0),
+        "parallel_threshold_chars": AUTO_PARALLEL_SOURCE_CHARS,
     }
 
 
@@ -583,8 +596,11 @@ def output_shape_for(
             "fidelity_review": {"paragraphs_reviewed": 1},
             "speaker_turn_edit": {
                 "manifest_sha256": str((task_context or {}).get("manifest_sha256") or "0" * 64),
-                "shard_id": str((task_context or {}).get("shard_id") or "speaker_001__part_01"),
-                "speaker_id": str((task_context or {}).get("speaker_id") or "speaker_001"),
+                "shard_id": str((task_context or {}).get("shard_id") or "package_001"),
+                "speaker_ids": [
+                    str(item)
+                    for item in (task_context or {}).get("speaker_ids", [])
+                ],
                 "input_sha256": str((task_context or {}).get("input_sha256") or "0" * 64),
                 "status": "complete",
                 "edited_turns": [
@@ -593,9 +609,7 @@ def output_shape_for(
                         "sequence": turn.get("sequence", 1),
                         "speaker_id": str(turn.get("speaker_id") or ""),
                         "source_sha256": str(turn.get("source_sha256") or ""),
-                        "edited_text": str(turn.get("text") or ""),
-                        "removed_fillers": [],
-                        "doubtful_fragments": [],
+                        "edited_text": "<edited source text>",
                     }
                     for turn in (task_context or {}).get("turns", [])
                     if isinstance(turn, dict)
@@ -662,6 +676,36 @@ def prompt_for_task(
     artifact_schema = artifact_schema_name(artifact_type)
     required_fields = REQUIRED_FIELDS[artifact_schema]
     secondary = [str(item) for item in spec.get("secondary_artifacts", [])]
+    if artifact_schema == "speaker_turn_edit":
+        context = task_context or {}
+        lines = [
+            "Use $investment-meeting-minutes for this Speaker Turn Editor task.",
+            "Load and follow the exact same investment-meeting-minutes SKILL.md used by the Main Orchestrator.",
+            "Apply that Skill's existing text-editing principles to every assigned turn; do not add another editing standard.",
+            "Do not write, modify, assemble, or export final Markdown.",
+            "Do not modify repository files or meeting-note files.",
+            "Return only JSON: an array with one object per displayed turn, in the same order.",
+            'Each object must contain only "turn_id" and "edited_text".',
+            'Example: [{"turn_id":"turn_000001","edited_text":"整理后的该段文本"}]',
+            "",
+            "Assigned turns:",
+        ]
+        for turn in context.get("turns", []):
+            if not isinstance(turn, dict):
+                continue
+            turn_id = str(turn.get("turn_id") or "")
+            lines.extend(
+                [
+                    "",
+                    (
+                        f"--- {turn_id} | speaker={turn.get('speaker_label')} ---"
+                    ),
+                    str(turn.get("text") or ""),
+                    f"--- end {turn_id} ---",
+                ]
+            )
+        return "\n".join(lines)
+
     lines = [
         "Use $investment-meeting-minutes for this process-only specialist task.",
         f"Role: {spec['role']}.",
@@ -716,23 +760,6 @@ def prompt_for_task(
     elif artifact_schema == "fidelity_review":
         lines.append("paragraphs_reviewed must be a positive integer for the actual reviewed scope.")
         lines.append("If source mapping is insufficient, add the exact paragraph to source_mapping_failures; do not infer missing speech.")
-    elif artifact_schema == "speaker_turn_edit":
-        lines.extend(
-            [
-                "Edit only the assigned turns in task_context; do not merge, omit, reorder, summarize, or add turns.",
-                "Deletion-only rule: edited_text may only delete source content; punctuation and whitespace may be normalized.",
-                "Do not insert, replace, reorder, canonicalize, or repair any content word, entity, number, date, code, unit, polarity, or conclusion.",
-                "Delete only pure filler words, meaningless repetitions, repeated false starts, and obvious ASR noise.",
-                "Preserve first-person wording, negation, uncertainty, judgment strength, conditions, numbers, dates, position actions, and reasoning.",
-                "Do not silently canonicalize an uncertain entity; keep it in edited_text and list it in doubtful_fragments.",
-                "Every removed_fillers item must quote an exact removed source span; do not return abstract cleanup categories.",
-                "Return every assigned turn exactly once with unchanged turn_id, sequence, speaker_id, and source_sha256.",
-                "Set status=blocked when exact coverage cannot be completed; explain the span in unresolved_spans.",
-                "The main workflow alone assembles turns by global sequence and writes Markdown.",
-                "Assigned task_context JSON follows:",
-                json.dumps(task_context or {}, ensure_ascii=False, sort_keys=True),
-            ]
-        )
     elif artifact_schema == "export_manifest":
         lines.append("Return markdown_sha256 for markdown_path and set main_actions_verified as a boolean.")
         lines.append("validators_run must contain exactly validate_utf8_text.py and validate_meeting_minutes_contract.py with boolean ok.")
@@ -754,6 +781,17 @@ def prompt_markdown(bundle: dict[str, Any], task: dict[str, Any]) -> str:
     dispatch_phase = str(task["dispatch_phase"])
     phase = DISPATCH_PHASES[dispatch_phase]
     output_shape = json.dumps(task["expected_output_shape"], ensure_ascii=False, indent=2)
+    if task.get("artifact_schema") == "speaker_turn_edit":
+        return "\n".join(
+            [
+                "# MAS Speaker Turn Editor Task",
+                "",
+                "## Instructions and Assigned Source",
+                "",
+                str(task["prompt"]),
+                "",
+            ]
+        )
     return "\n".join(
         [
             f"# MAS Specialist Task: {task['role']}",
@@ -816,6 +854,7 @@ def build_task(
     prompt_spec = {**spec, "inputs": inputs}
     secondary_artifacts = [str(item) for item in spec.get("secondary_artifacts", [])]
     dispatch_phase = str(spec["dispatch_phase"])
+    skill_digest = skill_instruction_sha256() if artifact_schema == "speaker_turn_edit" else None
     task = {
         "role": spec["role"],
         "artifact_type": artifact_type,
@@ -842,6 +881,8 @@ def build_task(
         ),
         "material_handoff": DISPATCH_PHASES[dispatch_phase]["materials"],
     }
+    if skill_digest is not None:
+        task["skill_instruction_sha256"] = skill_digest
     if task_context is not None:
         task["task_context"] = copy.deepcopy(task_context)
     if "doubtful_items" in secondary_artifacts:
@@ -888,7 +929,7 @@ def dispatch_protocol() -> dict[str, Any]:
         "dispatch": "Spawn one read-only/process-only subagent per generated task file only when that task's dispatch_phase is ready; otherwise use the prompts as a manual checklist.",
         "parallelism": "Tasks in the same dispatch_phase may run in parallel after the main workflow has prepared role-relevant current-session materials.",
         "phases": DISPATCH_PHASES,
-        "return_contract": "Each subagent returns only the requested JSON artifact. The main workflow validates and consumes artifacts.",
+        "return_contract": "Speaker editors return only ordered turn_id/edited_text arrays; other subagents return the requested JSON artifact. The main workflow binds, validates, and consumes them.",
         "main_workflow_after_return": [
             "run_mas_phase_operator.py",
             "create_mas_source_manifest.py",
@@ -945,8 +986,6 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
         and source_selection_status != "compared_clear"
     ):
         raise ValueError("audio_plus_document 必须先确认正文主源，再生成 speaker_turn_manifest")
-    if set(risk_flags) & EDITING_RISKS and speaker_turn_manifest is None:
-        raise ValueError("speaker 编辑风险必须提供 speaker_turn_manifest")
     speaker_editing = resolve_speaker_editing(
         request.get("speaker_editing_mode"),
         speaker_turn_manifest,
@@ -996,8 +1035,12 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
             task_context = {
                 "manifest_sha256": str(speaker_turn_manifest.get("manifest_sha256") or ""),
                 "shard_id": str(shard.get("shard_id") or ""),
-                "speaker_id": str(shard.get("speaker_id") or ""),
-                "speaker_label": str(shard.get("speaker_label") or ""),
+                "speaker_ids": [
+                    str(item) for item in shard.get("speaker_ids", [])
+                ],
+                "speaker_labels": [
+                    str(item) for item in shard.get("speaker_labels", [])
+                ],
                 "input_sha256": str(shard.get("input_sha256") or ""),
                 "turns": [
                     copy.deepcopy(turn_by_id[str(turn_id)])
@@ -1113,8 +1156,6 @@ def validate_bundle(
     else:
         if risk_flags != bundle.get("risk_flags"):
             errors.append("MAS task bundle risk_flags 必须去重并排序")
-        if set(risk_flags) & EDITING_RISKS and speaker_turn_manifest is None:
-            errors.append("speaker 编辑风险必须绑定有效 speaker_turn_manifest")
     speaker_editing: dict[str, Any] = {}
     try:
         declared_speaker_editing = bundle.get("speaker_editing")
@@ -1182,8 +1223,12 @@ def validate_bundle(
         str(shard.get("artifact_type") or ""): {
             "manifest_sha256": str((speaker_turn_manifest or {}).get("manifest_sha256") or ""),
             "shard_id": str(shard.get("shard_id") or ""),
-            "speaker_id": str(shard.get("speaker_id") or ""),
-            "speaker_label": str(shard.get("speaker_label") or ""),
+            "speaker_ids": [
+                str(item) for item in shard.get("speaker_ids", [])
+            ],
+            "speaker_labels": [
+                str(item) for item in shard.get("speaker_labels", [])
+            ],
             "input_sha256": str(shard.get("input_sha256") or ""),
             "turns": [
                 copy.deepcopy(manifest_turn_by_id[str(turn_id)])
@@ -1224,6 +1269,7 @@ def validate_bundle(
             "forbidden_final_fields",
             "prompt",
             "material_handoff",
+            "skill_instruction_sha256",
             "task_context",
         ):
             if task.get(field) != expected_task.get(field):

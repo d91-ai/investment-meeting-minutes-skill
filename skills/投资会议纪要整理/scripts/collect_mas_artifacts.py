@@ -357,7 +357,7 @@ def artifact_context_errors(
             for field, expected in (
                 ("manifest_sha256", speaker_manifest.get("manifest_sha256")),
                 ("shard_id", shard.get("shard_id")),
-                ("speaker_id", shard.get("speaker_id")),
+                ("speaker_ids", shard.get("speaker_ids")),
                 ("input_sha256", shard.get("input_sha256")),
             ):
                 if artifact.get(field) != expected:
@@ -370,11 +370,18 @@ def artifact_context_errors(
                 for turn in returned_turns
                 if isinstance(turn, dict)
             }
+            returned_turn_ids = [
+                str(turn.get("turn_id") or "")
+                for turn in returned_turns
+                if isinstance(turn, dict)
+            ]
             expected_turn_ids = [str(turn_id) for turn_id in shard.get("turn_ids", [])]
             if len(returned_by_id) != len(returned_turns):
                 errors.append(f"{artifact_type}.edited_turns turn_id 必须唯一")
             if set(returned_by_id) != set(expected_turn_ids):
                 errors.append(f"{artifact_type}.edited_turns 必须恰好覆盖当前 shard turn_ids")
+            elif returned_turn_ids != expected_turn_ids:
+                errors.append(f"{artifact_type}.edited_turns 必须保持当前 shard turn_ids 顺序")
             for turn_id in expected_turn_ids:
                 returned = returned_by_id.get(turn_id)
                 source = turn_by_id.get(turn_id)

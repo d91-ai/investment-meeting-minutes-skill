@@ -67,7 +67,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def markdown_field(markdown: str, field: str, fallback: str = "") -> str:
-    pattern = re.compile(rf"^\*\*{re.escape(field)}\*\*[:：]\s*(.+?)\s*$", re.MULTILINE)
+    pattern = re.compile(rf"^{re.escape(field)}[:：]\s*(.+?)\s*$", re.MULTILINE)
     match = pattern.search(markdown)
     return match.group(1).strip() if match else fallback
 

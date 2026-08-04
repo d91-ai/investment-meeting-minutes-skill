@@ -321,6 +321,32 @@ def export_binding_errors(
     return errors
 
 
+def draft_review_binding_errors(
+    artifacts: dict[str, Any],
+    task_dir: Path,
+) -> list[str]:
+    """Require every semantic draft review to describe the current Markdown bytes."""
+    errors: list[str] = []
+    bound_paths: set[str] = set()
+    bound_hashes: set[str] = set()
+    for artifact_type in ("target_attribution_review", "fidelity_review"):
+        artifact = artifacts.get(artifact_type)
+        if not isinstance(artifact, dict):
+            continue
+        markdown_path = resolve_runtime_path(task_dir, artifact.get("reviewed_markdown_path"))
+        claimed_hash = str(artifact.get("reviewed_markdown_sha256") or "").strip().lower()
+        bound_paths.add(str(markdown_path.resolve(strict=False)))
+        bound_hashes.add(claimed_hash)
+        if not markdown_path.is_file():
+            errors.append(f"{artifact_type} 审核的 Markdown 不存在: {markdown_path}")
+            continue
+        if file_sha256(markdown_path) != claimed_hash:
+            errors.append(f"{artifact_type} 审核哈希已过期，必须基于最新 Markdown 重新审核")
+    if len(bound_paths) > 1 or len(bound_hashes) > 1:
+        errors.append("target_attribution_review 与 fidelity_review 必须审核同一版 Markdown")
+    return errors
+
+
 def artifact_context_errors(
     artifacts: dict[str, Any],
     bundle: dict[str, Any],
@@ -799,6 +825,7 @@ def _collect_mas_run_unlocked(
     warnings.extend(str(warning) for warning in validation.get("warnings", []))
     warnings.extend(str(warning) for warning in decision.get("warnings", []))
     errors.extend(artifact_context_errors(artifacts, bundle, task_dir))
+    errors.extend(draft_review_binding_errors(artifacts, task_dir))
 
     missing_artifacts = [artifact for artifact in required_artifacts if artifact not in artifacts]
     gates = phase_gates(bundle, artifacts, manifest)

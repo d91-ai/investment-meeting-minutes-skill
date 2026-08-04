@@ -192,6 +192,8 @@ Use the fields and type enum in `verification_policy.md`. This list remains the 
 ### target_attribution_review
 
 Required fields:
+- `reviewed_markdown_path`
+- `reviewed_markdown_sha256`
 - `segments_reviewed`
 - `wrong_grouping`
 - `missing_positive_targets`
@@ -200,11 +202,13 @@ Required fields:
 - `non_source_companies`
 - `recommended_revisions`
 
-`segments_reviewed` must be a positive integer; a zero-scope review does not pass.
+`segments_reviewed` must be a positive integer; a zero-scope review does not pass. The path and SHA-256 must identify the exact draft bytes reviewed. Any subsequent Markdown change makes this artifact stale and blocks later phases until the review is repeated.
 
 ### fidelity_review
 
 Required fields:
+- `reviewed_markdown_path`
+- `reviewed_markdown_sha256`
 - `paragraphs_reviewed`
 - `source_mapping_failures`
 - `summary_compression_findings`
@@ -212,7 +216,7 @@ Required fields:
 - `omission_findings`
 - `recommended_revisions`
 
-`paragraphs_reviewed` must be a positive integer; a zero-scope review does not pass.
+`paragraphs_reviewed` must be a positive integer; a zero-scope review does not pass. The path and SHA-256 must identify the exact draft bytes reviewed. Any subsequent Markdown change makes this artifact stale and blocks later phases until the review is repeated.
 
 ### export_manifest
 
@@ -271,7 +275,7 @@ Accepted `risk_flags` are explicit and unknown tokens fail fast:
 - Fidelity: `fidelity_review`, `omission_risk`, `summary_compression`, `third_person_rewrite`, `prior_user_feedback`.
 - Speaker editing: `speaker_turn_editing`, `long_transcript`, `filler_cleanup`.
 
-Artifact selection is incremental rather than all-specialist by default. Every active MAS run keeps main-owned `source_manifest` plus final `export_manifest`; audio risks add `transcript_audit`, source-selection risks add `source_reconciliation` and `fidelity_review`, entity/public-fact risks add `entity_verification_report` plus `doubtful_items`, target risks add `target_attribution_review`, and fidelity risks add `fidelity_review`. A bound speaker manifest adds one unique edit artifact per work package plus main-owned `editing_assembly_receipt`. `audio_only` must use `strict_audio`, which may reach the full set through its inferred risks. A flags-only CLI call may inspect a plan without materials; `--task-dir`, `--request-json`, or explicit `--material` activates source-coverage validation.
+Artifact selection has a mandatory baseline plus incremental risk-specific reviews. Every active MAS run requires main-owned `source_manifest`, `entity_verification_report`, `doubtful_items`, `fidelity_review`, and final `export_manifest`; `多人复盘会` also requires `target_attribution_review`. Audio/ASR evidence adds `transcript_audit`, and source-selection risks add `source_reconciliation`. Other risks may add further applicable reviews. A bound speaker manifest adds one unique edit artifact per work package plus main-owned `editing_assembly_receipt`. `audio_only` must use `strict_audio`. A flags-only CLI call may inspect a plan without materials; `--task-dir`, `--request-json`, or explicit `--material` activates source-coverage validation.
 
 The task bundle must define:
 - That MAS is required for the current run, plus the risk-based specialist selection.
@@ -335,6 +339,7 @@ Subagent execution rules:
 - Gate on collector top-level `ok`. Treat the embedded `decision` as actionable only when collector output is `ok: true`; otherwise repair/regenerate invalid, duplicate, or missing artifacts before final delivery.
 - Apply final writing, doubtful marking, export, and user-facing decisions only in the Main Orchestrator.
 - If draft-review or doubtful actions can change Markdown, apply them before `final_verification`, run `record_mas_main_actions.py` against that Markdown, then rerun collector. Do not dispatch Contract Verifier until collector accepts the receipt.
+- Every `target_attribution_review` and `fidelity_review` must bind to the same current Markdown path and SHA-256. If either review reports an actionable finding, revise the Markdown and repeat both affected semantic reviews on the new bytes. A receipt that merely claims the old findings were applied cannot substitute for a fresh clean review. Missing, stale, failed, zero-scope, or still-actionable review artifacts block `final_verification` and export.
 
 ## Codex Operator Harness
 
@@ -438,6 +443,7 @@ The main workflow must repair and rerun verification before final delivery when:
 - Required validators were not run.
 - A validator, export step, or regression result is failed, blocked, or structurally reports `ok=false`.
 - The contract verifier reports errors that cannot be resolved by merely marking content doubtful.
+- A required semantic review is missing, stale, zero-scope, or still contains an actionable finding; revise the draft and repeat the affected review against the new Markdown hash.
 
 ### 请求人工
 

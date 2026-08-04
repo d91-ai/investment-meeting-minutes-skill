@@ -167,7 +167,8 @@ def summarize_payload(payload: Any, required_artifacts: list[str] | None = None)
         for field_name in field_names:
             if has_items(artifact.get(field_name)):
                 reasons.append(f"{artifact_type}.{field_name}_present")
-                add_action(actions, "revise_draft_before_final_validation")
+                add_action(actions, "revise_draft_and_repeat_semantic_review")
+                repair_required = True
                 break
 
     export_manifest = artifacts.get("export_manifest", {})

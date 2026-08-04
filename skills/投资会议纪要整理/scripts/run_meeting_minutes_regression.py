@@ -122,6 +122,9 @@ def fixture_payload(
         artifact_value["markdown_path"] = str(markdown_path)
         artifact_value["markdown_sha256"] = file_sha256(markdown_path)
         artifact_value["main_actions_verified"] = True
+    if artifact_type in {"target_attribution_review", "fidelity_review"} and isinstance(artifact_value, dict) and markdown_path is not None:
+        artifact_value["reviewed_markdown_path"] = str(markdown_path)
+        artifact_value["reviewed_markdown_sha256"] = file_sha256(markdown_path)
     return {
         **fixture_identity(manifest, artifact_type),
         "artifact_type": artifact_type,
@@ -168,6 +171,9 @@ def fixture_return_payload(
             artifact_value["markdown_path"] = str(markdown_path)
             artifact_value["markdown_sha256"] = file_sha256(markdown_path)
             artifact_value["main_actions_verified"] = True
+        if artifact_type in {"target_attribution_review", "fidelity_review"} and isinstance(artifact_value, dict) and markdown_path is not None:
+            artifact_value["reviewed_markdown_path"] = str(markdown_path)
+            artifact_value["reviewed_markdown_sha256"] = file_sha256(markdown_path)
         values[artifact_type] = artifact_value
     if len(values) == 1:
         artifact_type, artifact_value = next(iter(values.items()))
@@ -1079,6 +1085,24 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 json.dumps(source_payload, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+            baseline_entity_report = {
+                "items": [],
+                "local_candidate_paths": [],
+                "external_evidence_paths": [],
+                "confirmed_item_evidence_paths": {},
+                "confirmed_items": [],
+                "unresolved_items": [],
+                "conflicts": [],
+            }
+            for artifact_type, artifact_value in (
+                ("entity_verification_report", baseline_entity_report),
+                ("doubtful_items", []),
+            ):
+                payload = fixture_payload(dispatch_manifest, artifact_type, artifact_value)
+                (artifact_dir / f"{artifact_type}.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
             edit_bound_tasks = [
                 task
                 for task in bound_bundle.get("tasks", [])
@@ -1830,6 +1854,11 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                         encoding="utf-8",
                     )
+            if case.get("tamper_markdown_after_reviews"):
+                synthetic_markdown.write_text(
+                    synthetic_markdown.read_text(encoding="utf-8") + "review-stale\n",
+                    encoding="utf-8",
+                )
             if case.get("record_main_actions"):
                 result = collect_mas_run(task_dir, through_phase="draft_review")
                 summary_path = task_dir / "mas_run_summary.json"

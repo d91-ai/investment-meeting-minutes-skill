@@ -39,11 +39,11 @@ def synthetic_final_markdown(artifacts: dict[str, Any]) -> str:
     lines = [
         "# 投资会议纪要｜合成 MAS dry-run",
         "",
-        "**会议日期**：2026-07-11",
-        "**整理时间**：2026-07-11",
-        "**会议标题**：合成 MAS dry-run 会议",
-        "**会议类型**：多人复盘会",
-        "**会议系列**：合成回归",
+        "会议日期：2026-07-11",
+        "整理时间：2026-07-11",
+        "会议标题：合成 MAS dry-run 会议",
+        "会议类型：多人复盘会",
+        "会议系列：合成回归",
         "",
         "---",
         "",
@@ -68,7 +68,7 @@ def synthetic_final_markdown(artifacts: dict[str, Any]) -> str:
                 "",
                 "| 原始表述 | 当前判断 | 候选项 | 人工确认 |",
                 "| --- | --- | --- | --- |",
-                f"| {raw} | {current} | {candidate} | |",
+                f"| **{raw}** | {current} | {candidate} | |",
             ]
         )
     return "\n".join(lines) + "\n"
@@ -246,6 +246,9 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
                 artifact["markdown_path"] = str(synthetic_markdown)
                 artifact["markdown_sha256"] = file_sha256(synthetic_markdown)
                 artifact["main_actions_verified"] = True
+            if artifact_type in {"target_attribution_review", "fidelity_review"} and isinstance(artifact, dict):
+                artifact["reviewed_markdown_path"] = str(synthetic_markdown)
+                artifact["reviewed_markdown_sha256"] = file_sha256(synthetic_markdown)
             artifact_path = write_artifact(artifact_dir, manifest, artifact_type, artifact)
             emitted_artifacts.add(artifact_type)
             emitted_this_phase.append(artifact_type)

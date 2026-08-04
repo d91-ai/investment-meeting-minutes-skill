@@ -42,6 +42,8 @@
       }
     ],
     "fidelity_review": {
+      "reviewed_markdown_path": "NOTE.md",
+      "reviewed_markdown_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "paragraphs_reviewed": 1,
       "source_mapping_failures": [],
       "summary_compression_findings": [],

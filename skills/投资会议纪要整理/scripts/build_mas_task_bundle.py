@@ -166,6 +166,7 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         "objective": "Review target headings, sector grouping, and positive/negative attribution.",
         "inputs": [
             "review-meeting draft body",
+            "exact draft Markdown path and SHA-256",
             "source spans",
             "entity verification status",
         ],
@@ -185,6 +186,7 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         "objective": "Review whether draft prose preserves source order, pronouns, and substance.",
         "inputs": [
             "draft Markdown",
+            "exact draft Markdown path and SHA-256",
             "source spans",
             "source_reconciliation",
         ],
@@ -552,20 +554,23 @@ def select_expected_artifacts(
     if not should_use_mas(run_profile, source_mode, risk_flags, source_selection_status):
         return []
 
-    artifacts = {"source_manifest", "export_manifest"}
+    # Every run must complete the applicable semantic review chain instead of
+    # relying on risk flags to opt into basic entity and fidelity checks.
+    artifacts = {
+        "source_manifest",
+        "entity_verification_report",
+        "doubtful_items",
+        "fidelity_review",
+        "export_manifest",
+    }
     if risks & AUDIO_RISKS or (
         source_mode == "audio_plus_document" and source_selection_status != "compared_clear"
     ):
         artifacts.add("transcript_audit")
     if risks & SOURCE_RECONCILIATION_RISKS:
         artifacts.add("source_reconciliation")
-    if risks & TARGET_RISKS or (meeting_type == "多人复盘会" and run_profile == "strict_audio"):
+    if meeting_type == "多人复盘会" or risks & TARGET_RISKS:
         artifacts.add("target_attribution_review")
-    if risks & ENTITY_RISKS:
-        artifacts.add("entity_verification_report")
-        artifacts.add("doubtful_items")
-    if risks & (FIDELITY_RISKS | SOURCE_RECONCILIATION_RISKS):
-        artifacts.add("fidelity_review")
     return sorted(artifacts)
 
 
@@ -592,8 +597,16 @@ def output_shape_for(
                 "cross_check_source": "provided_document" if source_mode == "audio_plus_document" else "",
                 "manual_review_required": False,
             },
-            "target_attribution_review": {"segments_reviewed": 1},
-            "fidelity_review": {"paragraphs_reviewed": 1},
+            "target_attribution_review": {
+                "reviewed_markdown_path": "NOTE.md",
+                "reviewed_markdown_sha256": "0" * 64,
+                "segments_reviewed": 1,
+            },
+            "fidelity_review": {
+                "reviewed_markdown_path": "NOTE.md",
+                "reviewed_markdown_sha256": "0" * 64,
+                "paragraphs_reviewed": 1,
+            },
             "speaker_turn_edit": {
                 "manifest_sha256": str((task_context or {}).get("manifest_sha256") or "0" * 64),
                 "shard_id": str((task_context or {}).get("shard_id") or "package_001"),
@@ -747,6 +760,7 @@ def prompt_for_task(
         lines.append("Do not copy local_candidate_paths into external_evidence_paths.")
         lines.append("If entity evidence is insufficient, put the exact item in unresolved_items and doubtful_items; do not guess.")
     elif artifact_type == "target_attribution_review":
+        lines.append("Return reviewed_markdown_path and the SHA-256 of the exact draft bytes you reviewed.")
         lines.append("segments_reviewed must be a positive integer for the actual reviewed scope.")
         lines.append(
             "Decide whether a security belongs in a target heading from current-session context; do not promote every mention. "
@@ -758,6 +772,7 @@ def prompt_for_task(
         )
         lines.append("If target attribution is unsupported, add the exact finding to recommended_revisions; do not invent a target.")
     elif artifact_schema == "fidelity_review":
+        lines.append("Return reviewed_markdown_path and the SHA-256 of the exact draft bytes you reviewed.")
         lines.append("paragraphs_reviewed must be a positive integer for the actual reviewed scope.")
         lines.append("If source mapping is insufficient, add the exact paragraph to source_mapping_failures; do not infer missing speech.")
     elif artifact_schema == "export_manifest":
@@ -1207,6 +1222,7 @@ def validate_bundle(
         bundle.get("source_mode") == "audio_plus_document"
         and "fidelity_review" in expected_set
         and "source_reconciliation" not in expected_set
+        and source_selection_status != "compared_clear"
     ):
         errors.append("audio_plus_document fidelity_review 缺少 source_reconciliation 依赖")
     produced_artifacts = {"source_manifest"} if bundle.get("mas_required") else set()

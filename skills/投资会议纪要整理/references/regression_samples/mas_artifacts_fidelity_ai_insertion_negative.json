@@ -1,0 +1,18 @@
+{
+  "artifacts": {
+    "fidelity_review": {
+      "reviewed_markdown_path": "NOTE.md",
+      "reviewed_markdown_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "paragraphs_reviewed": 2,
+      "source_mapping_failures": [
+        "发言整理正文新增了源材料不存在的 AI 投资判断和整理说明"
+      ],
+      "summary_compression_findings": [],
+      "pronoun_rewrite_findings": [],
+      "omission_findings": [],
+      "recommended_revisions": [
+        "删除额外 AI 判断和整理说明，重新执行源对齐审核"
+      ]
+    }
+  }
+}

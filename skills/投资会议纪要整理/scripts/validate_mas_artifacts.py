@@ -50,6 +50,8 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
         "conflicts",
     ],
     "target_attribution_review": [
+        "reviewed_markdown_path",
+        "reviewed_markdown_sha256",
         "segments_reviewed",
         "wrong_grouping",
         "missing_positive_targets",
@@ -59,6 +61,8 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
         "recommended_revisions",
     ],
     "fidelity_review": [
+        "reviewed_markdown_path",
+        "reviewed_markdown_sha256",
         "paragraphs_reviewed",
         "source_mapping_failures",
         "summary_compression_findings",
@@ -162,6 +166,8 @@ STRING_FIELD_RULES: dict[str, list[str]] = {
     "source_manifest": ["source_mode", "archive_status", "skipped_reason"],
     "transcript_audit": ["asr_primary", "asr_auxiliary", "timestamp_index_status", "recommended_action"],
     "source_reconciliation": ["primary_body_source", "primary_source_reason", "cross_check_source"],
+    "target_attribution_review": ["reviewed_markdown_path", "reviewed_markdown_sha256"],
+    "fidelity_review": ["reviewed_markdown_path", "reviewed_markdown_sha256"],
     "speaker_turn_edit": [
         "manifest_sha256",
         "shard_id",
@@ -900,6 +906,18 @@ def validate_entity_verification_report(artifact: Any) -> list[str]:
     return errors
 
 
+def validate_draft_review_binding(artifact_type: str, artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    errors: list[str] = []
+    if not str(artifact.get("reviewed_markdown_path") or "").strip():
+        errors.append(f"{artifact_type}.reviewed_markdown_path 不得为空")
+    digest = str(artifact.get("reviewed_markdown_sha256") or "").strip().lower()
+    if not HEX_SHA256.fullmatch(digest):
+        errors.append(f"{artifact_type}.reviewed_markdown_sha256 必须是 64 位小写 SHA-256")
+    return errors
+
+
 def validate_export_manifest(artifact: Any) -> list[str]:
     if not isinstance(artifact, dict):
         return []
@@ -1053,6 +1071,8 @@ def validate_payload(payload: Any, required_artifacts: list[str] | None = None) 
                 errors.extend(validate_source_reconciliation(artifact))
             elif artifact_schema == "entity_verification_report":
                 errors.extend(validate_entity_verification_report(artifact))
+            elif artifact_schema in {"target_attribution_review", "fidelity_review"}:
+                errors.extend(validate_draft_review_binding(artifact_schema, artifact))
             elif artifact_schema == "speaker_turn_edit":
                 errors.extend(validate_speaker_turn_edit(str(artifact_type), artifact))
             elif artifact_schema == "editing_assembly_receipt":

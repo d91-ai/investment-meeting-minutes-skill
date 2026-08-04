@@ -12,10 +12,17 @@ from pathlib import Path
 from typing import Any
 
 from create_mas_source_manifest import material_coverage_errors
+from build_entity_candidate_manifest import (
+    ALLOWED_NETWORK_VERIFICATION_REASONS,
+    ALLOWED_VERIFICATION_KINDS,
+    ALLOWED_RELATION_KINDS,
+)
 from mas_task_lock import mas_task_lock
 from validate_mas_artifacts import (
     BOOLEAN_FIELD_RULES,
     DOUBTFUL_REQUIRED_FIELDS,
+    ENTITY_VERIFICATION_SHARD_PREFIX,
+    FIDELITY_REVIEW_SHARD_PREFIX,
     FORBIDDEN_FINAL_FIELDS,
     HEX_SHA256,
     LIST_FIELD_RULES,
@@ -32,7 +39,9 @@ SOURCE_MODES = {"document_only", "audio_only", "audio_plus_document"}
 MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
 SOURCE_SELECTION_STATUSES = {"not_applicable", "not_compared", "compared_clear", "conflict", "uncertain"}
 SPEAKER_EDITING_MODES = {"auto", "skip", "full"}
+ENTITY_VERIFICATION_MODES = {"auto", "single", "parallel"}
 AUTO_PARALLEL_SOURCE_CHARS = 16_000
+DIRECT_DOCUMENT_SOURCE_CHARS = 48_000
 MAX_SPEAKER_EDIT_SHARD_CHARS = 16_000
 SKILL_INSTRUCTION_PATH = Path(__file__).resolve().parent.parent / "SKILL.md"
 PRIMARY_SOURCE_ALIASES_BY_MODE = {
@@ -68,9 +77,11 @@ SOURCE_RECONCILIATION_RISKS = {
 }
 ENTITY_RISKS = {
     "entity_verification",
-    "high_risk_facts",
     "many_doubtful_items",
     "company_codes",
+}
+MEETING_FACT_RISKS = {
+    "high_risk_facts",
     "customers_suppliers",
     "numbers_dates",
 }
@@ -92,10 +103,20 @@ EDITING_RISKS = {
     "long_transcript",
     "filler_cleanup",
 }
+DIRECT_DOCUMENT_BLOCKING_RISKS = (
+    AUDIO_RISKS
+    | FIDELITY_RISKS
+    | {
+        "filler_cleanup",
+        "unclear_speaker_boundaries",
+        "noisy_audio",
+    }
+)
 KNOWN_RISK_FLAGS = (
     AUDIO_RISKS
     | SOURCE_RECONCILIATION_RISKS
     | ENTITY_RISKS
+    | MEETING_FACT_RISKS
     | TARGET_RISKS
     | FIDELITY_RISKS
     | EDITING_RISKS
@@ -143,9 +164,8 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
     "entity_verification_report": {
         "role": "Entity Verifier",
         "dispatch_phase": "pre_draft",
-        "objective": "Verify non-person business entities and update doubtful_items proposals.",
+        "objective": "Disambiguate non-person entity names, security codes, and terminology only.",
         "inputs": [
-            "current-session source context",
             "entity candidates",
             "local code candidates",
             "external evidence paths",
@@ -153,12 +173,25 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         "checks": [
             "company names",
             "stock codes",
-            "customers and suppliers",
-            "numbers and dates",
             "industry terms",
-            "public high-risk facts",
+            "entity identity conflicts",
         ],
         "secondary_artifacts": ["doubtful_items"],
+    },
+    "entity_verification_shard": {
+        "role": "Entity Verifier",
+        "dispatch_phase": "pre_draft",
+        "objective": "Verify only the assigned entity candidate shard and return structured results.",
+        "inputs": [
+            "assigned candidate terms and necessary aliases",
+            "verification kinds",
+        ],
+        "checks": [
+            "assigned candidate coverage",
+            "public evidence path validity",
+            "confirmed item evidence",
+            "identity or evidence conflicts",
+        ],
     },
     "target_attribution_review": {
         "role": "Target Attribution Reviewer",
@@ -196,6 +229,34 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
             "speaker-order drift",
         ],
     },
+    "fidelity_review_shard": {
+        "role": "Fidelity Reviewer",
+        "dispatch_phase": "draft_review",
+        "objective": "Review only the assigned changed or at-risk source-bound fidelity groups.",
+        "inputs": ["assigned lexical diff groups and exact source/draft span bindings"],
+        "checks": [
+            "assigned group and span coverage",
+            "numbers, negation, conditions, dates, entity anchors, and explicit Q&A boundaries",
+            "source correspondence without deterministic semantic inference",
+        ],
+    },
+    "final_semantic_review": {
+        "role": "Final Semantic Reviewer",
+        "dispatch_phase": "final_verification",
+        "objective": "Independently review only main-owned changed or risky final spans against their bound sources.",
+        "inputs": [
+            "main-owned changed/risky span scope",
+            "source-bound excerpts",
+            "final Markdown excerpts",
+            "doubtful and fidelity dispositions",
+        ],
+        "checks": [
+            "source correspondence",
+            "numbers, negation, conditions, dates, and Q&A linkage",
+            "doubtful disposition",
+            "fidelity disposition",
+        ],
+    },
     "speaker_turn_edit": {
         "role": "Speaker Turn Editor",
         "dispatch_phase": "editing",
@@ -210,7 +271,7 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         ],
     },
     "export_manifest": {
-        "role": "Contract Verifier",
+        "role": "Main Orchestrator",
         "dispatch_phase": "final_verification",
         "objective": "Verify encoding, Markdown contract, sidecar consistency, export status, and regressions.",
         "inputs": [
@@ -230,6 +291,62 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         ],
     },
 }
+
+FINAL_REVIEW_REASON_CODES = {
+    "changed",
+    "risky",
+    "doubtful",
+    "entity",
+    "number",
+    "negation",
+    "condition",
+    "date",
+    "qa_boundary",
+    "main_action_changed",
+}
+
+
+def normalized_final_semantic_review_scope(value: Any) -> dict[str, Any] | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("final_semantic_review_scope 必须是 JSON object")
+    scope = copy.deepcopy(value)
+    if scope.get("schema_version") != "1.0":
+        raise ValueError("final_semantic_review_scope.schema_version 必须是 1.0")
+    draft_sha256 = str(scope.get("draft_sha256") or "")
+    if not HEX_SHA256.fullmatch(draft_sha256):
+        raise ValueError("final_semantic_review_scope.draft_sha256 必须是小写 SHA-256")
+    spans = scope.get("spans")
+    if not isinstance(spans, list) or not spans:
+        raise ValueError("final_semantic_review_scope.spans 必须是非空 array")
+    span_ids: list[str] = []
+    for index, span in enumerate(spans, start=1):
+        if not isinstance(span, dict):
+            raise ValueError(f"final_semantic_review_scope.spans[{index}] 必须是 object")
+        span_id = str(span.get("span_id") or "")
+        source_span_id = str(span.get("source_span_id") or "")
+        source_sha256 = str(span.get("source_sha256") or "")
+        final_sha256 = str(span.get("final_sha256") or "")
+        reason_codes = span.get("reason_codes")
+        if not span_id or not source_span_id:
+            raise ValueError("final_semantic_review_scope span identity 不得为空")
+        if not HEX_SHA256.fullmatch(source_sha256) or not HEX_SHA256.fullmatch(final_sha256):
+            raise ValueError("final_semantic_review_scope span source/final hash 非法")
+        if (
+            not isinstance(reason_codes, list)
+            or not reason_codes
+            or any(str(item) not in FINAL_REVIEW_REASON_CODES for item in reason_codes)
+            or "changed" not in reason_codes and "risky" not in reason_codes and "main_action_changed" not in reason_codes
+        ):
+            raise ValueError("final_semantic_review_scope span 必须有受支持的 changed/risky 原因")
+        span_ids.append(span_id)
+    if len(span_ids) != len(set(span_ids)):
+        raise ValueError("final_semantic_review_scope span_id 不得重复")
+    digest_payload = {key: item for key, item in scope.items() if key != "scope_sha256"}
+    if scope.get("scope_sha256") != canonical_json_digest(digest_payload):
+        raise ValueError("final_semantic_review_scope.scope_sha256 与内容不一致")
+    return scope
 
 DISPATCH_PHASES: dict[str, dict[str, str]] = {
     "pre_draft": {
@@ -297,6 +414,7 @@ def normalized_speaker_turn_manifest(value: Any) -> dict[str, Any] | None:
         raise ValueError("speaker_turn_manifest.shards 必须是非空 JSON array")
     turn_by_id: dict[str, dict[str, Any]] = {}
     sequences: set[int] = set()
+    previous_span_end = -1
     for index, turn in enumerate(turns, start=1):
         if not isinstance(turn, dict):
             raise ValueError(f"speaker_turn_manifest.turns[{index}] 必须是 JSON object")
@@ -317,6 +435,24 @@ def normalized_speaker_turn_manifest(value: Any) -> dict[str, Any] | None:
             raise ValueError(f"speaker_turn_manifest {turn_id} text 不得为空")
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != source_sha256:
             raise ValueError(f"speaker_turn_manifest {turn_id} source_sha256 与 text 不一致")
+        source_span = turn.get("source_span")
+        if source_span is not None:
+            if not isinstance(source_span, dict):
+                raise ValueError(f"speaker_turn_manifest {turn_id} source_span 必须是 JSON object")
+            start_char = source_span.get("start_char")
+            end_char = source_span.get("end_char")
+            if (
+                not isinstance(start_char, int)
+                or isinstance(start_char, bool)
+                or not isinstance(end_char, int)
+                or isinstance(end_char, bool)
+                or start_char < 0
+                or end_char <= start_char
+                or end_char - start_char != len(text)
+                or start_char < previous_span_end
+            ):
+                raise ValueError(f"speaker_turn_manifest {turn_id} source_span 非法、重叠或与 text 长度不一致")
+            previous_span_end = end_char
         turn_by_id[turn_id] = turn
         sequences.add(sequence)
     if sequences != set(range(1, len(turns) + 1)):
@@ -404,6 +540,22 @@ def normalized_speaker_turn_manifest(value: Any) -> dict[str, Any] | None:
         raise ValueError("speaker_turn_manifest shards 必须恰好覆盖全部 turns 一次")
     if manifest.get("turn_count") != len(turns) or manifest.get("shard_count") != len(shards):
         raise ValueError("speaker_turn_manifest turn_count/shard_count 与内容不一致")
+    source_profile = manifest.get("source_profile")
+    if source_profile is not None:
+        if not isinstance(source_profile, dict):
+            raise ValueError("speaker_turn_manifest.source_profile 必须是 JSON object")
+        for field in (
+            "boundary_count",
+            "standalone_boundary_count",
+            "inline_boundary_count",
+            "speaker_count",
+            "unlabeled_prefix_chars",
+        ):
+            if not isinstance(source_profile.get(field), int) or isinstance(source_profile.get(field), bool):
+                raise ValueError(f"speaker_turn_manifest.source_profile.{field} 必须是 integer")
+        for field in ("structure_reliable", "lossless_renderable"):
+            if not isinstance(source_profile.get(field), bool):
+                raise ValueError(f"speaker_turn_manifest.source_profile.{field} 必须是 boolean")
     declared_digest = str(manifest.get("manifest_sha256") or "")
     digest_payload = {key: item for key, item in manifest.items() if key != "manifest_sha256"}
     if declared_digest != canonical_json_digest(digest_payload):
@@ -411,10 +563,287 @@ def normalized_speaker_turn_manifest(value: Any) -> dict[str, Any] | None:
     return manifest
 
 
+def normalized_entity_candidate_manifest(value: Any) -> dict[str, Any] | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("entity_candidate_manifest 必须是 JSON object")
+    manifest = copy.deepcopy(value)
+    if manifest.get("schema_version") != "1.0" or manifest.get("artifact_type") != "entity_candidate_manifest":
+        raise ValueError("entity_candidate_manifest schema/artifact_type 不合法")
+    mode = str(manifest.get("mode") or "")
+    if mode not in {"single", "parallel"}:
+        raise ValueError("entity_candidate_manifest.mode 必须是 single 或 parallel")
+    for field in ("source_sha256", "candidate_set_sha256", "manifest_sha256"):
+        if not HEX_SHA256.fullmatch(str(manifest.get(field) or "")):
+            raise ValueError(f"entity_candidate_manifest.{field} 必须是小写 SHA-256")
+    candidates = manifest.get("candidates")
+    groups = manifest.get("groups")
+    shards = manifest.get("shards")
+    policy = manifest.get("policy")
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("entity_candidate_manifest.candidates 必须是非空 JSON array")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("entity_candidate_manifest.groups 必须是非空 JSON array")
+    if not isinstance(shards, list) or not isinstance(policy, dict):
+        raise ValueError("entity_candidate_manifest.shards/policy 类型不合法")
+    scope_policy = manifest.get("scope_policy")
+    if not isinstance(scope_policy, dict) or scope_policy.get("meeting_fact_verification_excluded") is not True:
+        raise ValueError("entity_candidate_manifest 必须声明排除会议事实联网核验")
+    if scope_policy.get("network_admission_policy") != "uncertain_only_v1":
+        raise ValueError("entity_candidate_manifest 必须只允许真实身份歧义进入联网核验")
+    for index, candidate in enumerate(candidates, start=1):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"entity_candidate_manifest.candidates[{index}] 必须是 JSON object")
+        kinds = candidate.get("verification_kinds")
+        if not isinstance(kinds, list) or not kinds:
+            raise ValueError(f"entity_candidate_manifest.candidates[{index}].verification_kinds 不得为空")
+        unknown_kinds = sorted({str(item) for item in kinds} - ALLOWED_VERIFICATION_KINDS)
+        if unknown_kinds:
+            raise ValueError(
+                "entity_candidate_manifest 包含越界会议事实 verification_kinds: "
+                + ", ".join(unknown_kinds)
+            )
+        reason_codes = candidate.get("verification_reason_codes")
+        if not isinstance(reason_codes, list) or not reason_codes:
+            raise ValueError(
+                f"entity_candidate_manifest.candidates[{index}].verification_reason_codes 不得为空"
+            )
+        unknown_reasons = sorted(set(reason_codes) - ALLOWED_NETWORK_VERIFICATION_REASONS)
+        if unknown_reasons:
+            raise ValueError(
+                "entity_candidate_manifest 包含未知联网准入原因: " + ", ".join(unknown_reasons)
+            )
+        relation_kinds = candidate.get("relation_kind", [])
+        if not isinstance(relation_kinds, list):
+            raise ValueError(f"entity_candidate_manifest.candidates[{index}].relation_kind 必须是 array")
+        unknown_relations = sorted({str(item) for item in relation_kinds} - ALLOWED_RELATION_KINDS)
+        if unknown_relations:
+            raise ValueError(
+                "entity_candidate_manifest 包含越界会议事实 relation_kind: "
+                + ", ".join(unknown_relations)
+            )
+        if candidate.get("public_keywords") not in (None, []):
+            raise ValueError("entity_candidate_manifest 不得向联网 verifier 传递会议事实检索关键词")
+    candidate_ids = [
+        str(item.get("candidate_id") or "")
+        for item in candidates
+        if isinstance(item, dict)
+    ]
+    if len(candidate_ids) != len(candidates) or any(not item for item in candidate_ids):
+        raise ValueError("entity_candidate_manifest candidate_id 必须非空")
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError("entity_candidate_manifest candidate_id 必须唯一")
+    if canonical_json_digest(candidates) != str(manifest.get("candidate_set_sha256") or ""):
+        raise ValueError("entity_candidate_manifest candidate_set_sha256 与 candidates 不一致")
+    grouped_ids = [
+        str(candidate_id)
+        for group in groups
+        if isinstance(group, dict)
+        for candidate_id in group.get("candidate_ids", [])
+    ]
+    if len(grouped_ids) != len(set(grouped_ids)) or set(grouped_ids) != set(candidate_ids):
+        raise ValueError("entity_candidate_manifest groups 必须恰好覆盖全部 candidates 一次")
+    if mode == "single":
+        if shards or manifest.get("single_packet") in (None, []):
+            raise ValueError("single entity manifest 必须无 shards 且包含 single_packet")
+    else:
+        if not shards or manifest.get("single_packet") not in ([], None):
+            raise ValueError("parallel entity manifest 必须包含 shards 且不含 single_packet")
+        assigned: list[str] = []
+        artifact_types: set[str] = set()
+        shard_ids: set[str] = set()
+        for shard in shards:
+            if not isinstance(shard, dict):
+                raise ValueError("entity_candidate_manifest shard 必须是 JSON object")
+            shard_id = str(shard.get("shard_id") or "")
+            artifact_type = str(shard.get("artifact_type") or "")
+            shard_candidate_ids = [str(item) for item in shard.get("candidate_ids", [])]
+            if not shard_id or shard_id in shard_ids:
+                raise ValueError("entity_candidate_manifest shard_id 必须唯一且非空")
+            if (
+                not artifact_type.startswith(ENTITY_VERIFICATION_SHARD_PREFIX)
+                or not SAFE_DYNAMIC_ARTIFACT.fullmatch(artifact_type)
+                or artifact_type in artifact_types
+            ):
+                raise ValueError("entity_candidate_manifest artifact_type 必须是唯一安全的 entity shard key")
+            if not shard_candidate_ids or len(shard_candidate_ids) != len(set(shard_candidate_ids)):
+                raise ValueError(f"entity_candidate_manifest {shard_id} candidate_ids 必须非空且唯一")
+            if not set(shard_candidate_ids) <= set(candidate_ids):
+                raise ValueError(f"entity_candidate_manifest {shard_id} 包含未知 candidate_id")
+            digest_payload = {
+                key: item
+                for key, item in shard.items()
+                if key not in {"input_sha256", "shard_sha256"}
+            }
+            expected_digest = canonical_json_digest(digest_payload)
+            if shard.get("shard_sha256") != expected_digest or shard.get("input_sha256") != expected_digest:
+                raise ValueError(f"entity_candidate_manifest {shard_id} shard hash 与内容不一致")
+            assigned.extend(shard_candidate_ids)
+            artifact_types.add(artifact_type)
+            shard_ids.add(shard_id)
+        if len(assigned) != len(set(assigned)) or set(assigned) != set(candidate_ids):
+            raise ValueError("entity_candidate_manifest shards 必须恰好覆盖全部 candidates 一次")
+    if manifest.get("candidate_count") != len(candidates) or manifest.get("group_count") != len(groups):
+        raise ValueError("entity_candidate_manifest candidate_count/group_count 与内容不一致")
+    if manifest.get("shard_count") != len(shards):
+        raise ValueError("entity_candidate_manifest shard_count 与内容不一致")
+    digest_payload = {key: item for key, item in manifest.items() if key != "manifest_sha256"}
+    if manifest.get("manifest_sha256") != canonical_json_digest(digest_payload):
+        raise ValueError("entity_candidate_manifest manifest_sha256 与内容不一致")
+    max_parallel = policy.get("max_parallel")
+    if not isinstance(max_parallel, int) or isinstance(max_parallel, bool) or not 1 <= max_parallel <= 8:
+        raise ValueError("entity_candidate_manifest policy.max_parallel 必须在 1 到 8 之间")
+    shard_target_weight = policy.get("shard_target_weight")
+    if (
+        not isinstance(shard_target_weight, int)
+        or isinstance(shard_target_weight, bool)
+        or not 1 <= shard_target_weight <= 1_000_000
+    ):
+        raise ValueError("entity_candidate_manifest policy.shard_target_weight 必须在 1 到 1000000 之间")
+    max_entity_waves = policy.get("max_entity_waves")
+    if (
+        not isinstance(max_entity_waves, int)
+        or isinstance(max_entity_waves, bool)
+        or not 1 <= max_entity_waves <= 64
+    ):
+        raise ValueError("entity_candidate_manifest policy.max_entity_waves 必须在 1 到 64 之间")
+    max_shard_count = policy.get("max_shard_count")
+    if max_shard_count != max_parallel * max_entity_waves:
+        raise ValueError("entity_candidate_manifest policy.max_shard_count 必须等于 max_parallel * max_entity_waves")
+    if mode == "parallel" and not 2 <= len(shards) <= min(len(groups), max_shard_count):
+        raise ValueError("parallel entity manifest shard 数必须在 2 到 group/wave 容量上限之间")
+    return manifest
+
+
+def normalized_fidelity_diff_manifest(value: Any) -> dict[str, Any] | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("fidelity_diff_manifest 必须是 JSON object")
+    manifest = copy.deepcopy(value)
+    if manifest.get("schema_version") != "1.0" or manifest.get("artifact_type") != "fidelity_diff_manifest":
+        raise ValueError("fidelity_diff_manifest schema/artifact_type 不合法")
+    for field in ("source_sha256", "draft_sha256", "span_map_sha256", "manifest_sha256"):
+        if not HEX_SHA256.fullmatch(str(manifest.get(field) or "")):
+            raise ValueError(f"fidelity_diff_manifest.{field} 必须是小写 SHA-256")
+    core = {
+        key: item
+        for key, item in manifest.items()
+        if key not in {
+            "shards", "shard_count", "shard_artifact_types", "manifest_sha256", "deterministic_hash"
+        }
+    }
+    if manifest.get("manifest_sha256") != canonical_json_digest(core):
+        raise ValueError("fidelity_diff_manifest.manifest_sha256 与 core 内容不一致")
+    if manifest.get("deterministic_hash") != manifest.get("manifest_sha256"):
+        raise ValueError("fidelity_diff_manifest.deterministic_hash 与 manifest_sha256 不一致")
+    groups = manifest.get("groups")
+    review_groups = manifest.get("review_groups")
+    shards = manifest.get("shards")
+    if not isinstance(groups, list) or not isinstance(review_groups, list) or not isinstance(shards, list):
+        raise ValueError("fidelity_diff_manifest groups/review_groups/shards 必须是 arrays")
+    group_by_id: dict[str, dict[str, Any]] = {}
+    all_span_ids: set[str] = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ValueError("fidelity_diff_manifest group 必须是 object")
+        group_id = str(group.get("group_id") or "")
+        span_ids = [str(item) for item in group.get("span_ids", [])]
+        if not group_id or group_id in group_by_id or not span_ids or len(span_ids) != len(set(span_ids)):
+            raise ValueError("fidelity_diff_manifest group_id/span_ids 必须唯一且非空")
+        if all_span_ids & set(span_ids):
+            raise ValueError("fidelity_diff_manifest spans 不得跨 group 重叠")
+        all_span_ids.update(span_ids)
+        group_by_id[group_id] = group
+    review_group_ids = [str(item) for item in manifest.get("review_group_ids", [])]
+    if review_group_ids != [str(item.get("group_id") or "") for item in review_groups if isinstance(item, dict)]:
+        raise ValueError("fidelity_diff_manifest review_group_ids 与 review_groups 顺序不一致")
+    if any(group_id not in group_by_id for group_id in review_group_ids):
+        raise ValueError("fidelity_diff_manifest review_groups 包含未知 group")
+    semantic_required = manifest.get("semantic_review_required") is True
+    if semantic_required != bool(review_group_ids):
+        raise ValueError("fidelity_diff_manifest semantic_review_required 与 review groups 不一致")
+    if not semantic_required and shards:
+        raise ValueError("fidelity_diff_manifest no-change 路径不得生成 shards")
+    if semantic_required and not 1 <= len(shards) <= 3:
+        raise ValueError("fidelity_diff_manifest semantic review 必须生成 1 到 3 个 shards")
+    assigned_groups: list[str] = []
+    assigned_spans: list[str] = []
+    artifact_types: set[str] = set()
+    for shard in shards:
+        if not isinstance(shard, dict):
+            raise ValueError("fidelity_diff_manifest shard 必须是 object")
+        artifact_type = str(shard.get("artifact_type") or "")
+        group_ids = [str(item) for item in shard.get("group_ids", [])]
+        span_ids = [str(item) for item in shard.get("span_ids", [])]
+        if (
+            not artifact_type.startswith(FIDELITY_REVIEW_SHARD_PREFIX)
+            or not SAFE_DYNAMIC_ARTIFACT.fullmatch(artifact_type)
+            or artifact_type in artifact_types
+        ):
+            raise ValueError("fidelity_diff_manifest shard artifact_type 不安全或重复")
+        expected_spans = [
+            str(span_id)
+            for group_id in group_ids
+            for span_id in group_by_id.get(group_id, {}).get("span_ids", [])
+        ]
+        if not group_ids or group_ids != list(dict.fromkeys(group_ids)) or span_ids != expected_spans:
+            raise ValueError("fidelity_diff_manifest shard group/span coverage 不合法")
+        shard_core = {
+            "shard_id": shard.get("shard_id"),
+            "shard_number": shard.get("shard_number"),
+            "group_ids": group_ids,
+            "group_count": len(group_ids),
+            "span_ids": span_ids,
+            "source_sha256": manifest.get("source_sha256"),
+            "draft_sha256": manifest.get("draft_sha256"),
+            "span_map_sha256": manifest.get("span_map_sha256"),
+            "manifest_sha256": manifest.get("manifest_sha256"),
+        }
+        expected_hash = canonical_json_digest(shard_core)
+        if shard.get("input_sha256") != expected_hash or shard.get("shard_sha256") != expected_hash:
+            raise ValueError("fidelity_diff_manifest shard hash 与内容不一致")
+        assigned_groups.extend(group_ids)
+        assigned_spans.extend(span_ids)
+        artifact_types.add(artifact_type)
+    expected_review_spans = [
+        str(span_id)
+        for group_id in review_group_ids
+        for span_id in group_by_id[group_id].get("span_ids", [])
+    ]
+    if assigned_groups != review_group_ids or assigned_spans != expected_review_spans:
+        raise ValueError("fidelity_diff_manifest shards 必须按顺序完整覆盖 review groups/spans")
+    if manifest.get("shard_count") != len(shards) or manifest.get("shard_artifact_types") != [
+        str(shard.get("artifact_type") or "") for shard in shards
+    ]:
+        raise ValueError("fidelity_diff_manifest shard count/types 与内容不一致")
+    return manifest
+
+
+def entity_verification_summary(manifest: dict[str, Any] | None) -> dict[str, Any]:
+    mode = str(manifest.get("mode") or "") if manifest else "not_applicable"
+    return {
+        "requested_mode": str(manifest.get("requested_mode") or mode) if manifest else "not_applicable",
+        "effective_mode": mode,
+        "candidate_count": int(manifest.get("candidate_count") or 0) if manifest else 0,
+        "group_count": int(manifest.get("group_count") or 0) if manifest else 0,
+        "shard_count": int(manifest.get("shard_count") or 0) if manifest else 0,
+        "total_weight": int(manifest.get("total_weight") or 0) if manifest else 0,
+        "high_risk_count": int(manifest.get("high_risk_count") or 0) if manifest else 0,
+        "max_parallel": int((manifest.get("policy") or {}).get("max_parallel") or 3) if manifest else 3,
+        "max_entity_waves": int((manifest.get("policy") or {}).get("max_entity_waves") or 2) if manifest else 2,
+        "max_shard_count": int((manifest.get("policy") or {}).get("max_shard_count") or 6) if manifest else 6,
+    }
+
+
 def resolve_speaker_editing(
     requested_mode: Any,
     manifest: dict[str, Any] | None,
     materials: list[Any],
+    *,
+    source_mode: str,
+    risk_flags: list[str],
 ) -> dict[str, Any]:
     del materials
     mode = str(requested_mode or "auto").strip()
@@ -434,6 +863,11 @@ def resolve_speaker_editing(
             "shard_count": 0,
             "max_shard_chars": 0,
             "parallel_threshold_chars": AUTO_PARALLEL_SOURCE_CHARS,
+            "direct_document_threshold_chars": DIRECT_DOCUMENT_SOURCE_CHARS,
+            "structure_reliable": False,
+            "lossless_renderable": False,
+            "blocking_risks": sorted(set(risk_flags) & DIRECT_DOCUMENT_BLOCKING_RISKS),
+            "routing_risk_flags": sorted(set(risk_flags)),
         }
 
     source_char_count = sum(
@@ -446,13 +880,26 @@ def resolve_speaker_editing(
         for shard in manifest.get("shards", [])
         if isinstance(shard, dict)
     ]
+    source_profile = manifest.get("source_profile") if isinstance(manifest.get("source_profile"), dict) else {}
+    structure_reliable = bool(source_profile.get("structure_reliable"))
+    lossless_renderable = bool(source_profile.get("lossless_renderable"))
+    blocking_risks = sorted(set(risk_flags) & DIRECT_DOCUMENT_BLOCKING_RISKS)
     if mode == "auto":
-        if source_char_count > AUTO_PARALLEL_SOURCE_CHARS:
-            effective_mode = "full"
-            reason = "source_exceeds_parallel_context_threshold"
-        else:
+        if source_char_count <= AUTO_PARALLEL_SOURCE_CHARS:
             effective_mode = "skip"
             reason = "source_fits_main_workflow_context"
+        elif (
+            source_mode == "document_only"
+            and source_char_count <= DIRECT_DOCUMENT_SOURCE_CHARS
+            and structure_reliable
+            and lossless_renderable
+            and not blocking_risks
+        ):
+            effective_mode = "skip"
+            reason = "structured_clean_document_direct_render"
+        else:
+            effective_mode = "full"
+            reason = "document_requires_specialist_editing"
     else:
         effective_mode = mode
         reason = (
@@ -468,6 +915,41 @@ def resolve_speaker_editing(
         "shard_count": len(shard_char_counts),
         "max_shard_chars": max(shard_char_counts, default=0),
         "parallel_threshold_chars": AUTO_PARALLEL_SOURCE_CHARS,
+        "direct_document_threshold_chars": DIRECT_DOCUMENT_SOURCE_CHARS,
+        "structure_reliable": structure_reliable,
+        "lossless_renderable": lossless_renderable,
+        "blocking_risks": blocking_risks,
+        "routing_risk_flags": sorted(set(risk_flags)),
+    }
+
+
+def working_body_contract(
+    speaker_editing: dict[str, Any],
+    manifest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if speaker_editing.get("effective_mode") == "full":
+        return {
+            "owner": "Main Orchestrator",
+            "mode": "assembled_editing_body",
+            "source_binding": "editing_assembly_receipt",
+            "source_field": "assembled_draft_path",
+            "downstream_must_consume": True,
+        }
+    if manifest is not None:
+        return {
+            "owner": "Main Orchestrator",
+            "mode": "direct_manifest_body",
+            "source_binding": "speaker_turn_manifest",
+            "source_field": "turns",
+            "manifest_sha256": str(manifest.get("manifest_sha256") or ""),
+            "downstream_must_consume": True,
+        }
+    return {
+        "owner": "Main Orchestrator",
+        "mode": "main_workflow_source_body",
+        "source_binding": "source_manifest",
+        "source_field": "selected_primary_body_source",
+        "downstream_must_consume": True,
     }
 
 
@@ -578,6 +1060,24 @@ def output_shape_for(
 ) -> dict[str, Any]:
     artifact_schema = artifact_schema_name(artifact_type)
 
+    if artifact_schema == "entity_verification_shard":
+        return {
+            "task_id": str((identity or {}).get("task_id") or "<exact task_id from dispatch>"),
+            "results": [
+                {
+                    "candidate_id": str(candidate.get("candidate_id") or ""),
+                    "status": "unresolved",
+                    "canonical_name": "",
+                    "identity_key": "",
+                    "evidence_paths": [],
+                    "conflict_codes": [],
+                    "unresolved_reason": "insufficient public evidence",
+                }
+                for candidate in (task_context or {}).get("verification_packet", [])
+                if isinstance(candidate, dict)
+            ],
+        }
+
     def placeholder(field: str) -> Any:
         artifact_examples: dict[str, dict[str, Any]] = {
             "transcript_audit": {
@@ -592,8 +1092,60 @@ def output_shape_for(
                 "cross_check_source": "provided_document" if source_mode == "audio_plus_document" else "",
                 "manual_review_required": False,
             },
+            "entity_verification_shard": {
+                "manifest_sha256": str((task_context or {}).get("manifest_sha256") or "0" * 64),
+                "source_sha256": str((task_context or {}).get("source_sha256") or "0" * 64),
+                "candidate_set_sha256": str((task_context or {}).get("candidate_set_sha256") or "0" * 64),
+                "shard_sha256": str((task_context or {}).get("shard_sha256") or "0" * 64),
+                "shard_id": str((task_context or {}).get("shard_id") or "shard_001"),
+                "candidate_ids": [str(item) for item in (task_context or {}).get("candidate_ids", [])],
+                "status": "complete",
+                "results": [
+                    {
+                        "candidate_id": str(candidate.get("candidate_id") or ""),
+                        "input_term": str(candidate.get("candidate_term") or ""),
+                        "status": "unresolved",
+                        "canonical_name": "",
+                        "identity_key": "",
+                        "evidence_paths": [],
+                        "conflict_codes": [],
+                        "unresolved_reason": "insufficient public evidence",
+                    }
+                    for candidate in (task_context or {}).get("verification_packet", [])
+                    if isinstance(candidate, dict)
+                ],
+            },
             "target_attribution_review": {"segments_reviewed": 1},
             "fidelity_review": {"paragraphs_reviewed": 1},
+            "fidelity_review_shard": {
+                "manifest_sha256": str((task_context or {}).get("manifest_sha256") or "0" * 64),
+                "source_sha256": str((task_context or {}).get("source_sha256") or "0" * 64),
+                "draft_sha256": str((task_context or {}).get("draft_sha256") or "0" * 64),
+                "shard_sha256": str((task_context or {}).get("shard_sha256") or "0" * 64),
+                "shard_id": str((task_context or {}).get("shard_id") or "shard_001"),
+                "review_group_ids": [str(item) for item in (task_context or {}).get("review_group_ids", [])],
+                "span_ids": [str(item) for item in (task_context or {}).get("span_ids", [])],
+                "status": "complete",
+                "findings": [],
+                "unresolved_items": [],
+                "conflicts": [],
+                "evidence_mappings": [],
+                "source_mapping_failures": [],
+                "summary_compression_findings": [],
+                "pronoun_rewrite_findings": [],
+                "omission_findings": [],
+                "recommended_revisions": [],
+            },
+            "final_semantic_review": {
+                "scope_sha256": str((task_context or {}).get("scope_sha256") or "0" * 64),
+                "draft_sha256": str((task_context or {}).get("draft_sha256") or "0" * 64),
+                "reviewed_span_ids": [
+                    str(item.get("span_id") or "")
+                    for item in (task_context or {}).get("spans", [])
+                    if isinstance(item, dict)
+                ],
+                "status": "complete",
+            },
             "speaker_turn_edit": {
                 "manifest_sha256": str((task_context or {}).get("manifest_sha256") or "0" * 64),
                 "shard_id": str((task_context or {}).get("shard_id") or "package_001"),
@@ -706,6 +1258,28 @@ def prompt_for_task(
             )
         return "\n".join(lines)
 
+    if artifact_schema == "entity_verification_shard":
+        return "\n".join(
+            [
+                "Use $investment-meeting-minutes for this process-only Entity Verifier task.",
+                f"Run profile: {run_profile}; source mode: {source_mode}.",
+                "Verify every assigned candidate exactly once and preserve candidate order.",
+                "Do not write, modify, assemble, or export final Markdown.",
+                "Do not modify repository files or meeting-note files.",
+                "Use fresh public evidence for this run; do not read historical shard results or caches.",
+                "External sources may verify entity names, security codes, and terminology only.",
+                "Do not verify, reject, or rewrite customer/supplier relationships, product attribution, orders, prices, forecasts, numbers, dates, or other meeting-content claims.",
+                "Do not request or transmit meeting excerpts, recordings, private paths, or unrelated context.",
+                "Return only JSON. Use exactly two top-level fields: task_id and results.",
+                "Copy the exact task_id shown in Run Context.",
+                "Each results item must contain exactly candidate_id, status, canonical_name, identity_key, evidence_paths, conflict_codes, and unresolved_reason.",
+                "Do not return input_term, run_id, hashes, shard metadata, candidate_ids, an artifact envelope, doubtful_items, entity_verification_report, or final Markdown.",
+                "If evidence is insufficient or conflicting, set status=unresolved and explain why; do not guess.",
+                "Assigned minimal candidate packet:",
+                json.dumps((task_context or {}).get("verification_packet", []), ensure_ascii=False, sort_keys=True),
+            ]
+        )
+
     lines = [
         "Use $investment-meeting-minutes for this process-only specialist task.",
         f"Role: {spec['role']}.",
@@ -714,7 +1288,8 @@ def prompt_for_task(
         "Do not write, modify, assemble, or export final Markdown.",
         "Do not modify repository files or meeting-note files; return the requested process artifact only.",
         "Use only current-session meeting materials as meeting-content evidence.",
-        "External sources may verify names, codes, terms, and public facts only.",
+        "External sources may verify entity names, security codes, and terminology only.",
+        "Do not confirm, reject, or mark doubtful any customer/supplier relationship, product attribution, order, price, forecast, number, date, or other meeting-content claim from public-source availability.",
         "Do not upload private meeting materials, transcripts, recordings, or local paths to external services.",
         "Return only JSON. Do not include prose outside JSON.",
         f"Primary artifact: {artifact_type}.",
@@ -745,7 +1320,11 @@ def prompt_for_task(
     elif artifact_type == "entity_verification_report":
         lines.append("Every items entry must appear in exactly one of confirmed_items or unresolved_items.")
         lines.append("Do not copy local_candidate_paths into external_evidence_paths.")
-        lines.append("If entity evidence is insufficient, put the exact item in unresolved_items and doubtful_items; do not guess.")
+        lines.append("If name/code/term identity evidence is insufficient, put the exact item in unresolved_items and doubtful_items; do not guess.")
+        lines.append("A private meeting claim is source content, not an entity-verification target; lack of public evidence must not create a doubtful item.")
+        if task_context and task_context.get("verification_packet"):
+            lines.append("Verify only this minimal candidate packet; do not request long meeting excerpts or private paths:")
+            lines.append(json.dumps(task_context["verification_packet"], ensure_ascii=False, sort_keys=True))
     elif artifact_type == "target_attribution_review":
         lines.append("segments_reviewed must be a positive integer for the actual reviewed scope.")
         lines.append(
@@ -787,6 +1366,23 @@ def prompt_markdown(bundle: dict[str, Any], task: dict[str, Any]) -> str:
                 "# MAS Speaker Turn Editor Task",
                 "",
                 "## Instructions and Assigned Source",
+                "",
+                str(task["prompt"]),
+                "",
+            ]
+        )
+    if task.get("artifact_schema") == "entity_verification_shard":
+        return "\n".join(
+            [
+                "# MAS Entity Verifier Task",
+                "",
+                "## Trusted Dispatch Identity",
+                "",
+                f"- task_id: `{task.get('task_id', '')}`",
+                f"- artifact_type: `{artifact_type}`",
+                f"- dispatch_phase: `{dispatch_phase}`",
+                "",
+                "## Instructions and Candidate Packet",
                 "",
                 str(task["prompt"]),
                 "",
@@ -929,7 +1525,7 @@ def dispatch_protocol() -> dict[str, Any]:
         "dispatch": "Spawn one read-only/process-only subagent per generated task file only when that task's dispatch_phase is ready; otherwise use the prompts as a manual checklist.",
         "parallelism": "Tasks in the same dispatch_phase may run in parallel after the main workflow has prepared role-relevant current-session materials.",
         "phases": DISPATCH_PHASES,
-        "return_contract": "Speaker editors return only ordered turn_id/edited_text arrays; other subagents return the requested JSON artifact. The main workflow binds, validates, and consumes them.",
+        "return_contract": "Speaker editors return only ordered turn_id/edited_text arrays. Entity verification shards return compact task_id/results evidence; ingest binds trusted run, hash, shard, order, and envelope fields. Other subagents return the requested JSON artifact.",
         "main_workflow_after_return": [
             "run_mas_phase_operator.py",
             "create_mas_source_manifest.py",
@@ -990,18 +1586,52 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
         request.get("speaker_editing_mode"),
         speaker_turn_manifest,
         materials,
+        source_mode=source_mode,
+        risk_flags=risk_flags,
     )
     speaker_editing_enabled = speaker_editing["effective_mode"] == "full"
-    inferred_risks = infer_risk_flags(run_profile, source_mode, risk_flags, source_selection_status)
+    entity_candidate_manifest = normalized_entity_candidate_manifest(request.get("entity_candidate_manifest"))
+    if entity_candidate_manifest is not None and materials:
+        if entity_candidate_manifest.get("source_hash_kind") != "provided":
+            raise ValueError("有真实会议材料时 entity_candidate_manifest 必须绑定选定源文件 SHA-256")
+        if (
+            speaker_turn_manifest is not None
+            and entity_candidate_manifest.get("source_sha256")
+            != speaker_turn_manifest.get("source_sha256")
+        ):
+            raise ValueError("entity_candidate_manifest 与 speaker_turn_manifest 未绑定同一正文源")
+    final_semantic_review_scope = normalized_final_semantic_review_scope(
+        request.get("final_semantic_review_scope")
+    )
+    fidelity_diff_manifest = normalized_fidelity_diff_manifest(request.get("fidelity_diff_manifest"))
+    effective_risk_flags = list(risk_flags)
+    if entity_candidate_manifest is not None:
+        effective_risk_flags = sorted(set(effective_risk_flags) | {"entity_verification"})
+    entity_verification = entity_verification_summary(entity_candidate_manifest)
+    entity_mode = str(entity_verification["effective_mode"])
+    entity_parallel_enabled = entity_mode == "parallel"
+    inferred_risks = infer_risk_flags(run_profile, source_mode, effective_risk_flags, source_selection_status)
     if speaker_editing_enabled:
         inferred_risks = sorted(set(inferred_risks) | {"speaker_turn_editing"})
     expected_artifacts = select_expected_artifacts(
         run_profile,
         source_mode,
         meeting_type,
-        risk_flags,
+        effective_risk_flags,
         source_selection_status,
     )
+    if final_semantic_review_scope is not None:
+        expected_artifacts = sorted(set(expected_artifacts) | {"final_semantic_review"})
+    if fidelity_diff_manifest is not None:
+        expected_artifacts = sorted(
+            (set(expected_artifacts) - {"fidelity_review"})
+            | {"fidelity_review", "fidelity_review_assembly_receipt"}
+            | {
+                str(shard.get("artifact_type") or "")
+                for shard in fidelity_diff_manifest.get("shards", [])
+                if isinstance(shard, dict)
+            }
+        )
     if speaker_editing_enabled:
         expected_artifacts = sorted(
             set(expected_artifacts)
@@ -1012,10 +1642,32 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(shard, dict)
             }
         )
+    if entity_parallel_enabled:
+        expected_artifacts = sorted(
+            set(expected_artifacts)
+            | {"entity_verification_assembly_receipt"}
+            | {
+                str(shard.get("artifact_type") or "")
+                for shard in entity_candidate_manifest.get("shards", [])
+                if isinstance(shard, dict)
+            }
+        )
+    main_owned_artifacts = {
+        "source_manifest",
+        "editing_assembly_receipt",
+        "entity_verification_assembly_receipt",
+        "doubtful_items",
+        "export_manifest",
+        "fidelity_review_assembly_receipt",
+    }
+    if entity_parallel_enabled:
+        main_owned_artifacts.add("entity_verification_report")
+    if fidelity_diff_manifest is not None:
+        main_owned_artifacts.add("fidelity_review")
     task_artifacts = [
         artifact
         for artifact in expected_artifacts
-        if artifact not in {"source_manifest", "editing_assembly_receipt", "doubtful_items"}
+        if artifact not in main_owned_artifacts
     ]
     turn_by_id = {
         str(turn.get("turn_id") or ""): turn
@@ -1026,6 +1678,21 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
         str(shard.get("artifact_type") or ""): shard
         for shard in (speaker_turn_manifest or {}).get("shards", [])
         if isinstance(shard, dict)
+    }
+    entity_shard_by_artifact = {
+        str(shard.get("artifact_type") or ""): shard
+        for shard in (entity_candidate_manifest or {}).get("shards", [])
+        if isinstance(shard, dict)
+    }
+    fidelity_shard_by_artifact = {
+        str(shard.get("artifact_type") or ""): shard
+        for shard in (fidelity_diff_manifest or {}).get("shards", [])
+        if isinstance(shard, dict)
+    }
+    fidelity_group_by_id = {
+        str(group.get("group_id") or ""): group
+        for group in (fidelity_diff_manifest or {}).get("review_groups", [])
+        if isinstance(group, dict)
     }
     tasks = []
     for artifact in task_artifacts:
@@ -1047,6 +1714,46 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
                     for turn_id in shard.get("turn_ids", [])
                 ],
             }
+        elif artifact_schema_name(artifact) == "entity_verification_shard":
+            shard = entity_shard_by_artifact[artifact]
+            task_context = {
+                "manifest_sha256": str(entity_candidate_manifest.get("manifest_sha256") or ""),
+                "source_sha256": str(entity_candidate_manifest.get("source_sha256") or ""),
+                "candidate_set_sha256": str(entity_candidate_manifest.get("candidate_set_sha256") or ""),
+                "shard_sha256": str(shard.get("shard_sha256") or ""),
+                "shard_id": str(shard.get("shard_id") or ""),
+                "candidate_ids": [str(item) for item in shard.get("candidate_ids", [])],
+                "group_ids": [str(item) for item in shard.get("group_ids", [])],
+                "verification_packet": copy.deepcopy(shard.get("verification_packet", [])),
+            }
+        elif artifact == "entity_verification_report" and entity_candidate_manifest is not None:
+            task_context = {
+                "manifest_sha256": str(entity_candidate_manifest.get("manifest_sha256") or ""),
+                "source_sha256": str(entity_candidate_manifest.get("source_sha256") or ""),
+                "candidate_set_sha256": str(entity_candidate_manifest.get("candidate_set_sha256") or ""),
+                "candidate_ids": [
+                    str(candidate.get("candidate_id") or "")
+                    for candidate in entity_candidate_manifest.get("candidates", [])
+                    if isinstance(candidate, dict)
+                ],
+                "verification_packet": copy.deepcopy(entity_candidate_manifest.get("single_packet", [])),
+            }
+        elif artifact == "final_semantic_review" and final_semantic_review_scope is not None:
+            task_context = copy.deepcopy(final_semantic_review_scope)
+        elif artifact_schema_name(artifact) == "fidelity_review_shard":
+            shard = fidelity_shard_by_artifact[artifact]
+            group_ids = [str(item) for item in shard.get("group_ids", [])]
+            task_context = {
+                "manifest_sha256": str(fidelity_diff_manifest.get("manifest_sha256") or ""),
+                "source_sha256": str(fidelity_diff_manifest.get("source_sha256") or ""),
+                "draft_sha256": str(fidelity_diff_manifest.get("draft_sha256") or ""),
+                "span_map_sha256": str(fidelity_diff_manifest.get("span_map_sha256") or ""),
+                "shard_sha256": str(shard.get("shard_sha256") or ""),
+                "shard_id": str(shard.get("shard_id") or ""),
+                "review_group_ids": group_ids,
+                "span_ids": [str(item) for item in shard.get("span_ids", [])],
+                "review_groups": [copy.deepcopy(fidelity_group_by_id[group_id]) for group_id in group_ids],
+            }
         tasks.append(build_task(artifact, run_profile, source_mode, task_context=task_context))
     tasks.sort(key=lambda task: (PHASE_ORDER[str(task["dispatch_phase"])], str(task["artifact_type"])))
 
@@ -1059,8 +1766,19 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
         "mas_required": should_use_mas(run_profile, source_mode, risk_flags, source_selection_status),
         "risk_flags": inferred_risks,
         "materials": copy.deepcopy(materials),
+        "entity_candidate_manifest": entity_candidate_manifest,
+        "entity_verification": entity_verification,
+        "final_semantic_review_scope": final_semantic_review_scope,
+        "fidelity_diff_manifest": fidelity_diff_manifest,
+        "export_manifest_policy": {
+            "schema_version": "2.0",
+            "generation_mode": "deterministic_main_owned_v1",
+            "owner": "Main Orchestrator",
+            "legacy_specialist_manifest_accepted": False,
+        },
         "speaker_turn_manifest": speaker_turn_manifest,
         "speaker_editing": speaker_editing,
+        "working_body_contract": working_body_contract(speaker_editing, speaker_turn_manifest),
         "main_orchestrator": {
             "final_writer_only": True,
             "must_not_delegate": [
@@ -1072,7 +1790,27 @@ def build_bundle_from_request(request: dict[str, Any]) -> dict[str, Any]:
             "decision_outputs": ["automatic_pass", "automatic_doubtful", "repair_required", "request_user"],
         },
         "expected_artifacts": expected_artifacts,
-        "artifact_owners": artifact_owners(expected_artifacts),
+        "artifact_owners": {
+            **artifact_owners(expected_artifacts),
+            "export_manifest": "Main Orchestrator",
+            **(
+                {
+                    "fidelity_review": "Main Orchestrator",
+                    "fidelity_review_assembly_receipt": "Main Orchestrator",
+                }
+                if fidelity_diff_manifest is not None
+                else {}
+            ),
+            **(
+                {
+                    "entity_verification_report": "Main Orchestrator",
+                    "doubtful_items": "Main Orchestrator",
+                    "entity_verification_assembly_receipt": "Main Orchestrator",
+                }
+                if entity_parallel_enabled
+                else {}
+            ),
+        },
         "dispatch_protocol": dispatch_protocol(),
         "tasks": tasks,
         "validation": {
@@ -1127,7 +1865,12 @@ def validate_bundle(
     if expected_artifacts and not isinstance(owners, dict):
         errors.append("MAS task bundle artifact_owners 必须是 JSON object")
         owners = {}
-    if bundle.get("mas_required") and not tasks:
+    if (
+        bundle.get("mas_required")
+        and not tasks
+        and set(str(item) for item in expected_artifacts)
+        - {"source_manifest", "export_manifest", "fidelity_review", "fidelity_review_assembly_receipt"}
+    ):
         errors.append("MAS task bundle 启用 MAS 时必须包含 specialist tasks")
     for artifact in expected_artifacts:
         if str(artifact) not in owners:
@@ -1139,8 +1882,25 @@ def validate_bundle(
         errors.append("MAS task bundle expected_artifacts 不得重复")
     risk_flags: list[str] = []
     speaker_turn_manifest: dict[str, Any] | None = None
+    entity_candidate_manifest: dict[str, Any] | None = None
+    final_semantic_review_scope: dict[str, Any] | None = None
+    fidelity_diff_manifest: dict[str, Any] | None = None
     try:
         speaker_turn_manifest = normalized_speaker_turn_manifest(bundle.get("speaker_turn_manifest"))
+    except ValueError as exc:
+        errors.append(str(exc))
+    try:
+        fidelity_diff_manifest = normalized_fidelity_diff_manifest(bundle.get("fidelity_diff_manifest"))
+    except ValueError as exc:
+        errors.append(str(exc))
+    try:
+        entity_candidate_manifest = normalized_entity_candidate_manifest(bundle.get("entity_candidate_manifest"))
+    except ValueError as exc:
+        errors.append(str(exc))
+    try:
+        final_semantic_review_scope = normalized_final_semantic_review_scope(
+            bundle.get("final_semantic_review_scope")
+        )
     except ValueError as exc:
         errors.append(str(exc))
     if (
@@ -1165,12 +1925,20 @@ def validate_bundle(
             declared_speaker_editing.get("requested_mode"),
             speaker_turn_manifest,
             list(bundle.get("materials") or []),
+            source_mode=source_mode,
+            risk_flags=[str(item) for item in declared_speaker_editing.get("routing_risk_flags", [])],
         )
         if declared_speaker_editing != speaker_editing:
             errors.append("MAS task bundle speaker_editing 与 manifest/materials 自适应判定不一致")
     except ValueError as exc:
         errors.append(str(exc))
     speaker_editing_enabled = speaker_editing.get("effective_mode") == "full"
+    if bundle.get("working_body_contract") != working_body_contract(speaker_editing, speaker_turn_manifest):
+        errors.append("MAS task bundle working_body_contract 与 editing mode/manifest 绑定不一致")
+    entity_verification = entity_verification_summary(entity_candidate_manifest)
+    if bundle.get("entity_verification") != entity_verification:
+        errors.append("MAS task bundle entity_verification 与 entity_candidate_manifest 不一致")
+    entity_parallel_enabled = entity_verification.get("effective_mode") == "parallel"
     if not isinstance(bundle.get("mas_required"), bool):
         errors.append("MAS task bundle mas_required 必须是 boolean")
     if not configuration_errors and isinstance(bundle.get("mas_required"), bool):
@@ -1198,6 +1966,23 @@ def validate_bundle(
                 for shard in speaker_turn_manifest.get("shards", [])
                 if isinstance(shard, dict)
             )
+        if entity_parallel_enabled:
+            canonical_expected.add("entity_verification_assembly_receipt")
+            canonical_expected.update(
+                str(shard.get("artifact_type") or "")
+                for shard in entity_candidate_manifest.get("shards", [])
+                if isinstance(shard, dict)
+            )
+        if final_semantic_review_scope is not None:
+            canonical_expected.add("final_semantic_review")
+        if fidelity_diff_manifest is not None:
+            canonical_expected.discard("fidelity_review")
+            canonical_expected.update({"fidelity_review", "fidelity_review_assembly_receipt"})
+            canonical_expected.update(
+                str(shard.get("artifact_type") or "")
+                for shard in fidelity_diff_manifest.get("shards", [])
+                if isinstance(shard, dict)
+            )
         if expected_set != canonical_expected:
             errors.append(
                 "MAS task bundle expected_artifacts 与 risk matrix 不一致: "
@@ -1211,9 +1996,40 @@ def validate_bundle(
         errors.append("audio_plus_document fidelity_review 缺少 source_reconciliation 依赖")
     produced_artifacts = {"source_manifest"} if bundle.get("mas_required") else set()
     producer_counts: dict[str, int] = {"source_manifest": 1} if bundle.get("mas_required") else {}
+    if bundle.get("mas_required"):
+        produced_artifacts.add("export_manifest")
+        producer_counts["export_manifest"] = 1
+    if fidelity_diff_manifest is not None:
+        for artifact in ("fidelity_review", "fidelity_review_assembly_receipt"):
+            produced_artifacts.add(artifact)
+            producer_counts[artifact] = 1
+            if isinstance(owners, dict) and owners.get(artifact) != "Main Orchestrator":
+                errors.append(f"Fidelity assembly {artifact} owner 必须为 Main Orchestrator")
+    if bundle.get("export_manifest_policy") != {
+        "schema_version": "2.0",
+        "generation_mode": "deterministic_main_owned_v1",
+        "owner": "Main Orchestrator",
+        "legacy_specialist_manifest_accepted": False,
+    }:
+        errors.append("MAS task bundle export_manifest_policy 非确定性 main-owned v2")
     if speaker_editing_enabled:
         produced_artifacts.add("editing_assembly_receipt")
         producer_counts["editing_assembly_receipt"] = 1
+    if entity_parallel_enabled:
+        for artifact in (
+            "entity_verification_report",
+            "doubtful_items",
+            "entity_verification_assembly_receipt",
+        ):
+            produced_artifacts.add(artifact)
+            producer_counts[artifact] = 1
+        for artifact in (
+            "entity_verification_report",
+            "doubtful_items",
+            "entity_verification_assembly_receipt",
+        ):
+            if isinstance(owners, dict) and owners.get(artifact) != "Main Orchestrator":
+                errors.append(f"并行实体核验 {artifact} owner 必须为 Main Orchestrator")
     manifest_turn_by_id = {
         str(turn.get("turn_id") or ""): turn
         for turn in (speaker_turn_manifest or {}).get("turns", [])
@@ -1239,6 +2055,56 @@ def validate_bundle(
         for shard in (speaker_turn_manifest or {}).get("shards", [])
         if isinstance(shard, dict)
     }
+    canonical_entity_contexts = {
+        str(shard.get("artifact_type") or ""): {
+            "manifest_sha256": str((entity_candidate_manifest or {}).get("manifest_sha256") or ""),
+            "source_sha256": str((entity_candidate_manifest or {}).get("source_sha256") or ""),
+            "candidate_set_sha256": str((entity_candidate_manifest or {}).get("candidate_set_sha256") or ""),
+            "shard_sha256": str(shard.get("shard_sha256") or ""),
+            "shard_id": str(shard.get("shard_id") or ""),
+            "candidate_ids": [str(item) for item in shard.get("candidate_ids", [])],
+            "group_ids": [str(item) for item in shard.get("group_ids", [])],
+            "verification_packet": copy.deepcopy(shard.get("verification_packet", [])),
+        }
+        for shard in (entity_candidate_manifest or {}).get("shards", [])
+        if isinstance(shard, dict)
+    }
+    fidelity_group_by_id = {
+        str(group.get("group_id") or ""): group
+        for group in (fidelity_diff_manifest or {}).get("review_groups", [])
+        if isinstance(group, dict)
+    }
+    canonical_fidelity_contexts = {
+        str(shard.get("artifact_type") or ""): {
+            "manifest_sha256": str((fidelity_diff_manifest or {}).get("manifest_sha256") or ""),
+            "source_sha256": str((fidelity_diff_manifest or {}).get("source_sha256") or ""),
+            "draft_sha256": str((fidelity_diff_manifest or {}).get("draft_sha256") or ""),
+            "span_map_sha256": str((fidelity_diff_manifest or {}).get("span_map_sha256") or ""),
+            "shard_sha256": str(shard.get("shard_sha256") or ""),
+            "shard_id": str(shard.get("shard_id") or ""),
+            "review_group_ids": [str(item) for item in shard.get("group_ids", [])],
+            "span_ids": [str(item) for item in shard.get("span_ids", [])],
+            "review_groups": [
+                copy.deepcopy(fidelity_group_by_id[str(group_id)])
+                for group_id in shard.get("group_ids", [])
+                if str(group_id) in fidelity_group_by_id
+            ],
+        }
+        for shard in (fidelity_diff_manifest or {}).get("shards", [])
+        if isinstance(shard, dict)
+    }
+    if entity_candidate_manifest is not None and not entity_parallel_enabled:
+        canonical_entity_contexts["entity_verification_report"] = {
+            "manifest_sha256": str(entity_candidate_manifest.get("manifest_sha256") or ""),
+            "source_sha256": str(entity_candidate_manifest.get("source_sha256") or ""),
+            "candidate_set_sha256": str(entity_candidate_manifest.get("candidate_set_sha256") or ""),
+            "candidate_ids": [
+                str(candidate.get("candidate_id") or "")
+                for candidate in entity_candidate_manifest.get("candidates", [])
+                if isinstance(candidate, dict)
+            ],
+            "verification_packet": copy.deepcopy(entity_candidate_manifest.get("single_packet", [])),
+        }
     for task in tasks:
         if not isinstance(task, dict):
             errors.append("MAS task bundle task 必须是 JSON object")
@@ -1249,8 +2115,18 @@ def validate_bundle(
             errors.append(f"未知 MAS task artifact_type: {artifact_type}")
             continue
         canonical_task_context = canonical_edit_contexts.get(artifact_type)
+        if canonical_task_context is None:
+            canonical_task_context = canonical_entity_contexts.get(artifact_type)
+        if canonical_task_context is None:
+            canonical_task_context = canonical_fidelity_contexts.get(artifact_type)
         if artifact_schema == "speaker_turn_edit" and task.get("task_context") != canonical_task_context:
             errors.append(f"{artifact_type} task_context 与 speaker_turn_manifest 不一致")
+        if artifact_schema == "entity_verification_shard" and task.get("task_context") != canonical_task_context:
+            errors.append(f"{artifact_type} task_context 与 entity_candidate_manifest 不一致")
+        if artifact_type == "entity_verification_report" and canonical_task_context is not None and task.get("task_context") != canonical_task_context:
+            errors.append("entity_verification_report task_context 与 entity_candidate_manifest 不一致")
+        if artifact_schema == "fidelity_review_shard" and task.get("task_context") != canonical_task_context:
+            errors.append(f"{artifact_type} task_context 与 fidelity_diff_manifest 不一致")
         expected_task = build_task(
             artifact_type,
             run_profile,
@@ -1276,6 +2152,21 @@ def validate_bundle(
                 errors.append(f"{artifact_type} task {field} 与角色契约不一致")
         if task.get("secondary_required_fields") != expected_task.get("secondary_required_fields"):
             errors.append(f"{artifact_type} task secondary_required_fields 与角色契约不一致")
+        if artifact_schema == "entity_verification_shard":
+            expected_compact_shape = output_shape_for(
+                artifact_type,
+                [str(item) for item in task.get("secondary_artifacts", [])],
+                identity={
+                    "run_id": str(task.get("run_id") or ""),
+                    "task_id": str(task.get("task_id") or ""),
+                    "dispatch_phase": str(task.get("dispatch_phase") or ""),
+                    "artifact_owner": str(task.get("artifact_owner") or task.get("role") or ""),
+                },
+                source_mode=source_mode,
+                task_context=canonical_task_context,
+            )
+            if task.get("expected_output_shape") != expected_compact_shape:
+                errors.append(f"{artifact_type} task expected_output_shape 与紧凑返回契约不一致")
         produced_artifacts.add(artifact_type)
         producer_counts[artifact_type] = producer_counts.get(artifact_type, 0) + 1
         actual_secondary = task.get("secondary_artifacts")
@@ -1427,6 +2318,7 @@ def main() -> int:
     parser.add_argument("--material", action="append", default=[], help="当前会议材料路径，可重复")
     parser.add_argument("--speaker-turn-manifest", help="由 build_speaker_turn_manifest.py 生成的 JSON")
     parser.add_argument("--speaker-editing-mode", choices=sorted(SPEAKER_EDITING_MODES), help="发言人编辑路由：auto/skip/full")
+    parser.add_argument("--entity-candidate-manifest", help="由 build_entity_candidate_manifest.py 生成的 JSON")
     parser.add_argument("--out", help="写入 JSON 文件；默认输出到 stdout")
     parser.add_argument("--task-dir", help="写入 Codex-ready subagent prompt 文件和 dispatch manifest")
     parser.add_argument("--overwrite-dispatch", action="store_true", help="显式覆盖无 artifact 的已有 dispatch 文件")
@@ -1456,6 +2348,8 @@ def main() -> int:
             request["speaker_turn_manifest"] = read_json(Path(args.speaker_turn_manifest))
         if args.speaker_editing_mode:
             request["speaker_editing_mode"] = args.speaker_editing_mode
+        if args.entity_candidate_manifest:
+            request["entity_candidate_manifest"] = read_json(Path(args.entity_candidate_manifest))
 
         bundle = build_bundle_from_request(request)
         errors = validate_bundle(

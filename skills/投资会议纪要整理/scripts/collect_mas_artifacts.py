@@ -60,8 +60,24 @@ def required_artifacts_for_phase(bundle: dict[str, Any], through_phase: str | No
     required: set[str] = set()
     if "source_manifest" in expected:
         required.add("source_manifest")
+    for artifact in (
+        "entity_verification_report",
+        "doubtful_items",
+        "entity_verification_assembly_receipt",
+    ):
+        if artifact in expected and phase_index >= PHASE_ORDER["pre_draft"]:
+            required.add(artifact)
     if "editing_assembly_receipt" in expected and phase_index >= PHASE_ORDER["editing"]:
         required.add("editing_assembly_receipt")
+    for artifact in ("fidelity_review", "fidelity_review_assembly_receipt"):
+        if (
+            artifact in expected
+            and isinstance(bundle.get("fidelity_diff_manifest"), dict)
+            and phase_index >= PHASE_ORDER["draft_review"]
+        ):
+            required.add(artifact)
+    if "export_manifest" in expected and phase_index >= PHASE_ORDER["final_verification"]:
+        required.add("export_manifest")
     for task in bundle.get("tasks", []):
         if not isinstance(task, dict):
             continue
@@ -150,6 +166,7 @@ def task_files_for_artifacts(records: list[dict[str, Any]], artifact_types: list
         files.append(
             {
                 "artifact_type": str(record.get("artifact_type") or ""),
+                "task_id": str(record.get("task_id") or ""),
                 "dispatch_phase": str(record.get("dispatch_phase") or ""),
                 "role": str(record.get("role") or ""),
                 "path": str(record.get("path") or ""),
@@ -231,8 +248,13 @@ def main_action_receipt_state(
     bundle: dict[str, Any],
     task_dir: Path,
     required_actions: list[str],
+    require_final_snapshot: bool = False,
 ) -> dict[str, Any]:
-    if not required_actions:
+    snapshot_only = require_final_snapshot and not required_actions
+    effective_actions = list(required_actions)
+    if snapshot_only:
+        effective_actions = ["final_validation_snapshot"]
+    if not effective_actions:
         return {"required": False, "valid": True, "errors": [], "recorded_actions": []}
     receipt = artifacts.get("main_action_receipt")
     if not isinstance(receipt, dict):
@@ -247,7 +269,7 @@ def main_action_receipt_state(
     if str(receipt.get("run_id") or "") != run_id:
         errors.append("main_action_receipt.run_id 与当前 dispatch 不匹配")
     recorded_actions = sorted({str(item).strip() for item in receipt.get("actions", []) if str(item).strip()})
-    missing_actions = sorted(set(required_actions) - set(recorded_actions))
+    missing_actions = [] if snapshot_only and recorded_actions else sorted(set(effective_actions) - set(recorded_actions))
     if missing_actions:
         errors.append("main_action_receipt 未覆盖当前动作: " + ", ".join(missing_actions))
     expected_digest = artifact_set_digest(artifacts)
@@ -278,6 +300,21 @@ def export_binding_errors(
     if not isinstance(export_manifest, dict):
         return []
     errors: list[str] = []
+    if export_manifest.get("schema_version") != "2.0" or export_manifest.get("generation_mode") != "deterministic_main_owned_v1":
+        errors.append("export_manifest 必须由主流程确定性 builder 生成 schema 2.0")
+    bindings = export_manifest.get("bindings")
+    if not isinstance(bindings, dict):
+        errors.append("export_manifest.bindings 缺失，无法复核确定性证据")
+        bindings = {}
+    bundle_binding = bindings.get("task_bundle")
+    bundle_path = task_dir / "mas_task_bundle.json"
+    if not isinstance(bundle_binding, dict):
+        errors.append("export_manifest.bindings.task_bundle 缺失")
+    elif (
+        bundle_binding.get("run_id") != bundle.get("run_id")
+        or bundle_binding.get("sha256") != file_sha256(bundle_path)
+    ):
+        errors.append("export_manifest task bundle 绑定已过期")
     markdown_path = resolve_runtime_path(task_dir, export_manifest.get("markdown_path"))
     if not markdown_path.is_file():
         errors.append(f"export_manifest Markdown 不存在: {markdown_path}")
@@ -285,6 +322,19 @@ def export_binding_errors(
     actual_hash = file_sha256(markdown_path)
     if actual_hash != str(export_manifest.get("markdown_sha256") or ""):
         errors.append("export_manifest.markdown_sha256 与当前 Markdown 不一致")
+    receipt_binding = bindings.get("main_action_receipt")
+    if not isinstance(receipt_binding, dict):
+        errors.append("export_manifest.bindings.main_action_receipt 缺失")
+    else:
+        receipt_path = resolve_runtime_path(task_dir, receipt_binding.get("path"))
+        if not receipt_path.is_file():
+            errors.append("export_manifest main_action_receipt 证据不存在")
+        else:
+            receipt_sha256 = file_sha256(receipt_path)
+            if receipt_binding.get("sha256") != receipt_sha256:
+                errors.append("export_manifest main_action_receipt 证据已被篡改")
+            if export_manifest.get("main_action_receipt_sha256") != receipt_sha256:
+                errors.append("export_manifest.main_action_receipt_sha256 与证据不一致")
     if receipt_state.get("required"):
         if not receipt_state.get("valid"):
             errors.append("export_manifest 不得建立在无效 main_action_receipt 上")
@@ -318,6 +368,53 @@ def export_binding_errors(
             sidecar_result = validate_verification_sidecar(sidecar_path, require_verification=True)
             for error in sidecar_result.get("errors", []):
                 errors.append(f"export_manifest verification sidecar: {error}")
+    sidecar_path_value = str(export_manifest.get("verification_sidecar_path") or "").strip()
+    if sidecar_path_value:
+        sidecar_path = resolve_runtime_path(task_dir, sidecar_path_value)
+        if sidecar_path.is_file() and file_sha256(sidecar_path) != export_manifest.get("verification_sidecar_sha256"):
+            errors.append("export_manifest.verification_sidecar_sha256 与当前 sidecar 不一致")
+
+    validator_records = export_manifest.get("validators_run")
+    if isinstance(validator_records, list):
+        for record in validator_records:
+            if not isinstance(record, dict):
+                continue
+            evidence_path = resolve_runtime_path(task_dir, record.get("evidence_path"))
+            if not evidence_path.is_file():
+                errors.append(f"export_manifest validator evidence 不存在: {record.get('name')}")
+                continue
+            if file_sha256(evidence_path) != record.get("evidence_sha256"):
+                errors.append(f"export_manifest validator evidence 已被篡改: {record.get('name')}")
+            try:
+                evidence_payload = read_json(evidence_path)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                evidence_payload = {}
+            evidence_candidates = [evidence_payload]
+            if isinstance(evidence_payload, dict):
+                evidence_candidates.extend(
+                    evidence_payload.get(key)
+                    for key in ("result", "validation", "validator_result")
+                    if isinstance(evidence_payload.get(key), dict)
+                )
+            if not any(
+                isinstance(item, dict)
+                and str(item.get("name") or item.get("validator_name") or item.get("check_name") or "") == record.get("name")
+                and item.get("ok") is record.get("ok")
+                for item in evidence_candidates
+            ):
+                errors.append(f"export_manifest validator evidence 内容不匹配: {record.get('name')}")
+        if canonical_json_digest(validator_records) != export_manifest.get("validator_evidence_sha256"):
+            errors.append("export_manifest.validator_evidence_sha256 与 validator records 不一致")
+    regression = export_manifest.get("regression_result")
+    if isinstance(regression, dict):
+        regression_path = resolve_runtime_path(task_dir, regression.get("evidence_path"))
+        if not regression_path.is_file():
+            errors.append("export_manifest regression evidence 不存在")
+        elif (
+            file_sha256(regression_path) != regression.get("evidence_sha256")
+            or file_sha256(regression_path) != export_manifest.get("regression_evidence_sha256")
+        ):
+            errors.append("export_manifest regression evidence 已被篡改或 hash 不一致")
     return errors
 
 
@@ -328,6 +425,142 @@ def artifact_context_errors(
 ) -> list[str]:
     """Bind specialist claims to the current dispatch and its sidecar files."""
     errors: list[str] = []
+    fidelity_manifest = bundle.get("fidelity_diff_manifest")
+    dynamic_fidelity_types = {
+        str(artifact_type)
+        for artifact_type in artifacts
+        if str(artifact_type).startswith("fidelity_review_shard__")
+    }
+    if dynamic_fidelity_types and not isinstance(fidelity_manifest, dict):
+        errors.append("fidelity review shard 缺少当前 bundle 的 fidelity_diff_manifest")
+    if isinstance(fidelity_manifest, dict):
+        expected_shards = {
+            str(shard.get("artifact_type") or ""): shard
+            for shard in fidelity_manifest.get("shards", [])
+            if isinstance(shard, dict)
+        }
+        unexpected = sorted(dynamic_fidelity_types - set(expected_shards))
+        if unexpected:
+            errors.append("存在未由 fidelity_diff_manifest 授权的 shard: " + ", ".join(unexpected))
+        shard_artifacts: dict[str, Any] = {}
+        for artifact_type, shard in expected_shards.items():
+            artifact = artifacts.get(artifact_type)
+            if not isinstance(artifact, dict):
+                continue
+            shard_artifacts[artifact_type] = artifact
+            for field, expected in (
+                ("manifest_sha256", fidelity_manifest.get("manifest_sha256")),
+                ("source_sha256", fidelity_manifest.get("source_sha256")),
+                ("draft_sha256", fidelity_manifest.get("draft_sha256")),
+                ("shard_sha256", shard.get("shard_sha256")),
+                ("shard_id", shard.get("shard_id")),
+                ("review_group_ids", shard.get("group_ids")),
+                ("span_ids", shard.get("span_ids")),
+            ):
+                if artifact.get(field) != expected:
+                    errors.append(f"{artifact_type}.{field} 与 fidelity_diff_manifest 不一致")
+        receipt = artifacts.get("fidelity_review_assembly_receipt")
+        report = artifacts.get("fidelity_review")
+        if isinstance(receipt, dict):
+            review_group_ids = [str(item) for item in fidelity_manifest.get("review_group_ids", [])]
+            group_by_id = {
+                str(group.get("group_id") or ""): group
+                for group in fidelity_manifest.get("review_groups", [])
+                if isinstance(group, dict)
+            }
+            span_ids = [
+                str(span_id)
+                for group_id in review_group_ids
+                for span_id in group_by_id.get(group_id, {}).get("span_ids", [])
+            ]
+            for field, expected in (
+                ("manifest_sha256", fidelity_manifest.get("manifest_sha256")),
+                ("shard_artifact_digest", canonical_json_digest(shard_artifacts)),
+                ("review_group_ids", review_group_ids),
+                ("span_ids", span_ids),
+            ):
+                if receipt.get(field) != expected:
+                    errors.append(f"fidelity_review_assembly_receipt.{field} 与当前 manifest/shards 不一致")
+            if isinstance(report, dict) and receipt.get("fidelity_review_sha256") != canonical_json_digest(report):
+                errors.append("fidelity_review_assembly_receipt.fidelity_review_sha256 与当前 report 不一致")
+    entity_manifest = bundle.get("entity_candidate_manifest")
+    dynamic_entity_types = {
+        str(artifact_type)
+        for artifact_type in artifacts
+        if str(artifact_type).startswith("entity_verification_shard__")
+    }
+    if dynamic_entity_types and not isinstance(entity_manifest, dict):
+        errors.append("entity verification shard 缺少当前 bundle 的 entity_candidate_manifest")
+    if isinstance(entity_manifest, dict) and str(entity_manifest.get("mode") or "") == "parallel":
+        candidate_ids = [
+            str(candidate.get("candidate_id") or "")
+            for candidate in entity_manifest.get("candidates", [])
+            if isinstance(candidate, dict)
+        ]
+        expected_types: set[str] = set()
+        returned_ids: list[str] = []
+        for shard in entity_manifest.get("shards", []):
+            if not isinstance(shard, dict):
+                continue
+            artifact_type = str(shard.get("artifact_type") or "")
+            expected_types.add(artifact_type)
+            artifact = artifacts.get(artifact_type)
+            if not isinstance(artifact, dict):
+                continue
+            if artifact.get("status") != "complete":
+                errors.append(f"{artifact_type}.status 未完成，不能汇总实体核验")
+            for field, expected in (
+                ("manifest_sha256", entity_manifest.get("manifest_sha256")),
+                ("source_sha256", entity_manifest.get("source_sha256")),
+                ("candidate_set_sha256", entity_manifest.get("candidate_set_sha256")),
+                ("shard_sha256", shard.get("shard_sha256")),
+                ("shard_id", shard.get("shard_id")),
+                ("candidate_ids", shard.get("candidate_ids")),
+            ):
+                if artifact.get(field) != expected:
+                    errors.append(f"{artifact_type}.{field} 与 entity_candidate_manifest 不一致")
+            results = artifact.get("results")
+            if not isinstance(results, list):
+                continue
+            actual_ids = [
+                str(result.get("candidate_id") or "")
+                for result in results
+                if isinstance(result, dict)
+            ]
+            expected_ids = [str(item) for item in shard.get("candidate_ids", [])]
+            if len(actual_ids) != len(results) or len(actual_ids) != len(set(actual_ids)):
+                errors.append(f"{artifact_type}.results candidate_id 必须唯一且非空")
+            if actual_ids != expected_ids:
+                errors.append(f"{artifact_type}.results 必须按 manifest 顺序恰好覆盖当前 shard")
+            returned_ids.extend(actual_ids)
+        unexpected = sorted(dynamic_entity_types - expected_types)
+        if unexpected:
+            errors.append("存在未由 entity_candidate_manifest 授权的 shard artifact: " + ", ".join(unexpected))
+        if expected_types <= set(artifacts):
+            if len(returned_ids) != len(set(returned_ids)):
+                errors.append("entity verification shards 全局 candidate_id 重复")
+            if set(returned_ids) != set(candidate_ids):
+                errors.append("entity verification shards 未恰好覆盖全部 candidates")
+        receipt = artifacts.get("entity_verification_assembly_receipt")
+        report = artifacts.get("entity_verification_report")
+        doubtful = artifacts.get("doubtful_items")
+        if isinstance(receipt, dict):
+            shard_artifacts = {
+                artifact_type: artifacts[artifact_type]
+                for artifact_type in sorted(expected_types)
+                if artifact_type in artifacts
+            }
+            for field, expected in (
+                ("manifest_sha256", entity_manifest.get("manifest_sha256")),
+                ("shard_artifact_digest", canonical_json_digest(shard_artifacts)),
+                ("candidate_ids", candidate_ids),
+            ):
+                if receipt.get(field) != expected:
+                    errors.append(f"entity_verification_assembly_receipt.{field} 与当前 shard artifacts 不一致")
+            if isinstance(report, dict) and receipt.get("entity_report_sha256") != canonical_json_digest(report):
+                errors.append("entity_verification_assembly_receipt.entity_report_sha256 已过期")
+            if isinstance(doubtful, list) and receipt.get("doubtful_items_sha256") != canonical_json_digest(doubtful):
+                errors.append("entity_verification_assembly_receipt.doubtful_items_sha256 已过期")
     speaker_manifest = bundle.get("speaker_turn_manifest")
     dynamic_edit_types = {
         str(artifact_type)
@@ -600,6 +833,18 @@ def next_action(
 ) -> dict[str, Any]:
     missing_errors = {f"缺少必需 artifact: {artifact}" for artifact in missing_artifacts}
     non_missing_errors = [error for error in errors if error not in missing_errors]
+    stale_entity_receipt = bool(non_missing_errors) and all(
+        error.startswith("entity_verification_assembly_receipt.")
+        for error in non_missing_errors
+    )
+    if stale_entity_receipt:
+        return {
+            "type": "assemble_entity_verification_before_draft",
+            "phase": "pre_draft",
+            "main_actions": ["rebuild stale entity verification assembly outputs"],
+            "replace_existing_outputs": True,
+            "stale_receipt_errors": non_missing_errors,
+        }
     if non_missing_errors:
         return {
             "type": "repair_invalid_or_duplicate_artifacts",
@@ -631,6 +876,26 @@ def next_action(
     for gate in gates:
         if gate["status"] in {"ready_for_dispatch_or_collection", "blocked_by_previous_phase"}:
             if (
+                gate["phase"] == "pre_draft"
+                and set(gate["current_phase_missing_artifacts"])
+                == {
+                    "entity_verification_report",
+                    "doubtful_items",
+                    "entity_verification_assembly_receipt",
+                }
+                and not gate["missing_task_files"]
+            ):
+                return {
+                    "type": "assemble_entity_verification_before_draft",
+                    "phase": "pre_draft",
+                    "main_actions": ["run assemble_entity_verification_shards.py"],
+                    "main_owned_missing_artifacts": [
+                        "entity_verification_report",
+                        "doubtful_items",
+                        "entity_verification_assembly_receipt",
+                    ],
+                }
+            if (
                 gate["phase"] == "editing"
                 and gate["current_phase_missing_artifacts"] == ["editing_assembly_receipt"]
             ):
@@ -640,11 +905,26 @@ def next_action(
                     "main_actions": ["run assemble_speaker_turn_edits.py"],
                     "main_owned_missing_artifacts": ["editing_assembly_receipt"],
                 }
-            if gate["phase"] == "final_verification" and required_actions and not receipt_state.get("valid"):
+            if (
+                gate["phase"] == "draft_review"
+                and set(gate["current_phase_missing_artifacts"])
+                == {"fidelity_review", "fidelity_review_assembly_receipt"}
+                and not gate["missing_task_files"]
+            ):
+                return {
+                    "type": "assemble_fidelity_review_before_main_actions",
+                    "phase": "draft_review",
+                    "main_actions": ["run assemble_fidelity_review_shards.py"],
+                    "main_owned_missing_artifacts": [
+                        "fidelity_review",
+                        "fidelity_review_assembly_receipt",
+                    ],
+                }
+            if gate["phase"] == "final_verification" and receipt_state.get("required") and not receipt_state.get("valid"):
                 return {
                     "type": "apply_main_actions_before_final_verification",
                     "phase": "draft_review",
-                    "main_actions": required_actions,
+                    "main_actions": required_actions or ["final_validation_snapshot"],
                     "receipt_errors": receipt_state.get("errors", []),
                     "requires_final_verification_rerun": "export_manifest" in gate.get("required_artifacts", []),
                 }
@@ -807,11 +1087,29 @@ def _collect_mas_run_unlocked(
         bundle,
         task_dir,
         action_names(decision) if decision.get("ok") else [],
+        require_final_snapshot="export_manifest" in required_artifacts,
     )
     if "main_action_receipt" in artifacts and not receipt_state.get("valid"):
         errors.extend(str(error) for error in receipt_state.get("errors", []))
     errors.extend(export_binding_errors(artifacts, bundle, task_dir, receipt_state))
     action = next_action(gates, decision, errors, missing_artifacts, receipt_state)
+    working_body = dict(bundle.get("working_body_contract") or {})
+    if working_body.get("source_binding") == "editing_assembly_receipt":
+        edit_receipt = artifacts.get("editing_assembly_receipt")
+        if isinstance(edit_receipt, dict):
+            working_body.update(
+                {
+                    "ready": not any(
+                        error.startswith("editing_assembly_receipt") for error in errors
+                    ),
+                    "assembled_draft_path": edit_receipt.get("assembled_draft_path"),
+                    "assembled_draft_sha256": edit_receipt.get("assembled_draft_sha256"),
+                }
+            )
+        else:
+            working_body["ready"] = False
+    elif working_body:
+        working_body["ready"] = True
     return {
         "schema_version": "1.0",
         "ok": not errors and bool(validation.get("ok")) and bool(decision.get("ok")),
@@ -827,6 +1125,8 @@ def _collect_mas_run_unlocked(
         "artifact_types": sorted(artifacts),
         "artifact_sources": artifact_sources,
         "manifest_task_count": manifest.get("task_count"),
+        "entity_verification": bundle.get("entity_verification", {}),
+        "working_body": working_body,
         "decision": decision,
         "main_action_receipt": receipt_state,
         "validation": validation,

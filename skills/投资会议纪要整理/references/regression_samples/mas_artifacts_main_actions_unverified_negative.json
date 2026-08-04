@@ -26,6 +26,8 @@
       "recommended_revisions": []
     },
     "export_manifest": {
+      "schema_version": "2.0", "generation_mode": "deterministic_main_owned_v1",
+      "verification_sidecar_sha256": "", "main_action_receipt_sha256": "", "validator_evidence_sha256": "", "regression_evidence_sha256": "",
       "markdown_path": "synthetic.md",
       "markdown_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "verification_sidecar_path": "",

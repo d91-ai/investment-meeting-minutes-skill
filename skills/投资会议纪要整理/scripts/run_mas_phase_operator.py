@@ -6,16 +6,96 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import time
 from typing import Any
 
-from build_mas_task_bundle import build_bundle_from_request, read_json, validate_bundle, write_dispatch_files
+from build_mas_task_bundle import (
+    _write_dispatch_files_unlocked,
+    build_bundle_from_request,
+    read_json,
+    validate_bundle,
+    write_dispatch_files,
+)
+from assemble_speaker_turn_edits import assemble_speaker_turn_edits
+from assemble_entity_verification_shards import assemble_entity_verification_shards
+from assemble_fidelity_review_shards import assemble_fidelity_review_shards
 from collect_mas_artifacts import PHASE_ORDER, collect_mas_snapshot_unlocked
 from create_mas_source_manifest import create_source_manifest, source_manifest_artifact
 from ingest_mas_artifact import ingest_mas_artifact_file
 from mas_task_lock import mas_task_lock
+from mas_performance_telemetry import SCHEMA_VERSION as TELEMETRY_SCHEMA_VERSION, append_event
 from plan_mas_next_action import plan_from_summary
 
 DEFAULT_MAX_PARALLEL = 3
+AUTO_ASSEMBLY_LIMIT = 3
+
+
+def telemetry_profile(task_dir: Path, sample_kind: str) -> dict[str, Any]:
+    bundle = read_json(task_dir / "mas_task_bundle.json")
+    if not isinstance(bundle, dict):
+        raise ValueError("telemetry requires a valid bound MAS bundle")
+    meeting_map = {
+        "专家交流": "expert_call",
+        "专家访谈": "expert_call",
+        "上市公司交流": "listed_company",
+        "多人复盘会": "group_review",
+    }
+    speaker = bundle.get("speaker_editing") if isinstance(bundle.get("speaker_editing"), dict) else {}
+    source_chars = int(speaker.get("source_char_count") or 0)
+    entity = bundle.get("entity_candidate_manifest") if isinstance(bundle.get("entity_candidate_manifest"), dict) else {}
+    candidate_count = int(entity.get("candidate_count") or 0)
+    size_measure = max(source_chars, candidate_count * 256)
+    size_profile = "small" if size_measure <= 16000 else "medium" if size_measure <= 64000 else "large"
+    risks = bundle.get("risk_flags") if isinstance(bundle.get("risk_flags"), list) else []
+    risk_profile = "low" if not risks else "medium" if len(risks) <= 3 else "high"
+    effective_editing = str(speaker.get("effective_mode") or "direct")
+    editing_mode = {
+        "skip": "direct",
+        "direct": "direct",
+        "full": "full",
+    }.get(effective_editing, "not_applicable")
+    return {
+        "schema_version": TELEMETRY_SCHEMA_VERSION,
+        "source_mode": str(bundle.get("source_mode") or ""),
+        "meeting_type": meeting_map.get(str(bundle.get("meeting_type") or ""), "other"),
+        "size_profile": size_profile,
+        "risk_profile": risk_profile,
+        "editing_mode": editing_mode,
+        "sample_kind": sample_kind,
+        "candidate_count": candidate_count,
+        "group_count": int(entity.get("group_count") or 0),
+        "shard_count": int(entity.get("shard_count") or 0),
+        "retry_count": 0,
+    }
+
+
+def record_operator_telemetry(
+    path: Path | None,
+    profile: dict[str, Any] | None,
+    *,
+    event_type: str,
+    phase: str,
+    task_kind: str,
+    duration_ms: float,
+    queue_ms: float = 0.0,
+) -> str | None:
+    if path is None or profile is None:
+        return None
+    try:
+        append_event(
+            path,
+            {
+                **profile,
+                "event_type": event_type,
+                "phase": phase,
+                "task_kind": task_kind,
+                "duration_ms": round(max(0.0, duration_ms), 3),
+                "queue_ms": round(max(0.0, queue_ms), 3),
+            },
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        return f"telemetry record failed: {exc.__class__.__name__}: {exc}"
+    return None
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -111,6 +191,53 @@ def auto_write_source_manifest(task_dir: Path, request_path: Path | None) -> dic
         return _auto_write_source_manifest_unlocked(task_dir, request_path)
 
 
+def initialize_dispatch_atomic(
+    task_dir: Path,
+    request_path: Path,
+    *,
+    overwrite_dispatch: bool,
+    through_phase: str | None,
+    max_parallel: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Create dispatch, source manifest, initial collector snapshot, and plan under one lock."""
+
+    task_dir.mkdir(parents=True, exist_ok=True)
+    with mas_task_lock(task_dir, exclusive=True):
+        request = read_json(request_path)
+        if not isinstance(request, dict):
+            raise ValueError(f"request-json must be a JSON object: {request_path}")
+        bundle = build_bundle_from_request(request)
+        bundle_errors = validate_bundle(bundle)
+        if bundle_errors:
+            raise ValueError("invalid MAS request bundle: " + "; ".join(bundle_errors))
+        dispatch = _write_dispatch_files_unlocked(
+            bundle,
+            task_dir,
+            overwrite_prompts=overwrite_dispatch,
+        )
+        source_result = _auto_write_source_manifest_unlocked(task_dir, request_path)
+        summary, combined_payload, combined_errors = collect_mas_snapshot_unlocked(
+            task_dir,
+            through_phase=through_phase,
+        )
+        plan = plan_from_summary(summary, max_parallel=max_parallel)
+        write_json(task_dir / "mas_run_summary.json", summary)
+        write_json(task_dir / "mas_artifacts_collected.json", combined_payload)
+        write_json(task_dir / "mas_next_action_plan.json", plan)
+        return (
+            {
+                "created": True,
+                "atomic_init": True,
+                "source_snapshot_locked": True,
+                "initial_plan_written": True,
+                "errors": [],
+                "warnings": [str(item) for item in combined_errors],
+                **dispatch,
+            },
+            source_result,
+        )
+
+
 def operator_status(plan: dict[str, Any], ingest_results: list[dict[str, Any]]) -> str:
     if any(not bool(result.get("ok")) for result in ingest_results):
         return "repair_return_artifacts"
@@ -131,6 +258,10 @@ def operator_status(plan: dict[str, Any], ingest_results: list[dict[str, Any]]) 
         return "collect_phase_artifacts"
     if plan_status == "assemble_speaker_turns":
         return "assemble_speaker_turns"
+    if plan_status == "assemble_entity_verification":
+        return "assemble_entity_verification"
+    if plan_status == "assemble_fidelity_review":
+        return "assemble_fidelity_review"
     if plan_status == "ask_user":
         return "ask_user"
     if plan_status == "apply_main_actions":
@@ -150,6 +281,8 @@ def stop_reason_for(status: str) -> str:
         "dispatch_subagent_tasks": "waiting_for_subagent_returns",
         "collect_phase_artifacts": "waiting_for_phase_artifact_collection",
         "assemble_speaker_turns": "main_workflow_must_assemble_speaker_turns",
+        "assemble_entity_verification": "main_workflow_must_assemble_entity_verification",
+        "assemble_fidelity_review": "main_workflow_must_assemble_fidelity_review",
         "ask_user": "user_confirmation_required",
         "apply_main_actions": "main_workflow_must_apply_actions",
         "continue_main_workflow": "continue_without_user_intervention",
@@ -170,18 +303,41 @@ def run_mas_phase_operator(
     auto_source_manifest: bool = False,
     replace_existing: bool = False,
     max_parallel: int = DEFAULT_MAX_PARALLEL,
+    initialize: bool = False,
+    auto_assemble: bool = True,
+    telemetry_path: Path | None = None,
+    telemetry_sample_kind: str = "production",
 ) -> dict[str, Any]:
+    operator_started = time.perf_counter()
     task_dir = task_dir.expanduser()
     return_paths = return_paths or []
     errors: list[str] = []
     warnings: list[str] = []
 
-    dispatch = prepare_dispatch(task_dir, request_path, overwrite_dispatch)
+    if initialize and request_path is None:
+        raise ValueError("--init requires --request-json")
+    source_manifest_result = {"enabled": False, "status": "not_requested", "errors": [], "warnings": []}
+    if initialize:
+        try:
+            dispatch, source_manifest_result = initialize_dispatch_atomic(
+                task_dir,
+                request_path,
+                overwrite_dispatch=overwrite_dispatch,
+                through_phase=through_phase,
+                max_parallel=max_parallel,
+            )
+        except Exception as exc:
+            dispatch = {
+                "created": False,
+                "errors": [f"atomic init failed: {exc.__class__.__name__}: {exc}"],
+                "warnings": [],
+            }
+    else:
+        dispatch = prepare_dispatch(task_dir, request_path, overwrite_dispatch)
     errors.extend(str(error) for error in dispatch.get("errors", []))
     warnings.extend(str(warning) for warning in dispatch.get("warnings", []))
 
-    source_manifest_result = {"enabled": False, "status": "not_requested", "errors": [], "warnings": []}
-    if auto_source_manifest and not errors:
+    if auto_source_manifest and not initialize and not errors:
         try:
             source_manifest_result = auto_write_source_manifest(task_dir, request_path)
         except Exception as exc:
@@ -195,9 +351,27 @@ def run_mas_phase_operator(
         errors.extend(str(error) for error in source_manifest_result.get("errors", []))
         warnings.extend(str(warning) for warning in source_manifest_result.get("warnings", []))
 
+    telemetry: dict[str, Any] | None = None
+    if telemetry_path is not None and not errors:
+        try:
+            telemetry = telemetry_profile(task_dir, telemetry_sample_kind)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            warnings.append(f"telemetry profile failed: {exc.__class__.__name__}: {exc}")
+        telemetry_error = record_operator_telemetry(
+            telemetry_path,
+            telemetry,
+            event_type="phase_start",
+            phase=through_phase or "pre_draft",
+            task_kind="operator",
+            duration_ms=(time.perf_counter() - operator_started) * 1000,
+        )
+        if telemetry_error:
+            warnings.append(telemetry_error)
+
     ingest_results: list[dict[str, Any]] = []
     if not errors:
         for return_path in return_paths:
+            ingest_started = time.perf_counter()
             result = ingest_mas_artifact_file(
                 return_path,
                 task_dir,
@@ -206,6 +380,16 @@ def run_mas_phase_operator(
             )
             ingest_results.append(result)
             warnings.extend(str(warning) for warning in result.get("warnings", []))
+            telemetry_error = record_operator_telemetry(
+                telemetry_path,
+                telemetry,
+                event_type="ingest",
+                phase=through_phase or "pre_draft",
+                task_kind="specialist_return",
+                duration_ms=(time.perf_counter() - ingest_started) * 1000,
+            )
+            if telemetry_error:
+                warnings.append(telemetry_error)
 
     summary: dict[str, Any] = {}
     plan: dict[str, Any] = {}
@@ -268,6 +452,7 @@ def run_mas_phase_operator(
             "dispatch_batches": plan.get("dispatch_batches", []) if plan else [],
             "dispatch_waves": plan.get("dispatch_waves", []) if plan else [],
             "max_parallel": max_parallel,
+            "entity_max_parallel": plan.get("entity_max_parallel", max_parallel) if plan else max_parallel,
             "main_owned_missing_artifacts": plan.get("main_owned_missing_artifacts", []) if plan else [],
             "repair_errors": plan.get("repair_errors", []) if plan else [],
             "main_actions": plan.get("main_actions", []) if plan else [],
@@ -278,7 +463,114 @@ def run_mas_phase_operator(
             "warnings": warnings,
         }
         write_json(state_path, result)
+
+    assembly_results: list[dict[str, Any]] = []
+    if auto_assemble and result.get("ok"):
+        assembly_actions = {
+            "assemble_edited_turns_before_draft_review": (
+                "speaker_editing",
+                lambda: assemble_speaker_turn_edits(task_dir, replace=replace_existing),
+            ),
+            "assemble_entity_verification_before_draft": (
+                "entity_verification",
+                lambda: assemble_entity_verification_shards(task_dir, replace=replace_existing),
+            ),
+            "assemble_fidelity_review_before_main_actions": (
+                "fidelity_review",
+                lambda: assemble_fidelity_review_shards(task_dir, replace=replace_existing),
+            ),
+        }
+        for _ in range(AUTO_ASSEMBLY_LIMIT):
+            action_type = str(result.get("next_action_type") or "")
+            action = assembly_actions.get(action_type)
+            if action is None:
+                break
+            assembly_kind, callback = action
+            try:
+                assembly_started = time.perf_counter()
+                assembly_payload = callback()
+                assembly_results.append({"assembly": assembly_kind, **assembly_payload})
+                telemetry_error = record_operator_telemetry(
+                    telemetry_path,
+                    telemetry,
+                    event_type="assembly",
+                    phase=str(result.get("phase") or through_phase or "not_applicable"),
+                    task_kind=assembly_kind,
+                    duration_ms=(time.perf_counter() - assembly_started) * 1000,
+                )
+                if telemetry_error:
+                    warnings.append(telemetry_error)
+            except Exception as exc:
+                assembly_results.append(
+                    {
+                        "assembly": assembly_kind,
+                        "ok": False,
+                        "errors": [f"automatic assembly failed: {exc.__class__.__name__}: {exc}"],
+                    }
+                )
+                result["ok"] = False
+                result["command_ok"] = False
+                result["errors"] = list(result.get("errors", [])) + assembly_results[-1]["errors"]
+                break
+            refreshed = run_mas_phase_operator(
+                task_dir=task_dir,
+                request_path=None,
+                return_paths=[],
+                through_phase=through_phase,
+                summary_out=summary_out,
+                combined_out=combined_out,
+                plan_out=plan_out,
+                state_out=state_out,
+                overwrite_dispatch=False,
+                auto_source_manifest=False,
+                replace_existing=replace_existing,
+                max_parallel=max_parallel,
+                initialize=False,
+                auto_assemble=False,
+                telemetry_path=None,
+            )
+            refreshed["dispatch"] = dispatch
+            refreshed["auto_source_manifest"] = source_manifest_result
+            refreshed["ingested_return_count"] = len(return_paths)
+            refreshed["ingest_results"] = ingest_results
+            refreshed["warnings"] = warnings + list(refreshed.get("warnings", []))
+            result = refreshed
+    result["assembly_results"] = assembly_results
+    result["automatic_assembly_enabled"] = auto_assemble
+    end_phase = "complete" if result.get("complete") else str(result.get("phase") or through_phase or "not_applicable")
+    telemetry_error = record_operator_telemetry(
+        telemetry_path,
+        telemetry,
+        event_type="phase_end",
+        phase=end_phase,
+        task_kind="operator",
+        duration_ms=(time.perf_counter() - operator_started) * 1000,
+    )
+    if telemetry_error:
+        result["warnings"] = list(result.get("warnings", [])) + [telemetry_error]
+    result["performance_telemetry"] = {
+        "enabled": telemetry_path is not None,
+        "privacy_schema": TELEMETRY_SCHEMA_VERSION if telemetry_path is not None else "",
+        "sample_kind": telemetry_sample_kind if telemetry_path is not None else "",
+    }
+    with mas_task_lock(task_dir, exclusive=True):
+        write_json(state_path, result)
     return result
+
+
+def load_return_batch(batch_path: Path) -> list[Path]:
+    """Load an explicit JSON array of return paths; globs and artifact payloads are rejected."""
+
+    payload = read_json(batch_path)
+    if not isinstance(payload, list) or any(not isinstance(item, str) or not item.strip() for item in payload):
+        raise ValueError(f"return batch must be a JSON array of non-empty path strings: {batch_path}")
+    paths: list[Path] = []
+    for raw in payload:
+        if any(token in raw for token in ("*", "?", "[", "]")):
+            raise ValueError(f"return batch paths must be explicit and cannot contain globs: {raw}")
+        path = Path(raw)
+        paths.append(path if path.is_absolute() else batch_path.parent / path)
+    return paths
 
 
 def main() -> int:
@@ -286,6 +578,12 @@ def main() -> int:
     parser.add_argument("--task-dir", required=True, help="MAS dispatch directory")
     parser.add_argument("--request-json", help="Initialize the dispatch directory from a MAS request JSON")
     parser.add_argument("--return-json", action="append", default=[], help="Returned artifact JSON; may repeat")
+    parser.add_argument(
+        "--return-batch-json",
+        action="append",
+        default=[],
+        help="JSON array of returned artifact paths; may repeat (best-effort, non-atomic ingest)",
+    )
     parser.add_argument("--through-phase", choices=sorted(PHASE_ORDER), help="Collector phase gate to evaluate")
     parser.add_argument("--summary-out", help="Write collector summary JSON")
     parser.add_argument("--combined-out", help="Write combined artifacts JSON")
@@ -294,6 +592,22 @@ def main() -> int:
     parser.add_argument("--overwrite-dispatch", action="store_true", help="Allow replacing an existing dispatch bundle")
     parser.add_argument("--replace-existing", action="store_true", help="Archive and replace same-task returned artifacts")
     parser.add_argument("--auto-source-manifest", action="store_true", help="Create source_manifest if missing")
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Atomically create bundle, dispatch prompts, source manifest, collector snapshot, and initial plan",
+    )
+    parser.add_argument(
+        "--no-auto-assemble",
+        action="store_true",
+        help="Do not run eligible deterministic speaker/entity/fidelity assembly after ingest",
+    )
+    parser.add_argument("--telemetry-jsonl", help="Append privacy-safe anonymous timing events to one sample JSONL")
+    parser.add_argument(
+        "--telemetry-sample-kind",
+        choices=["production", "synthetic", "non_production"],
+        default="production",
+    )
     parser.add_argument(
         "--max-parallel",
         type=int,
@@ -304,10 +618,13 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        return_paths = [Path(path) for path in args.return_json]
+        for batch_json in args.return_batch_json:
+            return_paths.extend(load_return_batch(Path(batch_json)))
         result = run_mas_phase_operator(
             task_dir=Path(args.task_dir),
             request_path=Path(args.request_json) if args.request_json else None,
-            return_paths=[Path(path) for path in args.return_json],
+            return_paths=return_paths,
             through_phase=args.through_phase,
             summary_out=Path(args.summary_out) if args.summary_out else None,
             combined_out=Path(args.combined_out) if args.combined_out else None,
@@ -317,7 +634,12 @@ def main() -> int:
             auto_source_manifest=bool(args.auto_source_manifest),
             replace_existing=bool(args.replace_existing),
             max_parallel=args.max_parallel,
+            initialize=bool(args.init),
+            auto_assemble=not bool(args.no_auto_assemble),
+            telemetry_path=Path(args.telemetry_jsonl) if args.telemetry_jsonl else None,
+            telemetry_sample_kind=args.telemetry_sample_kind,
         )
+        result["batch_semantics"] = "best_effort_non_atomic" if args.return_batch_json else "sequential_explicit"
     except Exception as exc:
         result = {
             "schema_version": "1.0",

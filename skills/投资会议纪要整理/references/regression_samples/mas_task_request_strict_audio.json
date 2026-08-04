@@ -8,6 +8,7 @@
     "unclear_speaker_boundaries",
     "timestamp_alignment",
     "high_risk_facts",
+    "entity_verification",
     "mixed_targets",
     "omission_risk"
   ],

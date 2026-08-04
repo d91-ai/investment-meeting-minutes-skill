@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import errno
@@ -32,6 +33,7 @@ from validate_meeting_minutes_contract import (  # noqa: E402
     validate_verification_sidecar,
 )
 from validate_mas_artifacts import (  # noqa: E402
+    canonical_json_digest,
     file_sha256,
     validate_file as validate_mas_artifacts_file,
     validate_payload as validate_mas_artifacts_payload,
@@ -46,16 +48,29 @@ from create_mas_source_manifest import create_source_manifest, source_manifest_a
 from summarize_mas_decisions import summarize_file as summarize_mas_decision_file  # noqa: E402
 from collect_mas_artifacts import collect_mas_run  # noqa: E402
 from assemble_speaker_turn_edits import assemble_speaker_turn_edits  # noqa: E402
+from assemble_entity_verification_shards import assemble_entity_verification_shards  # noqa: E402
+from assemble_fidelity_review_shards import assemble_fidelity_review_shards  # noqa: E402
+from build_fidelity_diff_manifest import build_fidelity_diff_manifest  # noqa: E402
+from build_entity_candidate_manifest import build_manifest as build_entity_candidate_manifest  # noqa: E402
+from build_entity_discovery_plan import build_plan as build_entity_discovery_plan  # noqa: E402
+from assemble_entity_candidate_observations import assemble_observations as assemble_entity_candidate_observations  # noqa: E402
 from build_speaker_turn_manifest import build_manifest as build_speaker_turn_manifest  # noqa: E402
 from ingest_mas_artifact import expand_speaker_edit_response, ingest_mas_artifact_file  # noqa: E402
 import ingest_mas_artifact as ingest_mas_artifact_module  # noqa: E402
 from plan_mas_next_action import plan_from_summary  # noqa: E402
-from run_mas_phase_operator import DEFAULT_MAX_PARALLEL, run_mas_phase_operator  # noqa: E402
+from run_mas_phase_operator import DEFAULT_MAX_PARALLEL, run_mas_phase_operator, telemetry_profile  # noqa: E402
+from mas_performance_telemetry import (  # noqa: E402
+    SCHEMA_VERSION as TELEMETRY_SCHEMA_VERSION,
+    aggregate_samples as aggregate_telemetry_samples,
+    append_event as append_telemetry_event,
+    validate_event as validate_telemetry_event,
+)
 from run_mas_dry_run import (  # noqa: E402
     run_mas_dry_run,
     synthetic_final_markdown,
     synthetic_verification_payload,
 )
+from build_deterministic_export_manifest import build_deterministic_export_manifest  # noqa: E402
 from record_mas_main_actions import record_main_actions  # noqa: E402
 from archive_raw_inputs import archive_files  # noqa: E402
 from export_to_obsidian import export_note  # noqa: E402
@@ -89,11 +104,11 @@ def dispatch_context(task_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 
 def fixture_identity(manifest: dict[str, Any], artifact_type: str) -> dict[str, Any]:
     run_id = str(manifest.get("run_id") or "")
-    if artifact_type == "source_manifest":
+    if artifact_type in {"source_manifest", "export_manifest"}:
         return {
             "run_id": run_id,
-            "task_id": f"{run_id}:main:source_manifest",
-            "dispatch_phase": "pre_draft",
+            "task_id": f"{run_id}:main:{artifact_type}",
+            "dispatch_phase": "pre_draft" if artifact_type == "source_manifest" else "final_verification",
             "artifact_owner": "Main Orchestrator",
         }
     for task in manifest.get("task_files", []):
@@ -173,6 +188,39 @@ def fixture_return_payload(
         artifact_type, artifact_value = next(iter(values.items()))
         return {**identity, "artifact_type": artifact_type, "artifact": artifact_value}
     return {**identity, "artifacts": values}
+
+
+def write_deterministic_export_fixture(
+    task_dir: Path,
+    markdown_path: Path,
+    fixture_artifacts: dict[str, Any],
+) -> Path:
+    sidecar_path = task_dir / "synthetic.verification.json"
+    if not sidecar_path.is_file():
+        sidecar_path.write_text(
+            json.dumps(synthetic_verification_payload(fixture_artifacts), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    validator_paths: list[Path] = []
+    for name in ("validate_utf8_text.py", "validate_meeting_minutes_contract.py"):
+        path = task_dir / f"evidence.{name}.json"
+        path.write_text(json.dumps({"name": name, "ok": True}) + "\n", encoding="utf-8")
+        validator_paths.append(path)
+    regression_path = task_dir / "evidence.run_meeting_minutes_regression.py.json"
+    regression_path.write_text(
+        json.dumps({"name": "run_meeting_minutes_regression.py", "case_count": 1, "ok": True}) + "\n",
+        encoding="utf-8",
+    )
+    result = build_deterministic_export_manifest(
+        task_dir,
+        markdown_path,
+        verification_sidecar_path=(
+            sidecar_path if synthetic_verification_payload(fixture_artifacts).get("records") else None
+        ),
+        validator_evidence_paths=validator_paths,
+        regression_evidence_path=regression_path,
+    )
+    return Path(str(result["artifact_file"]))
 
 
 def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
@@ -728,6 +776,899 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                         f"expected={sorted(expected_materials)} actual={sorted(actual_materials)}"
                     )
             result = {"ok": not errors, "errors": errors, "warnings": []}
+    elif case.get("check") == "entity_verification_sharding_mas":
+        errors: list[str] = []
+        warnings: list[str] = []
+        discovery_source = (
+            "说话人 1\n这里提到ＡＢＣ，但全称不清楚，需要确认公司身份。\n"
+            "说话人 2\n后面又提到ABC，仍然无法确定具体实体。\n"
+            "说话人 3\n这一段没有任何需要核验的实体。\n"
+        )
+        discovery_speaker_manifest = build_speaker_turn_manifest(
+            Path("synthetic-discovery.txt"), discovery_source, max_chars=24
+        )
+        discovery_plan = build_entity_discovery_plan(discovery_speaker_manifest)
+        discovery_tasks = discovery_plan.get("tasks", [])
+        if len(discovery_tasks) < 2 or discovery_plan.get("parallel_from_start") is not True:
+            errors.append("entity discovery 未从 speaker shards 首波并行")
+        discovery_prompt = "\n".join(str(task.get("prompt") or "") for task in discovery_tasks)
+        for anchor in (
+            "仅仅在原文出现",
+            "不是候选理由",
+            "source 本身给出可观察的身份不确定信号",
+            "不得为稳定公司全量建立待核验清单",
+        ):
+            if anchor not in discovery_prompt:
+                errors.append(f"entity discovery prompt 缺少 uncertain-only 边界: {anchor}")
+        discovery_returns = [
+            {"task_id": task["task_id"], "candidates": []}
+            for task in discovery_tasks
+        ]
+        first_turn = discovery_tasks[0]["turn_ids"][0]
+        second_task_index = 1 if len(discovery_tasks) > 1 else 0
+        second_turn = discovery_tasks[second_task_index]["turn_ids"][0]
+        discovery_returns[0]["candidates"] = [
+            {
+                "candidate_term": "ＡＢＣ",
+                "observed_forms": ["ＡＢＣ"],
+                "verification_kinds": ["company_identity"],
+                "risk_level": "medium",
+                "verification_reason_codes": ["source_identity_unclear"],
+                "source_turn_ids": [first_turn],
+            }
+        ]
+        discovery_returns[second_task_index]["candidates"] = [
+            {
+                "candidate_term": "ABC",
+                "observed_forms": ["ABC"],
+                "verification_kinds": ["company_identity"],
+                "risk_level": "high",
+                "verification_reason_codes": ["abbreviation_ambiguous"],
+                "source_turn_ids": [second_turn],
+            }
+        ]
+        discovered_candidates, discovery_receipt = assemble_entity_candidate_observations(
+            discovery_plan, list(reversed(discovery_returns))
+        )
+        reordered_candidates, reordered_receipt = assemble_entity_candidate_observations(
+            discovery_plan, discovery_returns
+        )
+        if discovered_candidates != reordered_candidates or discovery_receipt.get(
+            "candidate_manifest_sha256"
+        ) != reordered_receipt.get("candidate_manifest_sha256"):
+            errors.append("entity discovery merge 随 shard 返回顺序变化")
+        if (
+            len(discovered_candidates.get("candidates", [])) != 1
+            or discovered_candidates["candidates"][0].get("candidate_term") != "ＡＢＣ"
+            or discovered_candidates["candidates"][0].get("risk_level") != "high"
+            or discovery_receipt.get("turn_coverage", {}).get("complete") is not True
+        ):
+            errors.append("entity discovery exact merge 未保留最早原始形态/最高风险/全 turn 覆盖")
+        try:
+            build_entity_candidate_manifest(discovered_candidates)
+        except ValueError as exc:
+            errors.append(f"entity discovery 输出不能被 candidate manifest 消费: {exc}")
+        invalid_discovery = json.loads(json.dumps(discovery_returns, ensure_ascii=False))
+        invalid_discovery[0]["candidates"][0]["source_turn_ids"] = [second_turn]
+        try:
+            assemble_entity_candidate_observations(discovery_plan, invalid_discovery)
+            errors.append("entity discovery assembly 未拒绝跨 shard source_turn_id")
+        except ValueError:
+            pass
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
+        scale_spec = payload.get("scale_regression", {})
+        scale_candidates: list[dict[str, Any]] = []
+        candidate_count = int(scale_spec.get("candidate_count") or 0)
+        high_company_code_count = int(scale_spec.get("high_risk_company_code_count") or 0)
+        low_company_code_count = int(scale_spec.get("low_risk_company_code_count") or 0)
+        relation_pair_count = int(scale_spec.get("relation_pair_count") or 0)
+        for index in range(1, candidate_count + 1):
+            high_risk = index <= high_company_code_count
+            company_code = index <= high_company_code_count + low_company_code_count
+            candidate: dict[str, Any] = {
+                "candidate_id": f"scale_{index:03d}",
+                "term": f"合成规模候选{index:03d}",
+                "verification_kinds": ["company_code" if company_code else "company"],
+                "public_keywords": [f"synthetic-public-{index:03d}"],
+                "risk_level": "high" if high_risk else "low",
+                "network_verification_required": True,
+                "verification_reason_codes": [
+                    "confirmed_code_required" if company_code else "source_identity_unclear"
+                ],
+            }
+            if index <= relation_pair_count * 2:
+                candidate["relation_ids"] = [f"synthetic-pair-{(index + 1) // 2:02d}"]
+            if index > candidate_count - 2:
+                candidate["ambiguity_set"] = ["synthetic-shared-identity"]
+            scale_candidates.append(candidate)
+        scale_payload = {"source_sha256": "b" * 64, "candidates": scale_candidates}
+        entity_manifest = build_entity_candidate_manifest(scale_payload)
+        reversed_payload = dict(scale_payload)
+        reversed_payload["candidates"] = list(reversed(scale_candidates))
+        reversed_manifest = build_entity_candidate_manifest(reversed_payload)
+        if entity_manifest.get("manifest_sha256") != reversed_manifest.get("manifest_sha256"):
+            errors.append("entity candidate manifest 随输入顺序变化")
+        expected_scale = {
+            "candidate_count": int(scale_spec.get("candidate_count") or 0),
+            "group_count": int(scale_spec.get("expected_group_count") or 0),
+            "total_weight": int(scale_spec.get("expected_total_weight") or 0),
+            "high_risk_count": int(scale_spec.get("expected_high_risk_count") or 0),
+            "shard_count": int(scale_spec.get("expected_default_shard_count") or 0),
+        }
+        actual_scale = {key: entity_manifest.get(key) for key in expected_scale}
+        if actual_scale != expected_scale:
+            errors.append(f"95 项等价合成默认分片不符合预期: expected={expected_scale} actual={actual_scale}")
+        if entity_manifest.get("policy", {}).get("max_entity_waves") != 2:
+            errors.append("entity manifest 默认 max_entity_waves 必须为 2")
+        scope_policy = entity_manifest.get("scope_policy", {})
+        if (
+            scope_policy.get("meeting_fact_verification_excluded") is not True
+            or scope_policy.get("stripped_relation_candidate_count") != relation_pair_count * 2
+        ):
+            errors.append("entity manifest 未确定性剔除会议关系分组")
+        for test_parallel, expected_shards, expected_waves in ((1, 2, 2), (2, 3, 2), (3, 3, 1)):
+            parallel_manifest = build_entity_candidate_manifest(scale_payload, max_parallel=test_parallel)
+            actual_waves = (int(parallel_manifest.get("shard_count") or 0) + test_parallel - 1) // test_parallel
+            if (
+                parallel_manifest.get("shard_count") != expected_shards
+                or actual_waves != expected_waves
+            ):
+                errors.append(
+                    "entity 默认 wave cap 不符合 max_parallel 覆盖: "
+                    f"max_parallel={test_parallel} shards={parallel_manifest.get('shard_count')} waves={actual_waves}"
+                )
+        one_wave_manifest = build_entity_candidate_manifest(
+            scale_payload, max_parallel=3, max_entity_waves=1
+        )
+        if one_wave_manifest.get("shard_count") != 3:
+            errors.append("max_entity_waves=1 未将 scale manifest 限制为 3 shards")
+        three_wave_manifest = build_entity_candidate_manifest(
+            scale_payload, max_parallel=3, shard_target_weight=12, max_entity_waves=3
+        )
+        if three_wave_manifest.get("shard_count") != 9:
+            errors.append("max_entity_waves=3 显式覆盖未生成 9 shards")
+        legacy_tuning_manifest = build_entity_candidate_manifest(
+            scale_payload, max_parallel=3, shard_target_weight=12, max_entity_waves=7
+        )
+        if legacy_tuning_manifest.get("shard_count") != 21:
+            errors.append("显式分片参数无法恢复 21-shard 大任务计划")
+        for invalid_kwargs in (
+            {"max_entity_waves": 0},
+            {"max_entity_waves": 65},
+            {"shard_target_weight": 0},
+            {"shard_target_weight": 1_000_001},
+            {"max_parallel": 1, "max_entity_waves": 1},
+        ):
+            try:
+                build_entity_candidate_manifest(scale_payload, **invalid_kwargs)
+                errors.append(f"entity manifest 未拒绝非法分片参数: {invalid_kwargs}")
+            except ValueError:
+                pass
+        candidate_ids = [
+            str(item.get("candidate_id") or "")
+            for item in entity_manifest.get("candidates", [])
+            if isinstance(item, dict)
+        ]
+        grouped_ids = [
+            str(candidate_id)
+            for group in entity_manifest.get("groups", [])
+            if isinstance(group, dict)
+            for candidate_id in group.get("candidate_ids", [])
+        ]
+        sharded_ids = [
+            str(candidate_id)
+            for shard in entity_manifest.get("shards", [])
+            if isinstance(shard, dict)
+            for candidate_id in shard.get("candidate_ids", [])
+        ]
+        if (
+            len(grouped_ids) != len(set(grouped_ids))
+            or set(grouped_ids) != set(candidate_ids)
+            or len(sharded_ids) != len(set(sharded_ids))
+            or set(sharded_ids) != set(candidate_ids)
+        ):
+            errors.append("entity candidate groups/shards 未恰好覆盖候选一次")
+        small_payload = dict(scale_payload)
+        small_payload["candidates"] = scale_candidates[:3]
+        small_manifest = build_entity_candidate_manifest(small_payload)
+        small_bundle = build_mas_task_bundle_from_request(
+            {"risk_flags": ["entity_verification"], "entity_candidate_manifest": small_manifest}
+        )
+        if (
+            small_manifest.get("mode") != "single"
+            or any(
+                str(task.get("artifact_type") or "").startswith("entity_verification_shard__")
+                for task in small_bundle.get("tasks", [])
+                if isinstance(task, dict)
+            )
+            or "entity_verification_assembly_receipt" in small_bundle.get("expected_artifacts", [])
+        ):
+            errors.append("小规模实体候选未保留单 Entity Verifier 路径")
+        try:
+            build_entity_candidate_manifest(
+                {"candidates": [{"candidate_id": "private_path", "term": "/Users/example/private.txt"}]}
+            )
+            errors.append("entity candidate manifest 未拒绝会泄漏本地路径的候选词")
+        except ValueError:
+            pass
+        scoped_manifest = build_entity_candidate_manifest(
+            {
+                "source_sha256": "c" * 64,
+                "candidates": [
+                    {
+                        "candidate_id": "company_identity",
+                        "term": "合成公司甲",
+                        "verification_kinds": ["company_identity", "customer_supplier", "numbers_dates"],
+                        "relation_ids": ["private-relationship"],
+                        "public_keywords": ["private supplier relation"],
+                        "risk_level": "high",
+                        "network_verification_required": True,
+                        "verification_reason_codes": ["source_identity_unclear"],
+                    },
+                    {
+                        "candidate_id": "term_identity",
+                        "term": "合成术语乙",
+                        "verification_kinds": ["term_identity", "product_company"],
+                        "public_keywords": ["private product relation"],
+                        "network_verification_required": True,
+                        "verification_reason_codes": ["source_identity_unclear"],
+                    },
+                    {
+                        "candidate_id": "meeting_number",
+                        "term": "百分之九十九",
+                        "verification_kinds": ["numbers_dates"],
+                    },
+                    {
+                        "candidate_id": "stable_term",
+                        "term": "稳定普通术语",
+                        "verification_kinds": ["term_identity"],
+                        "risk_level": "medium",
+                    },
+                    {
+                        "candidate_id": "stable_alias",
+                        "term": "稳定品牌",
+                        "aliases": ["Stable Brand"],
+                        "verification_kinds": ["brand_company"],
+                        "risk_level": "low",
+                    },
+                    {
+                        "candidate_id": "high_without_reason",
+                        "term": "高风险但无身份疑点",
+                        "verification_kinds": ["company_identity"],
+                        "risk_level": "high",
+                    },
+                    {
+                        "candidate_id": "uppercase_without_reason",
+                        "term": "PLAINACRONYM",
+                        "verification_kinds": ["term_identity"],
+                        "risk_level": "medium",
+                    },
+                ],
+            }
+        )
+        scoped_candidates = scoped_manifest.get("candidates", [])
+        scoped_kinds = {
+            str(kind)
+            for candidate in scoped_candidates
+            if isinstance(candidate, dict)
+            for kind in candidate.get("verification_kinds", [])
+        }
+        if (
+            scoped_manifest.get("candidate_count") != 2
+            or scoped_kinds != {"company_identity", "term_identity"}
+            or any(candidate.get("relation_ids") for candidate in scoped_candidates if isinstance(candidate, dict))
+            or any(candidate.get("public_keywords") for candidate in scoped_candidates if isinstance(candidate, dict))
+            or scoped_manifest.get("scope_policy", {}).get("dropped_candidate_count") != 5
+            or scoped_manifest.get("scope_policy", {}).get("dropped_without_reason_candidate_count") != 4
+            or scoped_manifest.get("scope_policy", {}).get("network_admission_policy") != "uncertain_only_v1"
+        ):
+            errors.append("entity manifest 未将联网范围限制为名称/代码/术语身份")
+        try:
+            build_entity_candidate_manifest(
+                {
+                    "candidates": [
+                        {
+                            "candidate_id": "invalid_admission",
+                            "term": "合成歧义词",
+                            "verification_kinds": ["term_identity"],
+                            "network_verification_required": "yes",
+                            "verification_reason_codes": ["source_identity_unclear"],
+                        }
+                    ]
+                }
+            )
+            errors.append("entity manifest 未拒绝非 boolean 联网准入标记")
+        except ValueError:
+            pass
+        try:
+            build_entity_candidate_manifest(
+                {
+                    "candidates": [
+                        {
+                            "candidate_id": "unknown_reason",
+                            "term": "合成歧义词",
+                            "verification_kinds": ["term_identity"],
+                            "verification_reason_codes": ["model_says_so"],
+                        }
+                    ]
+                }
+            )
+            errors.append("entity manifest 未拒绝未知联网准入原因")
+        except ValueError:
+            pass
+        fact_only_bundle = build_mas_task_bundle_from_request(
+            {"risk_flags": ["high_risk_facts", "customers_suppliers", "numbers_dates"]}
+        )
+        if "entity_verification_report" in fact_only_bundle.get("expected_artifacts", []):
+            errors.append("会议事实风险错误触发 Entity Verifier")
+
+        with tempfile.TemporaryDirectory(prefix="entity-sharding-regression-") as temp_name:
+            task_dir = Path(temp_name) / "dispatch"
+            body_path = Path(temp_name) / "synthetic-body.txt"
+            body_path.write_text("完全合成的回归正文，不含真实会议材料。\n", encoding="utf-8")
+            bundle = build_mas_task_bundle_from_request(
+                {
+                    "run_profile": "standard",
+                    "source_mode": "document_only",
+                    "meeting_type": "公司交流",
+                    "risk_flags": ["audio_input", "entity_verification"],
+                    "materials": [str(body_path)],
+                    "entity_candidate_manifest": entity_manifest,
+                }
+            )
+            bundle_errors = validate_mas_task_bundle(bundle)
+            errors.extend(f"entity bundle: {item}" for item in bundle_errors)
+            write_mas_dispatch_files(bundle, task_dir)
+            bound_bundle, dispatch_manifest = dispatch_context(task_dir)
+            source_value, _ = create_source_manifest(bound_bundle)
+            source_payload = source_manifest_artifact(source_value, str(bound_bundle.get("run_id") or ""))
+            artifact_dir = task_dir / "artifacts"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "source_manifest.json").write_text(
+                json.dumps(source_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+
+            initial_summary = collect_mas_run(task_dir, through_phase="pre_draft")
+            if initial_summary.get("entity_verification") != bound_bundle.get("entity_verification"):
+                errors.append("collector summary 未保留绑定的 entity verification 调度策略")
+            mixed_plan = plan_from_summary(initial_summary, max_parallel=3)
+            entity_batches = [
+                batch
+                for batch in mixed_plan.get("dispatch_batches", [])
+                if isinstance(batch, dict) and batch.get("batch_kind") == "entity_verification"
+            ]
+            entity_waves = [
+                wave
+                for wave in mixed_plan.get("dispatch_waves", [])
+                if isinstance(wave, dict) and str(wave.get("wave_id") or "").startswith("entity_verification_wave_")
+            ]
+            shard_count = int(entity_manifest.get("shard_count") or 0)
+            if len(entity_batches) != shard_count or len(entity_waves) != (shard_count + 2) // 3:
+                errors.append("entity shard batches/waves 未遵守 max_parallel=3")
+            if shard_count != 3 or len(entity_waves) != 1:
+                errors.append(f"95 项默认生产计划必须为 3 shards/1 wave: {shard_count}/{len(entity_waves)}")
+            policy_bound_summary = dict(initial_summary)
+            policy_bound_summary["entity_verification"] = dict(initial_summary["entity_verification"])
+            policy_bound_summary["entity_verification"]["max_parallel"] = 2
+            two_slot_plan = plan_from_summary(policy_bound_summary, max_parallel=8)
+            two_slot_waves = [
+                wave
+                for wave in two_slot_plan.get("dispatch_waves", [])
+                if isinstance(wave, dict)
+                and str(wave.get("wave_id") or "").startswith("entity_verification_wave_")
+            ]
+            if two_slot_plan.get("entity_max_parallel") != 2 or len(two_slot_waves) != 2:
+                errors.append("entity planner 未优先使用 manifest-bound max_parallel")
+            ordinary_dispatches = [
+                step
+                for step in mixed_plan.get("recommended_steps", [])
+                if isinstance(step, dict)
+                and step.get("action") == "dispatch_subagent_prompt"
+                and step.get("artifact_type") == "transcript_audit"
+            ]
+            if len(ordinary_dispatches) != 1:
+                errors.append("混合 pre_draft plan 丢失或重复普通 transcript task")
+            for task in bound_bundle.get("tasks", []):
+                if not isinstance(task, dict) or task.get("artifact_schema") != "entity_verification_shard":
+                    continue
+                packet = task.get("task_context", {}).get("verification_packet", [])
+                allowed_packet_fields = {
+                    "candidate_id", "candidate_term", "aliases", "verification_kinds", "public_keywords"
+                }
+                if any(not isinstance(item, dict) or set(item) != allowed_packet_fields for item in packet):
+                    errors.append("entity shard prompt packet 超出最小字段白名单")
+                prompt = str(task.get("prompt") or "")
+                if "/Users/" in prompt or "会议原文" in prompt:
+                    errors.append("entity shard prompt 泄漏私密路径或长原文请求")
+                shape = task.get("expected_output_shape")
+                if not isinstance(shape, dict) or set(shape) != {"task_id", "results"}:
+                    errors.append("entity shard expected_output_shape 不是紧凑 task_id/results 契约")
+                elif shape.get("task_id") != task.get("task_id"):
+                    errors.append("entity shard expected_output_shape 未绑定真实 task_id")
+                dispatch_task = next(
+                    (
+                        item
+                        for item in dispatch_manifest.get("task_files", [])
+                        if isinstance(item, dict) and item.get("task_id") == task.get("task_id")
+                    ),
+                    None,
+                )
+                prompt_path = task_dir / str((dispatch_task or {}).get("path") or "")
+                if not prompt_path.is_file():
+                    errors.append("entity shard dispatch prompt file 缺失")
+                else:
+                    prompt_file_text = prompt_path.read_text(encoding="utf-8")
+                    if "Expected JSON Shape" in prompt_file_text or '"manifest_sha256"' in prompt_file_text:
+                        errors.append("entity shard prompt file 仍泄漏完整 envelope 结构")
+                    if "exactly two top-level fields: task_id and results" not in prompt_file_text:
+                        errors.append("entity shard prompt file 缺少紧凑返回契约")
+
+            tampered_bundle = json.loads(json.dumps(bound_bundle, ensure_ascii=False))
+            tampered_task = next(
+                task
+                for task in tampered_bundle.get("tasks", [])
+                if isinstance(task, dict) and task.get("artifact_schema") == "entity_verification_shard"
+            )
+            tampered_task["expected_output_shape"] = {"artifact_type": tampered_task["artifact_type"]}
+            if not any(
+                "expected_output_shape" in item
+                for item in validate_mas_task_bundle(tampered_bundle)
+            ):
+                errors.append("entity bundle validator 未拒绝被篡改的返回 shape")
+
+            active = 0
+            peak_active = 0
+            active_lock = threading.Lock()
+
+            def synthetic_worker() -> None:
+                nonlocal active, peak_active
+                with active_lock:
+                    active += 1
+                    peak_active = max(peak_active, active)
+                time.sleep(0.05)
+                with active_lock:
+                    active -= 1
+
+            batch_by_id = {str(batch["batch_id"]): batch for batch in entity_batches}
+            wall_start = time.perf_counter()
+            for wave in entity_waves:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    futures = [
+                        executor.submit(synthetic_worker)
+                        for batch_id in wave.get("batch_ids", [])
+                        if str(batch_id) in batch_by_id
+                    ]
+                    for future in futures:
+                        future.result()
+            wall_elapsed = time.perf_counter() - wall_start
+            serial_elapsed = shard_count * 0.05
+            if peak_active > 3 or (shard_count > 1 and wall_elapsed >= serial_elapsed * 0.9):
+                errors.append(
+                    f"entity synthetic wall-clock 调度结构异常: peak={peak_active} elapsed={wall_elapsed:.3f} serial={serial_elapsed:.3f}"
+                )
+
+            transcript_task = next(
+                task for task in bound_bundle.get("tasks", [])
+                if isinstance(task, dict) and task.get("artifact_type") == "transcript_audit"
+            )
+            transcript_payload = json.loads(json.dumps(transcript_task["expected_output_shape"], ensure_ascii=False))
+            transcript_payload["artifact"]["asr_primary"] = "synthetic"
+            transcript_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                transcript_payload, task_dir, through_phase="pre_draft"
+            )
+            if not transcript_result.get("ok"):
+                errors.append("合成 transcript task 未成功 ingest")
+
+            group_members = next(
+                (
+                    [str(item) for item in group.get("candidate_ids", [])]
+                    for group in entity_manifest.get("groups", [])
+                    if isinstance(group, dict) and len(group.get("candidate_ids", [])) >= 2
+                ),
+                [],
+            )
+            shard_tasks = [
+                task for task in bound_bundle.get("tasks", [])
+                if isinstance(task, dict) and task.get("artifact_schema") == "entity_verification_shard"
+            ]
+            shard_payloads: list[dict[str, Any]] = []
+            for task in shard_tasks:
+                returned = json.loads(json.dumps(task["expected_output_shape"], ensure_ascii=False))
+                term_by_id = {
+                    str(item.get("candidate_id") or ""): str(item.get("candidate_term") or "")
+                    for item in task.get("task_context", {}).get("verification_packet", [])
+                    if isinstance(item, dict)
+                }
+                for item in returned["results"]:
+                    candidate_id = str(item.get("candidate_id") or "")
+                    item.update(
+                        {
+                            "status": "confirmed",
+                            "canonical_name": term_by_id.get(candidate_id, ""),
+                            "identity_key": f"identity:{candidate_id}",
+                            "evidence_paths": ["company_website"],
+                            "conflict_codes": [],
+                            "unresolved_reason": "",
+                        }
+                    )
+                    if candidate_id in group_members:
+                        item["identity_key"] = "synthetic-shared-identity"
+                shard_payloads.append(returned)
+            if len(group_members) >= 2:
+                second = group_members[1]
+                for returned in shard_payloads:
+                    for item in returned["results"]:
+                        if item.get("candidate_id") == second:
+                            item.update(
+                                {
+                                    "status": "unresolved",
+                                    "evidence_paths": [],
+                                    "conflict_codes": ["synthetic_identity_conflict"],
+                                    "unresolved_reason": "synthetic conflicting public evidence",
+                                }
+                            )
+            expanded = ingest_mas_artifact_module.expand_entity_verification_response(
+                shard_payloads[0], task_dir
+            )
+            if (
+                expanded.get("run_id") != bound_bundle.get("run_id")
+                or expanded.get("artifact", {}).get("candidate_ids")
+                != shard_tasks[0].get("task_context", {}).get("candidate_ids")
+            ):
+                errors.append("entity compact binder 未从可信 dispatch 正确注入 envelope")
+
+            invalid_compact_payloads = []
+            missing_result = json.loads(json.dumps(shard_payloads[0], ensure_ascii=False))
+            missing_result["results"] = missing_result["results"][:-1]
+            invalid_compact_payloads.append(("缺少 candidate", missing_result))
+            wrong_order = json.loads(json.dumps(shard_payloads[0], ensure_ascii=False))
+            wrong_order["results"] = list(reversed(wrong_order["results"]))
+            invalid_compact_payloads.append(("candidate 乱序", wrong_order))
+            extra_field = json.loads(json.dumps(shard_payloads[0], ensure_ascii=False))
+            extra_field["results"][0]["input_term"] = "model-controlled"
+            invalid_compact_payloads.append(("越权 input_term", extra_field))
+            wrong_task = json.loads(json.dumps(shard_payloads[0], ensure_ascii=False))
+            wrong_task["task_id"] = "foreign-task"
+            invalid_compact_payloads.append(("错误 task_id", wrong_task))
+            for label, invalid_payload in invalid_compact_payloads:
+                try:
+                    ingest_mas_artifact_module.expand_entity_verification_response(
+                        invalid_payload, task_dir
+                    )
+                    errors.append(f"entity compact binder 未拒绝{label}")
+                except ValueError:
+                    pass
+
+            bad_payload = json.loads(json.dumps(expanded, ensure_ascii=False))
+            bad_payload["artifact"]["source_sha256"] = "0" * 64
+            bad_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                bad_payload, task_dir, through_phase="pre_draft"
+            )
+            if bad_result.get("ok") or not any(
+                "source_sha256" in str(item) for item in bad_result.get("errors", [])
+            ):
+                errors.append("entity shard source hash 篡改未被 ingest 拒绝")
+            private_payload = json.loads(json.dumps(expanded, ensure_ascii=False))
+            private_payload["artifact"]["results"][0].update(
+                {
+                    "status": "unresolved",
+                    "evidence_paths": [],
+                    "unresolved_reason": "/Users/example/private-meeting.txt",
+                }
+            )
+            private_result = ingest_mas_artifact_module.ingest_mas_artifact(
+                private_payload, task_dir, through_phase="pre_draft"
+            )
+            if private_result.get("ok") or not any(
+                "私密路径" in str(item) for item in private_result.get("errors", [])
+            ):
+                errors.append("entity shard 私密 unresolved_reason 未被 ingest 拒绝")
+            for index, returned in enumerate(shard_payloads[:-1], start=1):
+                return_path = task_dir / f"entity-compact-{index:02d}.json"
+                return_path.write_text(
+                    json.dumps(returned, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                ingest_result = ingest_mas_artifact_file(
+                    return_path, task_dir, through_phase="pre_draft"
+                )
+                if not ingest_result.get("ok"):
+                    errors.append("entity shard ingest 失败")
+            incomplete_summary = collect_mas_run(task_dir, through_phase="pre_draft")
+            if incomplete_summary.get("next_action", {}).get("type") == "assemble_entity_verification_before_draft":
+                errors.append("entity collector 在缺 shard 时提前进入 assembly")
+            last_return_path = task_dir / "entity-compact-last.json"
+            last_return_path.write_text(
+                json.dumps(shard_payloads[-1], ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            last_result = ingest_mas_artifact_file(
+                last_return_path, task_dir, through_phase="pre_draft"
+            )
+            if not last_result.get("ok"):
+                errors.append("最后一个 entity shard ingest 失败")
+            ready_summary = collect_mas_run(task_dir, through_phase="pre_draft")
+            if ready_summary.get("next_action", {}).get("type") != "assemble_entity_verification_before_draft":
+                errors.append("完整 entity shards 未触发 main-owned assembly")
+            assembly = assemble_entity_verification_shards(task_dir)
+            final_summary = collect_mas_run(task_dir, through_phase="pre_draft")
+            if not assembly.get("ok") or not final_summary.get("ok"):
+                errors.append("entity assembly 或 pre_draft collector 未通过")
+            report_payload = json.loads(
+                (artifact_dir / "entity_verification_report.json").read_text(encoding="utf-8")
+            )
+            report = report_payload.get("artifact", {})
+            candidate_term_by_id = {
+                str(item.get("candidate_id") or ""): str(item.get("term") or "")
+                for item in entity_manifest.get("candidates", [])
+                if isinstance(item, dict)
+            }
+            expected_conflict_terms = {candidate_term_by_id[item] for item in group_members}
+            if expected_conflict_terms and not expected_conflict_terms <= set(report.get("unresolved_items", [])):
+                errors.append("alias/dependency group 冲突未整体保留 unresolved")
+            stale_path = artifact_dir / f"{shard_tasks[0]['artifact_type']}.json"
+            stale_payload = json.loads(stale_path.read_text(encoding="utf-8"))
+            stale_payload["artifact"]["results"][0]["identity_key"] += ":changed"
+            stale_path.write_text(json.dumps(stale_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            stale_summary = collect_mas_run(task_dir, through_phase="pre_draft")
+            if stale_summary.get("ok") or not any(
+                "assembly_receipt" in str(item) and "过期" in str(item)
+                or "shard_artifact_digest" in str(item)
+                for item in stale_summary.get("errors", [])
+            ):
+                errors.append("entity shard 替换后旧 assembly receipt 未失效")
+            stale_plan = plan_from_summary(stale_summary, max_parallel=3)
+            stale_commands = [
+                str(step.get("command") or "")
+                for step in stale_plan.get("recommended_steps", [])
+                if isinstance(step, dict)
+            ]
+            if stale_plan.get("plan_status") != "assemble_entity_verification" or not any(
+                "--replace" in command for command in stale_commands
+            ):
+                errors.append(
+                    "entity stale receipt 未路由到显式 --replace 重组: "
+                    f"next_action={stale_summary.get('next_action')} plan={stale_plan.get('plan_status')} "
+                    f"commands={stale_commands}"
+                )
+            repaired_assembly = assemble_entity_verification_shards(task_dir, replace=True)
+            repaired_summary = collect_mas_run(task_dir, through_phase="pre_draft")
+            if not repaired_assembly.get("ok") or not repaired_summary.get("ok"):
+                errors.append("entity stale receipt 显式重组后 collector 未恢复")
+
+        with tempfile.TemporaryDirectory(prefix="entity-dry-run-regression-") as dry_name:
+            dry_root = Path(dry_name)
+            dry_body = dry_root / "synthetic-body.txt"
+            dry_body.write_text("完全合成的 dry-run 正文。\n", encoding="utf-8")
+            dry_request = dry_root / "request.json"
+            dry_request.write_text(
+                json.dumps(
+                    {
+                        "run_profile": "standard",
+                        "source_mode": "document_only",
+                        "meeting_type": "公司交流",
+                        "risk_flags": ["audio_input", "entity_verification"],
+                        "materials": [str(dry_body)],
+                        "entity_candidate_manifest": entity_manifest,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            dry_result = run_mas_dry_run(
+                dry_request,
+                base_dir / "mas_artifacts_valid.json",
+                dry_root / "dispatch",
+            )
+            if not dry_result.get("ok"):
+                errors.append("entity parallel MAS dry-run 未通过: " + "; ".join(dry_result.get("errors", [])))
+
+        result = {
+            "ok": not errors,
+            "errors": errors,
+            "warnings": warnings,
+            "candidate_count": entity_manifest.get("candidate_count"),
+            "group_count": entity_manifest.get("group_count"),
+            "shard_count": entity_manifest.get("shard_count"),
+            "synthetic_wall_clock_seconds": round(wall_elapsed, 3),
+            "synthetic_serial_seconds": round(serial_elapsed, 3),
+            "synthetic_peak_parallel": peak_active,
+        }
+    elif case.get("check") == "fidelity_diff_mas":
+        errors = []
+        warnings: list[str] = []
+
+        def fidelity_fixture_manifest(root: Path, source_segments: list[str], draft_segments: list[str], risks: dict[int, list[str]] | None = None) -> dict[str, Any]:
+            source_text = "".join(source_segments)
+            draft_text = "".join(draft_segments)
+            source_path = root / "source.txt"
+            draft_path = root / "draft.md"
+            span_path = root / "span-map.json"
+            source_path.write_text(source_text, encoding="utf-8")
+            draft_path.write_text(draft_text, encoding="utf-8")
+            source_cursor = 0
+            draft_cursor = 0
+            spans = []
+            for index, (source_segment, draft_segment) in enumerate(zip(source_segments, draft_segments), start=1):
+                spans.append(
+                    {
+                        "span_id": f"span_{index:06d}",
+                        "group_id": f"turn_{index:06d}",
+                        "qa_group_id": "qa_001" if index in {1, 2} else "",
+                        "source_span": {"start_char": source_cursor, "end_char": source_cursor + len(source_segment)},
+                        "draft_span": {"start_char": draft_cursor, "end_char": draft_cursor + len(draft_segment)},
+                        "risk_flags": (risks or {}).get(index, []),
+                    }
+                )
+                source_cursor += len(source_segment)
+                draft_cursor += len(draft_segment)
+            span_path.write_text(
+                json.dumps(
+                    {
+                        "source_sha256": file_sha256(source_path),
+                        "draft_sha256": file_sha256(draft_path),
+                        "spans": spans,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            return build_fidelity_diff_manifest(source_path, draft_path, span_path, max_parallel=3)
+
+        with tempfile.TemporaryDirectory(prefix="mas-fidelity-diff-") as tmpdir:
+            root = Path(tmpdir)
+            unchanged_root = root / "unchanged"
+            unchanged_root.mkdir()
+            unchanged = fidelity_fixture_manifest(
+                unchanged_root,
+                ["问：今年收入是多少？\n", "答：今年收入100万元，没有下调。\n"],
+                ["问：今年收入是多少？\n", "答：今年收入100万元，没有下调。\n"],
+            )
+            if unchanged.get("semantic_review_required") is not False or unchanged.get("shards") != []:
+                errors.append("Fidelity no-change 路径错误生成语义 shard")
+            nochange_bundle = build_mas_task_bundle_from_request(
+                {
+                    "run_profile": "fast_document",
+                    "source_mode": "document_only",
+                    "meeting_type": "多人复盘会",
+                    "materials": [{"kind": "document", "name": "fidelity-source.txt"}],
+                    "fidelity_diff_manifest": unchanged,
+                }
+            )
+            errors.extend(validate_mas_task_bundle(nochange_bundle))
+            nochange_dir = root / "nochange-dispatch"
+            write_mas_dispatch_files(nochange_bundle, nochange_dir)
+            nochange_result = assemble_fidelity_review_shards(nochange_dir)
+            nochange_report = json.loads(Path(nochange_result["artifacts"]["fidelity_review"]).read_text(encoding="utf-8"))["artifact"]
+            if nochange_report.get("mode") != "no_change" or nochange_report.get("paragraphs_reviewed") != 0:
+                errors.append("Fidelity no-change assembly 未生成确定性空 review")
+
+            changed_root = root / "changed"
+            changed_root.mkdir()
+            changed = fidelity_fixture_manifest(
+                changed_root,
+                ["问：收入是否下调？\n", "答：收入100万元，没有下调。\n", "条件是库存下降后再加仓。\n"],
+                ["问：收入是否下调？\n", "答：收入80万元，已经下调。\n", "条件是库存下降后再加仓。\n"],
+                {3: ["condition"]},
+            )
+            if changed.get("shard_count") != 1:
+                errors.append("Fidelity 小任务未保留 single shard 路径")
+            changed_bundle = build_mas_task_bundle_from_request(
+                {
+                    "run_profile": "standard",
+                    "source_mode": "document_only",
+                    "meeting_type": "多人复盘会",
+                    "risk_flags": ["fidelity_review"],
+                    "materials": [{"kind": "document", "name": "fidelity-source.txt"}],
+                    "fidelity_diff_manifest": changed,
+                }
+            )
+            errors.extend(validate_mas_task_bundle(changed_bundle))
+            changed_dir = root / "changed-dispatch"
+            write_mas_dispatch_files(changed_bundle, changed_dir)
+            _, changed_dispatch = dispatch_context(changed_dir)
+            for task in changed_bundle.get("tasks", []):
+                if not isinstance(task, dict) or task.get("artifact_schema") != "fidelity_review_shard":
+                    continue
+                artifact_type = str(task["artifact_type"])
+                artifact = copy.deepcopy(task["expected_output_shape"]["artifact"])
+                payload = {
+                    **fixture_identity(changed_dispatch, artifact_type),
+                    "artifact_type": artifact_type,
+                    "artifact": artifact,
+                }
+                (changed_dir / "artifacts").mkdir(exist_ok=True)
+                (changed_dir / "artifacts" / f"{artifact_type}.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+            changed_shard_paths = sorted((changed_dir / "artifacts").glob("fidelity_review_shard__*.json"))
+            if changed_shard_paths:
+                saved_shard = changed_shard_paths[0].read_bytes()
+                changed_shard_paths[0].unlink()
+                try:
+                    assemble_fidelity_review_shards(changed_dir)
+                    errors.append("Fidelity 缺片未 fail-closed")
+                except ValueError:
+                    pass
+                changed_shard_paths[0].write_bytes(saved_shard)
+            source_manifest, _ = create_source_manifest(changed_bundle, archive_allowed=False)
+            (changed_dir / "artifacts" / "source_manifest.json").write_text(
+                json.dumps(
+                    source_manifest_artifact(source_manifest, str(json.loads((changed_dir / "mas_task_bundle.json").read_text(encoding="utf-8"))["run_id"])),
+                    ensure_ascii=False,
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            operator_assembly = run_mas_phase_operator(
+                changed_dir,
+                through_phase="draft_review",
+                auto_assemble=True,
+            )
+            fidelity_assemblies = [
+                item for item in operator_assembly.get("assembly_results", [])
+                if isinstance(item, dict) and item.get("assembly") == "fidelity_review" and item.get("ok")
+            ]
+            if len(fidelity_assemblies) != 1:
+                errors.append("MAS operator 未在依赖齐备后自动组装 fidelity review")
+            changed_result = fidelity_assemblies[0] if fidelity_assemblies else {
+                "artifacts": {
+                    "fidelity_review": str(changed_dir / "artifacts" / "fidelity_review.json"),
+                    "fidelity_review_assembly_receipt": str(changed_dir / "artifacts" / "fidelity_review_assembly_receipt.json"),
+                }
+            }
+            changed_report_path = Path(changed_result["artifacts"]["fidelity_review"])
+            changed_report = json.loads(changed_report_path.read_text(encoding="utf-8"))["artifact"]
+            if changed_report.get("reviewed_span_ids") != ["span_000001", "span_000002", "span_000003"]:
+                errors.append("Fidelity assembly 未保持 Q&A/turn 完整 span 覆盖")
+            receipt = json.loads(Path(changed_result["artifacts"]["fidelity_review_assembly_receipt"]).read_text(encoding="utf-8"))["artifact"]
+            if receipt.get("fidelity_review_sha256") != canonical_json_digest(changed_report):
+                errors.append("Fidelity assembly receipt 未绑定 canonical review")
+            fidelity_gate = collect_mas_run(changed_dir, through_phase="draft_review")
+            if not fidelity_gate.get("ok"):
+                errors.append("Fidelity draft_review collector gate 未接受完整 assembly: " + "; ".join(fidelity_gate.get("errors", [])))
+            first_shard = next(iter(changed.get("shards", [])), None)
+            if isinstance(first_shard, dict):
+                shard_path = changed_dir / "artifacts" / f"{first_shard['artifact_type']}.json"
+                shard_payload = json.loads(shard_path.read_text(encoding="utf-8"))
+                shard_payload["artifact"]["draft_sha256"] = "0" * 64
+                shard_path.write_text(json.dumps(shard_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                try:
+                    assemble_fidelity_review_shards(changed_dir, replace=True)
+                    errors.append("Fidelity stale draft binding 未 fail-closed")
+                except ValueError:
+                    pass
+
+            parallel_root = root / "parallel"
+            parallel_root.mkdir()
+            long_source = [f"第{index}段，收入{index}00万元，没有下调。" + "甲" * 1500 for index in range(1, 8)]
+            long_draft = [segment.replace("没有下调", "已经下调") for segment in long_source]
+            parallel_manifest = fidelity_fixture_manifest(parallel_root, long_source, long_draft)
+            if parallel_manifest.get("shard_count") not in {2, 3}:
+                errors.append("Fidelity 大任务未按 2-3 shard 分片")
+            parallel_bundle = build_mas_task_bundle_from_request(
+                {
+                    "run_profile": "standard",
+                    "source_mode": "document_only",
+                    "meeting_type": "多人复盘会",
+                    "risk_flags": ["fidelity_review"],
+                    "materials": [{"kind": "document", "name": "fidelity-source.txt"}],
+                    "fidelity_diff_manifest": parallel_manifest,
+                }
+            )
+            errors.extend(validate_mas_task_bundle(parallel_bundle))
+            if len([task for task in parallel_bundle.get("tasks", []) if isinstance(task, dict) and task.get("artifact_schema") == "fidelity_review_shard"]) != parallel_manifest.get("shard_count"):
+                errors.append("Fidelity parallel bundle task 数与 manifest 不一致")
+        result = {
+            "ok": not errors,
+            "errors": errors,
+            "warnings": warnings,
+            "single_shards": changed.get("shard_count", 0),
+            "parallel_shards": parallel_manifest.get("shard_count", 0),
+        }
     elif case.get("check") == "speaker_editing_mas":
         errors = []
         warnings: list[str] = []
@@ -757,6 +1698,56 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             if isinstance(shard, dict)
         ] != [["speaker_001", "speaker_002"]]:
             errors.append("工作包 speaker_ids 未与 turns 首次出现顺序一致")
+        source_turns = [
+            turn for turn in speaker_manifest.get("turns", []) if isinstance(turn, dict)
+        ]
+        if len(source_turns) != 3:
+            errors.append("独占一行的说话人/发言人标签或正文提及被错误解析")
+        for turn in source_turns:
+            span = turn.get("source_span")
+            if not isinstance(span, dict):
+                errors.append("speaker turn 缺少 source_span")
+                continue
+            if source_text[int(span.get("start_char") or 0):int(span.get("end_char") or 0)] != turn.get("text"):
+                errors.append("speaker turn source_span 未精确绑定源文本")
+        source_profile = speaker_manifest.get("source_profile", {})
+        if (
+            source_profile.get("standalone_boundary_count") != 3
+            or source_profile.get("inline_boundary_count") != 0
+            or source_profile.get("speaker_count") != 2
+            or source_profile.get("structure_reliable") is not True
+            or source_profile.get("lossless_renderable") is not True
+        ):
+            errors.append("独占行标签 source_profile 统计或可靠性判定不正确")
+        if "正文提及“说话人 1”只是举例" not in str(source_turns[1].get("text") or ""):
+            errors.append("正文中的说话人词组被误判为 turn 边界")
+
+        indented_crlf_source = "  发言人1：正文内容\r\n\t发言人2：第二段\r\n"
+        indented_crlf_manifest = build_speaker_turn_manifest(
+            Path("indented-inline-speakers.txt"),
+            indented_crlf_source,
+            max_chars=100,
+        )
+        indented_crlf_turns = [
+            turn
+            for turn in indented_crlf_manifest.get("turns", [])
+            if isinstance(turn, dict)
+        ]
+        if [turn.get("text") for turn in indented_crlf_turns] != ["正文内容", "第二段"]:
+            errors.append("缩进 inline speaker 行的 content offset 未正确换算回原始 CRLF 源文")
+        for turn in indented_crlf_turns:
+            span = turn.get("source_span")
+            if not isinstance(span, dict) or indented_crlf_source[
+                int(span.get("start_char") or 0):int(span.get("end_char") or 0)
+            ] != turn.get("text"):
+                errors.append("缩进 inline speaker 的 source_span 未精确绑定原始 CRLF 源文")
+        indented_profile = indented_crlf_manifest.get("source_profile", {})
+        if (
+            indented_profile.get("inline_boundary_count") != 2
+            or indented_profile.get("structure_reliable") is not True
+            or indented_profile.get("lossless_renderable") is not True
+        ):
+            errors.append("缩进 CRLF inline speaker 的 source_profile 判定不正确")
 
         group_source = "\n".join(
             [
@@ -860,6 +1851,8 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                     errors.append("Speaker Editor prompt 未清晰呈现 turn 的 speaker_label")
         if bundle.get("speaker_editing", {}).get("effective_mode") != "full":
             errors.append("显式 full 未进入并行 speaker editing")
+        if bundle.get("working_body_contract", {}).get("source_binding") != "editing_assembly_receipt":
+            errors.append("full editing 下游未绑定 editing_assembly_receipt")
 
         clean_manifest = build_speaker_turn_manifest(
             Path("2026-07-26 示例周会（已核对）.md"),
@@ -888,6 +1881,15 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             errors.append("skip editing 仍要求 editing_assembly_receipt")
         if clean_bundle.get("speaker_turn_manifest") != clean_manifest:
             errors.append("skip editing 未保留 speaker manifest 审计绑定")
+        if clean_bundle.get("working_body_contract") != {
+            "owner": "Main Orchestrator",
+            "mode": "direct_manifest_body",
+            "source_binding": "speaker_turn_manifest",
+            "source_field": "turns",
+            "manifest_sha256": clean_manifest.get("manifest_sha256"),
+            "downstream_must_consume": True,
+        }:
+            errors.append("skip editing 下游未绑定主流程 speaker_turn_manifest working body")
         if DEFAULT_MAX_PARALLEL != 3:
             errors.append("MAS phase operator 默认并发未保持为 3 个 editor 槽")
 
@@ -950,8 +1952,37 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             }
         )
         errors.extend(validate_mas_task_bundle(long_bundle))
-        if long_bundle.get("speaker_editing", {}).get("effective_mode") != "full":
-            errors.append("超过 16000 字符的 source 未被 auto 路由为并行编辑")
+        if long_bundle.get("speaker_editing", {}).get("effective_mode") != "skip":
+            errors.append("可靠、低噪声且可无损渲染的 document_only 未进入 direct/skip")
+        if long_bundle.get("speaker_editing", {}).get("reason") != "structured_clean_document_direct_render":
+            errors.append("document_only direct/skip 未记录结构化低噪声判定原因")
+        noisy_long_bundle = build_mas_task_bundle_from_request(
+            {
+                "run_profile": "standard",
+                "source_mode": "document_only",
+                "meeting_type": "多人复盘会",
+                "risk_flags": ["long_transcript", "filler_cleanup"],
+                "materials": [{"kind": "document", "name": "speaker-editing-long-turn.txt"}],
+                "speaker_turn_manifest": long_manifest,
+            }
+        )
+        errors.extend(validate_mas_task_bundle(noisy_long_bundle))
+        if noisy_long_bundle.get("speaker_editing", {}).get("effective_mode") != "full":
+            errors.append("带编辑风险的长 document_only 被错误 direct/skip")
+        explicit_long_bundle = build_mas_task_bundle_from_request(
+            {
+                "run_profile": "standard",
+                "source_mode": "document_only",
+                "meeting_type": "多人复盘会",
+                "risk_flags": ["long_transcript"],
+                "materials": [{"kind": "document", "name": "speaker-editing-long-turn.txt"}],
+                "speaker_turn_manifest": long_manifest,
+                "speaker_editing_mode": "full",
+            }
+        )
+        errors.extend(validate_mas_task_bundle(explicit_long_bundle))
+        if explicit_long_bundle.get("speaker_editing", {}).get("effective_mode") != "full":
+            errors.append("显式 full 未覆盖 document_only 自动 direct/skip")
 
         stress_text = "\n".join(
             f"发言人{speaker}：第{round_index}轮，我保留数字{speaker}和条件判断。"
@@ -1836,11 +2867,31 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 summary_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 record_main_actions(task_dir, synthetic_markdown, summary_path=summary_path)
                 if deferred_export:
-                    artifact_type, artifact = deferred_export
-                    payload = fixture_payload(dispatch_manifest, artifact_type, artifact, synthetic_markdown)
-                    (artifact_dir / f"{artifact_type}.json").write_text(
-                        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8",
+                    write_deterministic_export_fixture(task_dir, synthetic_markdown, fixture_artifacts)
+                export_envelope_path = artifact_dir / "export_manifest.json"
+                if export_envelope_path.is_file() and case.get("tamper_export_validator_evidence"):
+                    export_envelope = json.loads(export_envelope_path.read_text(encoding="utf-8"))
+                    validator_records = export_envelope.get("artifact", {}).get("validators_run", [])
+                    if validator_records:
+                        evidence_path = Path(str(validator_records[0].get("evidence_path") or ""))
+                        evidence_path.write_text(
+                            evidence_path.read_text(encoding="utf-8") + " ", encoding="utf-8"
+                        )
+                if export_envelope_path.is_file() and case.get("delete_export_regression_evidence"):
+                    export_envelope = json.loads(export_envelope_path.read_text(encoding="utf-8"))
+                    regression_path = Path(
+                        str(export_envelope.get("artifact", {}).get("regression_result", {}).get("evidence_path") or "")
+                    )
+                    regression_path.unlink()
+                if export_envelope_path.is_file() and case.get("tamper_sidecar_after_export"):
+                    sidecar_path = task_dir / "synthetic.verification.json"
+                    sidecar_path.write_text(sidecar_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+                if export_envelope_path.is_file() and case.get("downgrade_export_schema"):
+                    export_envelope = json.loads(export_envelope_path.read_text(encoding="utf-8"))
+                    export_envelope["artifact"]["schema_version"] = "1.0"
+                    export_envelope["artifact"].pop("generation_mode", None)
+                    export_envelope_path.write_text(
+                        json.dumps(export_envelope, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
                     )
                 if case.get("tamper_markdown_after_receipt"):
                     synthetic_markdown.write_text(
@@ -2478,12 +3529,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 record_main_actions(task_dir, synthetic_markdown, summary_path=summary_path)
                 if deferred_export:
-                    artifact_type, artifact = deferred_export
-                    payload = fixture_payload(dispatch_manifest, artifact_type, artifact, synthetic_markdown)
-                    (artifact_dir / f"{artifact_type}.json").write_text(
-                        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8",
-                    )
+                    write_deterministic_export_fixture(task_dir, synthetic_markdown, fixture_artifacts)
             summary = collect_mas_run(
                 task_dir,
                 through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
@@ -2527,6 +3573,210 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             if term not in plan_text:
                 result["errors"].append(f"MAS next-action plan 缺少文本锚点: {term}")
                 result["ok"] = False
+    elif case.get("check") == "mas_phase_operator_cli_init_batch":
+        artifact_fixture_path = base_dir / str(case["artifact_file"])
+        fixture_artifacts = json.loads(artifact_fixture_path.read_text(encoding="utf-8")).get("artifacts")
+        if not isinstance(fixture_artifacts, dict):
+            raise ValueError(f"MAS artifact fixture 必须包含 artifacts object: {artifact_fixture_path}")
+        errors: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="mas-operator-cli-") as tmpdir:
+            root = Path(tmpdir)
+            task_dir = root / "dispatch"
+            telemetry_path = root / "operator-telemetry.jsonl"
+            operator_script = SCRIPT_DIR / "run_mas_phase_operator.py"
+            init_process = subprocess.run(
+                [
+                    sys.executable,
+                    str(operator_script),
+                    "--task-dir",
+                    str(task_dir),
+                    "--request-json",
+                    str(file_path),
+                    "--init",
+                    "--through-phase",
+                    "pre_draft",
+                    "--no-auto-assemble",
+                    "--telemetry-jsonl",
+                    str(telemetry_path),
+                    "--telemetry-sample-kind",
+                    "synthetic",
+                    "--json",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            try:
+                init_result = json.loads(init_process.stdout)
+            except json.JSONDecodeError:
+                init_result = {}
+                errors.append(f"operator --init CLI 未返回 JSON: {init_process.stderr or init_process.stdout}")
+            if init_process.returncode != 0 or not init_result.get("ok"):
+                errors.append("operator --init CLI 失败: " + "; ".join(init_result.get("errors", [])))
+            dispatch_result = init_result.get("dispatch", {})
+            if not isinstance(dispatch_result, dict) or not dispatch_result.get("atomic_init"):
+                errors.append("operator --init 未报告 atomic_init/source snapshot 绑定")
+            for name in ("mas_task_bundle.json", "dispatch_manifest.json", "mas_run_summary.json", "mas_next_action_plan.json"):
+                if not (task_dir / name).is_file():
+                    errors.append(f"operator --init 缺少初始产物: {name}")
+            if not (task_dir / "artifacts" / "source_manifest.json").is_file():
+                errors.append("operator --init 缺少 source_manifest")
+            _, dispatch_manifest = dispatch_context(task_dir)
+            returns_dir = root / "returns"
+            returns_dir.mkdir()
+            relative_returns: list[str] = []
+            # entity_verification_report and doubtful_items share one dispatch task;
+            # ingest expands that one returned envelope into both canonical artifacts.
+            for artifact_type in ("transcript_audit", "source_reconciliation", "entity_verification_report"):
+                return_path = returns_dir / f"{artifact_type}.json"
+                return_path.write_text(
+                    json.dumps(
+                        fixture_return_payload(dispatch_manifest, artifact_type, fixture_artifacts),
+                        ensure_ascii=False,
+                        indent=2,
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+                relative_returns.append(str(Path("returns") / return_path.name))
+            batch_path = root / "returns-batch.json"
+            batch_path.write_text(json.dumps(relative_returns, ensure_ascii=False) + "\n", encoding="utf-8")
+            batch_process = subprocess.run(
+                [
+                    sys.executable,
+                    str(operator_script),
+                    "--task-dir",
+                    str(task_dir),
+                    "--return-batch-json",
+                    str(batch_path),
+                    "--through-phase",
+                    "draft_review",
+                    "--no-auto-assemble",
+                    "--telemetry-jsonl",
+                    str(telemetry_path),
+                    "--telemetry-sample-kind",
+                    "synthetic",
+                    "--json",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            try:
+                batch_result = json.loads(batch_process.stdout)
+            except json.JSONDecodeError:
+                batch_result = {}
+                errors.append(f"operator batch CLI 未返回 JSON: {batch_process.stderr or batch_process.stdout}")
+            if batch_process.returncode != 0 or not batch_result.get("ok"):
+                errors.append("operator batch ingest CLI 失败: " + "; ".join(batch_result.get("errors", [])))
+            if batch_result.get("ingested_return_count") != 3:
+                errors.append("operator batch ingest 未逐项接收 3 个 return")
+            if batch_result.get("batch_semantics") != "best_effort_non_atomic":
+                errors.append("operator batch ingest 未明示 best_effort_non_atomic 语义")
+            telemetry_text = telemetry_path.read_text(encoding="utf-8") if telemetry_path.is_file() else ""
+            if not telemetry_text:
+                errors.append("operator CLI 未写入隐私安全 telemetry")
+            if str(root) in telemetry_text or "source_text" in telemetry_text or "run_id" in telemetry_text:
+                errors.append("operator telemetry 泄露路径、源文或运行标识")
+            if list(task_dir.rglob("*.md")):
+                # Prompt Markdown is allowed; final Markdown is not. Detect only files outside dispatch prompts.
+                forbidden = [path for path in task_dir.rglob("*.md") if not path.name.endswith(".prompt.md")]
+                if forbidden:
+                    errors.append("operator CLI 越权写入 final/working Markdown: " + ", ".join(path.name for path in forbidden))
+        result = {"ok": not errors, "errors": errors, "warnings": []}
+    elif case.get("check") == "mas_performance_telemetry":
+        errors: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="mas-telemetry-") as tmpdir:
+            root = Path(tmpdir)
+            routing_manifest = build_speaker_turn_manifest(
+                Path("telemetry-routing-source.txt"),
+                "发言人1：我们没有减仓，继续观察。",
+                max_chars=100,
+            )
+            routing_request = {
+                "run_profile": "standard",
+                "source_mode": "document_only",
+                "meeting_type": "多人复盘会",
+                "materials": [{"kind": "document", "name": "telemetry-routing-source.txt"}],
+                "speaker_turn_manifest": routing_manifest,
+            }
+            skip_bundle = build_mas_task_bundle_from_request(routing_request)
+            full_bundle = build_mas_task_bundle_from_request(
+                {**routing_request, "speaker_editing_mode": "full"}
+            )
+            skip_dir = root / "skip-dispatch"
+            full_dir = root / "full-dispatch"
+            write_mas_dispatch_files(skip_bundle, skip_dir)
+            write_mas_dispatch_files(full_bundle, full_dir)
+            if skip_bundle.get("speaker_editing", {}).get("effective_mode") != "skip":
+                errors.append("telemetry regression 未构造出真实 auto skip bundle")
+            if telemetry_profile(skip_dir, "synthetic").get("editing_mode") != "direct":
+                errors.append("telemetry 未将 bundle effective_mode=skip 归一为 direct")
+            if full_bundle.get("speaker_editing", {}).get("effective_mode") != "full":
+                errors.append("telemetry regression 未构造出真实 full bundle")
+            if telemetry_profile(full_dir, "synthetic").get("editing_mode") != "full":
+                errors.append("telemetry 未保留 bundle effective_mode=full")
+
+            def telemetry_event(event_type: str, phase: str, *, source_mode: str = "document_only", sample_kind: str = "production") -> dict[str, Any]:
+                return {
+                    "schema_version": TELEMETRY_SCHEMA_VERSION,
+                    "event_type": event_type,
+                    "source_mode": source_mode,
+                    "meeting_type": "expert_call",
+                    "size_profile": "medium",
+                    "risk_profile": "medium",
+                    "editing_mode": "direct",
+                    "sample_kind": sample_kind,
+                    "phase": phase,
+                    "task_kind": "operator",
+                    "candidate_count": 12,
+                    "group_count": 10,
+                    "shard_count": 1,
+                    "retry_count": 0,
+                    "duration_ms": 100.0,
+                    "queue_ms": 0.0,
+                }
+
+            samples: list[Path] = []
+            for index in range(3):
+                sample = root / f"document-{index}.jsonl"
+                append_telemetry_event(sample, telemetry_event("phase_start", "pre_draft"))
+                append_telemetry_event(sample, telemetry_event("phase_end", "complete"))
+                samples.append(sample)
+            synthetic_audio = root / "audio-synthetic.jsonl"
+            append_telemetry_event(
+                synthetic_audio,
+                telemetry_event("phase_start", "pre_draft", source_mode="audio_only", sample_kind="synthetic"),
+            )
+            append_telemetry_event(
+                synthetic_audio,
+                telemetry_event("phase_end", "complete", source_mode="audio_only", sample_kind="synthetic"),
+            )
+            samples.append(synthetic_audio)
+            report = aggregate_telemetry_samples(samples)
+            reports = {item["source_mode"]: item for item in report.get("source_mode_reports", [])}
+            if reports.get("document_only", {}).get("calibration_status") != "ready":
+                errors.append("telemetry 3 个 document_only 完整生产样本未达到 ready")
+            if reports.get("audio_only", {}).get("calibration_status") != "insufficient_data":
+                errors.append("telemetry 未将合成 audio_only 排除于校准样本")
+            if reports.get("audio_plus_document", {}).get("calibration_status") != "insufficient_data":
+                errors.append("telemetry 无样本模式未标记 insufficient_data")
+            if report.get("threshold_change_applied") is not False:
+                errors.append("telemetry 聚合器越权自动修改阈值")
+            private_event = telemetry_event("phase_start", "pre_draft")
+            private_event["source_text"] = "private meeting text"
+            try:
+                validate_telemetry_event(private_event)
+                errors.append("telemetry schema 未拒绝额外源文字段")
+            except ValueError:
+                pass
+            path_event = telemetry_event("phase_start", "pre_draft")
+            path_event["source_path"] = "/private/source.txt"
+            try:
+                validate_telemetry_event(path_event)
+                errors.append("telemetry schema 未拒绝私有绝对路径字段")
+            except ValueError:
+                pass
+        result = {"ok": not errors, "errors": errors, "warnings": []}
     elif case.get("check") == "mas_phase_operator":
         artifact_fixture_path = base_dir / str(case["artifact_file"])
         artifact_payload = json.loads(artifact_fixture_path.read_text(encoding="utf-8"))
@@ -2579,6 +3829,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 return_paths=return_paths,
                 through_phase=str(case["through_phase"]) if case.get("through_phase") else None,
                 auto_source_manifest=bool(case.get("auto_source_manifest", False)),
+                initialize=bool(case.get("atomic_init", False)),
             )
             result["errors"] = errors + result["errors"]
             result["ok"] = not result["errors"] and bool(result["ok"])
@@ -2692,6 +3943,8 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                         summary_path=task_dir / "mas_run_summary.json",
                         replace=(task_dir / "artifacts" / "main_action_receipt.json").exists(),
                     )
+                if run_spec.get("build_export_manifest"):
+                    write_deterministic_export_fixture(task_dir, synthetic_markdown, fixture_artifacts)
                 for artifact_type in [str(item) for item in run_spec.get("return_artifacts", [])]:
                     if artifact_type not in fixture_artifacts:
                         errors.append(f"MAS phase operator full-loop fixture 缺少 artifact: {artifact_type}")

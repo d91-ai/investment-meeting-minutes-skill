@@ -5,7 +5,8 @@
   "risk_flags": [
     "primary_source_uncertain",
     "source_conflict",
-    "high_risk_facts"
+    "high_risk_facts",
+    "entity_verification"
   ],
   "materials": [
     "synthetic_meeting.wav",

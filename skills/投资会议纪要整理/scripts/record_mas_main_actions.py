@@ -40,8 +40,13 @@ def _record_main_actions_unlocked(
     if not isinstance(next_action, dict):
         raise ValueError("MAS run summary missing next_action")
     actions = sorted({str(item).strip() for item in next_action.get("main_actions", []) if str(item).strip()})
+    if not actions and (
+        next_action.get("phase") == "final_verification"
+        or "export_manifest" in next_action.get("main_owned_missing_artifacts", [])
+    ):
+        actions = ["final_validation_snapshot"]
     if not actions:
-        raise ValueError("MAS next_action has no main_actions to record")
+        raise ValueError("MAS next_action has no main_actions or final validation snapshot to record")
 
     markdown_path = markdown_path.expanduser().resolve()
     if not markdown_path.is_file():

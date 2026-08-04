@@ -153,11 +153,56 @@ def speaker_edit_assembly_command(task_dir: Path) -> str:
     return quote_command(["python3", str(script_path), str(task_dir), "--json"])
 
 
+def entity_verification_assembly_command(task_dir: Path, *, replace: bool = False) -> str:
+    script_path = Path(__file__).with_name("assemble_entity_verification_shards.py")
+    command = ["python3", str(script_path), str(task_dir)]
+    if replace:
+        command.append("--replace")
+    command.append("--json")
+    return quote_command(command)
+
+
+def fidelity_review_assembly_command(task_dir: Path, *, replace: bool = False) -> str:
+    script_path = Path(__file__).with_name("assemble_fidelity_review_shards.py")
+    command = ["python3", str(script_path), str(task_dir)]
+    if replace:
+        command.append("--replace")
+    command.append("--json")
+    return quote_command(command)
+
+
+def deterministic_export_manifest_command(task_dir: Path) -> str:
+    script_path = Path(__file__).with_name("build_deterministic_export_manifest.py")
+    return quote_command(
+        [
+            "python3",
+            str(script_path),
+            "--task-dir",
+            str(task_dir),
+            "--markdown-path",
+            "<main-owned-final-markdown>",
+            "--main-action-receipt",
+            str(task_dir / "artifacts" / "main_action_receipt.json"),
+            "--validator-evidence",
+            "<validate_utf8_text-result.json>",
+            "--validator-evidence",
+            "<validate_meeting_minutes_contract-result.json>",
+            "--regression-evidence",
+            "<run_meeting_minutes_regression-result.json>",
+            "--json",
+        ]
+    )
+
+
 def plan_status_for(action_type: str) -> str:
     if action_type == "collect_or_dispatch_phase_artifacts":
         return "dispatch_or_collect_phase"
     if action_type == "assemble_edited_turns_before_draft_review":
         return "assemble_speaker_turns"
+    if action_type == "assemble_entity_verification_before_draft":
+        return "assemble_entity_verification"
+    if action_type == "assemble_fidelity_review_before_main_actions":
+        return "assemble_fidelity_review"
     if action_type in {
         "repair_missing_artifacts",
         "repair_invalid_or_duplicate_artifacts",
@@ -196,22 +241,26 @@ def main_action_checklist(main_actions: list[str]) -> list[dict[str, Any]]:
     return checklist
 
 
-def build_speaker_edit_batches(
+def build_shard_task_batches(
     dispatch_tasks: list[dict[str, str]],
     max_parallel: int,
+    *,
+    artifact_prefix: str,
+    phase: str,
+    batch_prefix: str,
 ) -> list[dict[str, Any]]:
     if max_parallel < 1 or max_parallel > 8:
         raise ValueError("max_parallel 必须在 1 到 8 之间")
-    if not dispatch_tasks or any(
-        task.get("dispatch_phase") != "editing"
-        or not task.get("artifact_type", "").startswith("speaker_turn_edit__")
+    shard_tasks = [
+        task
         for task in dispatch_tasks
-    ):
-        return []
+        if task.get("dispatch_phase") == phase
+        and task.get("artifact_type", "").startswith(artifact_prefix)
+    ]
 
     batches: list[dict[str, Any]] = []
     for index, task in enumerate(
-        sorted(dispatch_tasks, key=lambda item: item["artifact_type"]),
+        sorted(shard_tasks, key=lambda item: item["artifact_type"]),
         start=1,
     ):
         prompt = Path(task["prompt_path"])
@@ -221,7 +270,8 @@ def build_speaker_edit_batches(
             weight = 0
         batches.append(
             {
-                "batch_id": f"editing_batch_{index:03d}",
+                "batch_id": f"{batch_prefix}_batch_{index:03d}",
+                "batch_kind": batch_prefix,
                 "total_prompt_bytes": weight,
                 "tasks": [task],
             }
@@ -229,13 +279,27 @@ def build_speaker_edit_batches(
     return batches
 
 
+def build_speaker_edit_batches(
+    dispatch_tasks: list[dict[str, str]],
+    max_parallel: int,
+) -> list[dict[str, Any]]:
+    return build_shard_task_batches(
+        dispatch_tasks,
+        max_parallel,
+        artifact_prefix="speaker_turn_edit__",
+        phase="editing",
+        batch_prefix="editing",
+    )
+
+
 def build_dispatch_waves(
     dispatch_batches: list[dict[str, Any]],
     max_parallel: int,
+    wave_prefix: str = "editing",
 ) -> list[dict[str, Any]]:
     return [
         {
-            "wave_id": f"editing_wave_{index // max_parallel + 1:02d}",
+            "wave_id": f"{wave_prefix}_wave_{index // max_parallel + 1:02d}",
             "batch_ids": [
                 str(batch["batch_id"])
                 for batch in dispatch_batches[index : index + max_parallel]
@@ -296,8 +360,44 @@ def plan_from_summary(summary: dict[str, Any], max_parallel: int = 3) -> dict[st
     main_actions = [str(item) for item in next_action.get("main_actions", []) if str(item)]
     checklist = main_action_checklist(main_actions)
     repair_errors = [str(item) for item in next_action.get("errors", []) if str(item)]
-    dispatch_batches = build_speaker_edit_batches(dispatch_tasks, max_parallel)
-    dispatch_waves = build_dispatch_waves(dispatch_batches, max_parallel)
+    entity_verification = summary.get("entity_verification")
+    if not isinstance(entity_verification, dict):
+        entity_verification = {}
+    entity_max_parallel = entity_verification.get("max_parallel", max_parallel)
+    if (
+        isinstance(entity_max_parallel, bool)
+        or not isinstance(entity_max_parallel, int)
+        or not 1 <= entity_max_parallel <= 8
+    ):
+        errors.append("MAS run summary entity_verification.max_parallel 必须在 1 到 8 之间")
+        entity_max_parallel = max_parallel
+    speaker_batches = build_speaker_edit_batches(dispatch_tasks, max_parallel)
+    entity_batches = build_shard_task_batches(
+        dispatch_tasks,
+        entity_max_parallel,
+        artifact_prefix="entity_verification_shard__",
+        phase="pre_draft",
+        batch_prefix="entity_verification",
+    )
+    fidelity_batches = build_shard_task_batches(
+        dispatch_tasks,
+        min(max_parallel, 3),
+        artifact_prefix="fidelity_review_shard__",
+        phase="draft_review",
+        batch_prefix="fidelity_review",
+    )
+    dispatch_batches = [*speaker_batches, *entity_batches, *fidelity_batches]
+    dispatch_waves = [
+        *build_dispatch_waves(speaker_batches, max_parallel, "editing"),
+        *build_dispatch_waves(entity_batches, entity_max_parallel, "entity_verification"),
+        *build_dispatch_waves(fidelity_batches, min(max_parallel, 3), "fidelity_review"),
+    ]
+    batched_task_ids = {
+        str(task.get("task_id") or "")
+        for batch in dispatch_batches
+        for task in batch.get("tasks", [])
+        if isinstance(task, dict)
+    }
 
     recommended_steps: list[dict[str, Any]] = []
     if action_type == "collect_or_dispatch_phase_artifacts":
@@ -312,12 +412,32 @@ def plan_from_summary(summary: dict[str, Any], max_parallel: int = 3) -> dict[st
                             for wave in dispatch_waves
                             if batch["batch_id"] in wave["batch_ids"]
                         ),
-                        "role": "Speaker Turn Editor",
+                        "role": str(batch["tasks"][0].get("role") or ""),
                         "prompt_paths": [
                             task["prompt_path"]
                             for task in batch["tasks"]
                         ],
-                        "return_contract": "one ordered turn_id/edited_text JSON array per prompt",
+                        "return_contract": (
+                            "one ordered turn_id/edited_text JSON array per prompt"
+                            if batch.get("batch_kind") == "editing"
+                            else (
+                                "one compact task_id/results evidence JSON object per prompt; "
+                                "ingest binds the trusted envelope"
+                                if batch.get("batch_kind") == "entity_verification"
+                                else "one full dispatch-bound specialist shard envelope per prompt"
+                            )
+                        ),
+                    }
+                )
+            for task in dispatch_tasks:
+                if task["task_id"] in batched_task_ids:
+                    continue
+                recommended_steps.append(
+                    {
+                        "action": "dispatch_subagent_prompt",
+                        "artifact_type": task["artifact_type"],
+                        "role": task["role"],
+                        "prompt_path": task["prompt_path"],
                     }
                 )
         else:
@@ -339,13 +459,23 @@ def plan_from_summary(summary: dict[str, Any], max_parallel: int = 3) -> dict[st
                 }
             )
         for artifact in main_owned_missing:
-            recommended_steps.append(
-                {
-                    "action": "create_main_owned_artifact",
-                    "artifact_type": artifact,
-                    "destination": str(task_dir / "artifacts" / f"{artifact}.json"),
-                }
-            )
+            if artifact == "export_manifest":
+                recommended_steps.append(
+                    {
+                        "action": "build_deterministic_export_manifest",
+                        "artifact_type": artifact,
+                        "owner": "Main Orchestrator",
+                        "command": deterministic_export_manifest_command(task_dir),
+                    }
+                )
+            else:
+                recommended_steps.append(
+                    {
+                        "action": "create_main_owned_artifact",
+                        "artifact_type": artifact,
+                        "destination": str(task_dir / "artifacts" / f"{artifact}.json"),
+                    }
+                )
         recommended_steps.append(
             {
                 "action": "run_collector_after_phase_inputs",
@@ -364,6 +494,40 @@ def plan_from_summary(summary: dict[str, Any], max_parallel: int = 3) -> dict[st
             {
                 "action": "run_collector_after_speaker_edit_assembly",
                 "command": collector_command(task_dir, "editing"),
+            }
+        )
+    elif action_type == "assemble_entity_verification_before_draft":
+        recommended_steps.append(
+            {
+                "action": "assemble_entity_verification_before_draft",
+                "owner": "Main Orchestrator",
+                "command": entity_verification_assembly_command(
+                    task_dir,
+                    replace=bool(next_action.get("replace_existing_outputs")),
+                ),
+            }
+        )
+    elif action_type == "assemble_fidelity_review_before_main_actions":
+        recommended_steps.append(
+            {
+                "action": "assemble_fidelity_review_before_main_actions",
+                "owner": "Main Orchestrator",
+                "command": fidelity_review_assembly_command(
+                    task_dir,
+                    replace=bool(next_action.get("replace_existing_outputs")),
+                ),
+            }
+        )
+        recommended_steps.append(
+            {
+                "action": "run_collector_after_fidelity_assembly",
+                "command": collector_command(task_dir, "draft_review"),
+            }
+        )
+        recommended_steps.append(
+            {
+                "action": "run_collector_after_entity_verification_assembly",
+                "command": collector_command(task_dir, "pre_draft"),
             }
         )
     elif action_type in {
@@ -433,6 +597,8 @@ def plan_from_summary(summary: dict[str, Any], max_parallel: int = 3) -> dict[st
         "dispatch_batches": dispatch_batches,
         "dispatch_waves": dispatch_waves,
         "max_parallel": max_parallel,
+        "entity_max_parallel": entity_max_parallel,
+        "working_body": summary.get("working_body", {}),
         "tasks_per_agent_call": 1,
         "main_owned_missing_artifacts": main_owned_missing,
         "missing_artifacts": missing_artifacts,

@@ -49,6 +49,24 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
         "unresolved_items",
         "conflicts",
     ],
+    "entity_verification_shard": [
+        "manifest_sha256",
+        "source_sha256",
+        "candidate_set_sha256",
+        "shard_sha256",
+        "shard_id",
+        "candidate_ids",
+        "status",
+        "results",
+    ],
+    "entity_verification_assembly_receipt": [
+        "manifest_sha256",
+        "shard_artifact_digest",
+        "entity_report_sha256",
+        "doubtful_items_sha256",
+        "candidate_ids",
+        "status",
+    ],
     "target_attribution_review": [
         "segments_reviewed",
         "wrong_grouping",
@@ -84,14 +102,56 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
         "status",
     ],
     "export_manifest": [
+        "schema_version",
+        "generation_mode",
         "markdown_path",
         "markdown_sha256",
         "verification_sidecar_path",
+        "verification_sidecar_sha256",
+        "main_action_receipt_sha256",
+        "validator_evidence_sha256",
+        "regression_evidence_sha256",
         "validators_run",
         "regression_result",
         "export_status",
         "known_unverified_parts",
         "main_actions_verified",
+    ],
+    "final_semantic_review": [
+        "scope_sha256",
+        "draft_sha256",
+        "reviewed_span_ids",
+        "source_mapping_failures",
+        "doubtful_fidelity_findings",
+        "recommended_actions",
+        "status",
+    ],
+    "fidelity_review_shard": [
+        "manifest_sha256",
+        "source_sha256",
+        "draft_sha256",
+        "shard_sha256",
+        "shard_id",
+        "review_group_ids",
+        "span_ids",
+        "status",
+        "findings",
+        "unresolved_items",
+        "conflicts",
+        "evidence_mappings",
+        "source_mapping_failures",
+        "summary_compression_findings",
+        "pronoun_rewrite_findings",
+        "omission_findings",
+        "recommended_revisions",
+    ],
+    "fidelity_review_assembly_receipt": [
+        "manifest_sha256",
+        "shard_artifact_digest",
+        "fidelity_review_sha256",
+        "review_group_ids",
+        "span_ids",
+        "status",
     ],
     "main_action_receipt": [
         "run_id",
@@ -138,6 +198,8 @@ LIST_FIELD_RULES: dict[str, list[str]] = {
         "unresolved_items",
         "conflicts",
     ],
+    "entity_verification_shard": ["candidate_ids", "results"],
+    "entity_verification_assembly_receipt": ["candidate_ids"],
     "target_attribution_review": [
         "wrong_grouping",
         "missing_positive_targets",
@@ -156,12 +218,39 @@ LIST_FIELD_RULES: dict[str, list[str]] = {
     "speaker_turn_edit": ["speaker_ids", "edited_turns", "unresolved_spans"],
     "editing_assembly_receipt": ["ordered_turn_ids"],
     "export_manifest": ["validators_run", "known_unverified_parts"],
+    "final_semantic_review": [
+        "reviewed_span_ids",
+        "source_mapping_failures",
+        "doubtful_fidelity_findings",
+        "recommended_actions",
+    ],
+    "fidelity_review_shard": [
+        "review_group_ids", "span_ids", "findings", "unresolved_items", "conflicts",
+        "evidence_mappings", "source_mapping_failures", "summary_compression_findings",
+        "pronoun_rewrite_findings", "omission_findings", "recommended_revisions",
+    ],
+    "fidelity_review_assembly_receipt": ["review_group_ids", "span_ids"],
     "main_action_receipt": ["actions"],
 }
 STRING_FIELD_RULES: dict[str, list[str]] = {
     "source_manifest": ["source_mode", "archive_status", "skipped_reason"],
     "transcript_audit": ["asr_primary", "asr_auxiliary", "timestamp_index_status", "recommended_action"],
     "source_reconciliation": ["primary_body_source", "primary_source_reason", "cross_check_source"],
+    "entity_verification_shard": [
+        "manifest_sha256",
+        "source_sha256",
+        "candidate_set_sha256",
+        "shard_sha256",
+        "shard_id",
+        "status",
+    ],
+    "entity_verification_assembly_receipt": [
+        "manifest_sha256",
+        "shard_artifact_digest",
+        "entity_report_sha256",
+        "doubtful_items_sha256",
+        "status",
+    ],
     "speaker_turn_edit": [
         "manifest_sha256",
         "shard_id",
@@ -181,6 +270,13 @@ STRING_FIELD_RULES: dict[str, list[str]] = {
         "verification_sidecar_path",
         "export_status",
     ],
+    "final_semantic_review": ["scope_sha256", "draft_sha256", "status"],
+    "fidelity_review_shard": [
+        "manifest_sha256", "source_sha256", "draft_sha256", "shard_sha256", "shard_id", "status"
+    ],
+    "fidelity_review_assembly_receipt": [
+        "manifest_sha256", "shard_artifact_digest", "fidelity_review_sha256", "status"
+    ],
     "main_action_receipt": [
         "run_id",
         "status",
@@ -195,7 +291,6 @@ OBJECT_FIELD_RULES: dict[str, list[str]] = {
 }
 POSITIVE_INTEGER_FIELD_RULES: dict[str, list[str]] = {
     "target_attribution_review": ["segments_reviewed"],
-    "fidelity_review": ["paragraphs_reviewed"],
 }
 TRANSCRIPT_ACTIONS = {"continue", "repair_transcript", "request_user"}
 EXPORT_STATUSES = {"passed", "failed", "blocked"}
@@ -212,10 +307,23 @@ PUBLIC_SOURCE_IDS = {
 }
 REQUIRED_VALIDATOR_NAMES = {"validate_utf8_text.py", "validate_meeting_minutes_contract.py"}
 REGRESSION_VALIDATOR_NAME = "run_meeting_minutes_regression.py"
-MAIN_OWNED_ARTIFACTS = {"source_manifest", "editing_assembly_receipt", "main_action_receipt"}
+MAIN_OWNED_ARTIFACTS = {
+    "source_manifest",
+    "editing_assembly_receipt",
+    "entity_verification_assembly_receipt",
+    "fidelity_review_assembly_receipt",
+    "main_action_receipt",
+    "export_manifest",
+}
 SPEAKER_TURN_EDIT_PREFIX = "speaker_turn_edit__"
+ENTITY_VERIFICATION_SHARD_PREFIX = "entity_verification_shard__"
+FIDELITY_REVIEW_SHARD_PREFIX = "fidelity_review_shard__"
 SPEAKER_TURN_EDIT_STATUSES = {"complete", "blocked"}
-SAFE_DYNAMIC_ARTIFACT = re.compile(r"^speaker_turn_edit__[a-z0-9_]+$")
+ENTITY_VERIFICATION_SHARD_STATUSES = {"complete", "blocked"}
+FIDELITY_REVIEW_SHARD_STATUSES = {"complete", "blocked"}
+SAFE_DYNAMIC_ARTIFACT = re.compile(
+    r"^(?:speaker_turn_edit|entity_verification_shard|fidelity_review_shard)__[a-z0-9_]+$"
+)
 SENSITIVE_QUERY_KEYS = {
     "access_token",
     "api_key",
@@ -347,7 +455,12 @@ def artifact_set_digest(artifacts: dict[str, Any]) -> str:
     stable = {
         key: value
         for key, value in artifacts.items()
-        if key not in {"export_manifest", "editing_assembly_receipt", "main_action_receipt"}
+        if key not in {
+            "export_manifest",
+            "editing_assembly_receipt",
+            "entity_verification_assembly_receipt",
+            "main_action_receipt",
+        }
     }
     return canonical_json_digest(stable)
 
@@ -368,7 +481,50 @@ def artifact_mapping(payload: Any) -> tuple[dict[str, Any], list[str]]:
 def artifact_schema_name(artifact_type: str) -> str:
     if artifact_type.startswith(SPEAKER_TURN_EDIT_PREFIX):
         return "speaker_turn_edit"
+    if artifact_type.startswith(ENTITY_VERIFICATION_SHARD_PREFIX):
+        return "entity_verification_shard"
+    if artifact_type.startswith(FIDELITY_REVIEW_SHARD_PREFIX):
+        return "fidelity_review_shard"
     return artifact_type
+
+
+def validate_entity_shard_task_context(
+    artifact_type: str,
+    artifact: Any,
+    task: dict[str, Any],
+) -> list[str]:
+    if artifact_schema_name(artifact_type) != "entity_verification_shard":
+        return []
+    if not isinstance(artifact, dict):
+        return [f"{artifact_type} 必须是 JSON object"]
+    context = task.get("task_context")
+    if not isinstance(context, dict):
+        return [f"{artifact_type} dispatch task 缺少 task_context"]
+    errors: list[str] = []
+    for field in (
+        "manifest_sha256",
+        "source_sha256",
+        "candidate_set_sha256",
+        "shard_sha256",
+        "shard_id",
+        "candidate_ids",
+    ):
+        if artifact.get(field) != context.get(field):
+            errors.append(f"{artifact_type}.{field} 与 dispatch task_context 不一致")
+    results = artifact.get("results")
+    if not isinstance(results, list):
+        return errors
+    returned_ids = [
+        str(item.get("candidate_id") or "")
+        for item in results
+        if isinstance(item, dict)
+    ]
+    expected_ids = [str(item) for item in context.get("candidate_ids", [])]
+    if len(returned_ids) != len(results) or len(returned_ids) != len(set(returned_ids)):
+        errors.append(f"{artifact_type}.results candidate_id 必须唯一且每项非空")
+    if returned_ids != expected_ids:
+        errors.append(f"{artifact_type}.results 必须按 task_context 顺序恰好覆盖 candidate_ids")
+    return errors
 
 
 def validate_speaker_edit_task_context(
@@ -421,6 +577,28 @@ def validate_speaker_edit_task_context(
     return errors
 
 
+def validate_fidelity_shard_task_context(
+    artifact_type: str,
+    artifact: Any,
+    task: dict[str, Any],
+) -> list[str]:
+    if artifact_schema_name(artifact_type) != "fidelity_review_shard":
+        return []
+    if not isinstance(artifact, dict):
+        return [f"{artifact_type} 必须是 JSON object"]
+    context = task.get("task_context")
+    if not isinstance(context, dict):
+        return [f"{artifact_type} dispatch task 缺少 task_context"]
+    errors: list[str] = []
+    for field in (
+        "manifest_sha256", "source_sha256", "draft_sha256", "shard_sha256",
+        "shard_id", "review_group_ids", "span_ids",
+    ):
+        if artifact.get(field) != context.get(field):
+            errors.append(f"{artifact_type}.{field} 与 dispatch task_context 不一致")
+    return errors
+
+
 def validate_dispatch_identity(
     payload: Any,
     bundle: dict[str, Any],
@@ -460,6 +638,39 @@ def validate_dispatch_identity(
     task_id = str(payload.get("task_id") or "")
     dispatch_phase = str(payload.get("dispatch_phase") or "")
     owner = str(payload.get("artifact_owner") or "")
+    entity_config = bundle.get("entity_verification")
+    entity_mode = str(entity_config.get("effective_mode") or "") if isinstance(entity_config, dict) else ""
+    parallel_entity_main_outputs = {
+        "entity_verification_report",
+        "doubtful_items",
+        "entity_verification_assembly_receipt",
+    }
+    if (
+        entity_mode == "parallel"
+        and len(artifact_types) == 1
+        and artifact_types <= parallel_entity_main_outputs
+    ):
+        artifact_type = next(iter(artifact_types))
+        if owner != "Main Orchestrator":
+            errors.append("并行实体汇总 artifact_owner 必须为 Main Orchestrator")
+        if task_id != f"{expected_run_id}:main:{artifact_type}":
+            errors.append("并行实体汇总 task_id 与当前 run/artifact 不匹配")
+        if dispatch_phase != "pre_draft":
+            errors.append("并行实体汇总 dispatch_phase 必须为 pre_draft")
+        return errors
+    if (
+        isinstance(bundle.get("fidelity_diff_manifest"), dict)
+        and len(artifact_types) == 1
+        and artifact_types <= {"fidelity_review", "fidelity_review_assembly_receipt"}
+    ):
+        artifact_type = next(iter(artifact_types))
+        if owner != "Main Orchestrator":
+            errors.append("Fidelity 汇总 artifact_owner 必须为 Main Orchestrator")
+        if task_id != f"{expected_run_id}:main:{artifact_type}":
+            errors.append("Fidelity 汇总 task_id 与当前 run/artifact 不匹配")
+        if dispatch_phase != "draft_review":
+            errors.append("Fidelity 汇总 dispatch_phase 必须为 draft_review")
+        return errors
     if artifact_types and artifact_types <= MAIN_OWNED_ARTIFACTS:
         if owner != "Main Orchestrator":
             errors.append("Main-owned MAS artifact 的 artifact_owner 必须为 Main Orchestrator")
@@ -469,7 +680,10 @@ def validate_dispatch_identity(
         expected_phase_by_type = {
             "source_manifest": "pre_draft",
             "editing_assembly_receipt": "editing",
+            "entity_verification_assembly_receipt": "pre_draft",
+            "fidelity_review_assembly_receipt": "draft_review",
             "main_action_receipt": "draft_review",
+            "export_manifest": "final_verification",
         }
         expected_phases = {expected_phase_by_type[artifact_type] for artifact_type in artifact_types}
         if len(expected_phases) != 1 or dispatch_phase not in expected_phases:
@@ -523,6 +737,8 @@ def validate_dispatch_identity(
         )
     for artifact_type, artifact in artifacts.items():
         errors.extend(validate_speaker_edit_task_context(str(artifact_type), artifact, context_task))
+        errors.extend(validate_entity_shard_task_context(str(artifact_type), artifact, context_task))
+        errors.extend(validate_fidelity_shard_task_context(str(artifact_type), artifact, context_task))
     if dispatch_phase != expected_phase:
         errors.append(f"MAS artifact dispatch_phase 不匹配: expected={expected_phase} actual={dispatch_phase}")
     if owner != expected_owner:
@@ -619,8 +835,13 @@ def validate_dispatch_context(bundle: Any, manifest: Any) -> list[str]:
             errors.append(f"MAS task artifact_type 不在 expected_artifacts 中: {task_artifact}")
         if any(item not in expected_set for item in task_secondary):
             errors.append(f"MAS task secondary_artifacts 不在 expected_artifacts 中: {task_id}")
-    if bool(bundle.get("mas_required")) and not tasks:
-        errors.append("MAS task bundle 启用 MAS 时必须包含 specialist tasks")
+    specialist_expected = expected_set - MAIN_OWNED_ARTIFACTS - {
+        "doubtful_items",
+        "entity_verification_report",
+        "fidelity_review",
+    }
+    if bool(bundle.get("mas_required")) and specialist_expected and not tasks:
+        errors.append("MAS task bundle 存在 specialist artifacts 时必须包含 specialist tasks")
     if bool(bundle.get("mas_required")) != bool(manifest.get("mas_required")):
         errors.append("MAS bundle/manifest mas_required 不一致")
     return errors
@@ -742,6 +963,173 @@ def validate_speaker_turn_edit(artifact_type: str, artifact: Any) -> list[str]:
                 errors.append(f"{path}.edited_text 不得为空")
         if returned_speaker_ids != normalized_speaker_ids:
             errors.append(f"{artifact_type}.speaker_ids 与 edited_turns 首次出现顺序不一致")
+    return errors
+
+
+def validate_entity_verification_shard(artifact_type: str, artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    errors: list[str] = []
+    if not SAFE_DYNAMIC_ARTIFACT.fullmatch(artifact_type):
+        errors.append(f"{artifact_type} 动态 artifact key 不安全")
+    extra_fields = sorted(set(artifact) - set(REQUIRED_FIELDS["entity_verification_shard"]))
+    if extra_fields:
+        errors.append(f"{artifact_type} 包含 shard 权限之外字段: {', '.join(extra_fields)}")
+    for field in ("manifest_sha256", "source_sha256", "candidate_set_sha256", "shard_sha256"):
+        if not HEX_SHA256.fullmatch(str(artifact.get(field) or "")):
+            errors.append(f"{artifact_type}.{field} 必须是小写 SHA-256")
+    if artifact.get("status") not in ENTITY_VERIFICATION_SHARD_STATUSES:
+        errors.append(f"{artifact_type}.status 必须是 complete 或 blocked")
+    candidate_ids = artifact.get("candidate_ids")
+    if not isinstance(candidate_ids, list) or not candidate_ids:
+        errors.append(f"{artifact_type}.candidate_ids 必须是非空 JSON array")
+        candidate_ids = []
+    normalized_ids = [str(item) for item in candidate_ids]
+    if any(not item for item in normalized_ids) or len(normalized_ids) != len(set(normalized_ids)):
+        errors.append(f"{artifact_type}.candidate_ids 必须唯一且非空")
+    results = artifact.get("results")
+    if not isinstance(results, list):
+        return errors
+    for index, result in enumerate(results, start=1):
+        path = f"{artifact_type}.results[{index}]"
+        if not isinstance(result, dict):
+            errors.append(f"{path} 必须是 JSON object")
+            continue
+        required = {
+            "candidate_id",
+            "input_term",
+            "status",
+            "canonical_name",
+            "identity_key",
+            "evidence_paths",
+            "conflict_codes",
+            "unresolved_reason",
+        }
+        missing = sorted(required - set(result))
+        if missing:
+            errors.append(f"{path} 缺少字段: {', '.join(missing)}")
+            continue
+        extra_result_fields = sorted(set(result) - required)
+        if extra_result_fields:
+            errors.append(f"{path} 包含核验结果权限之外字段: {', '.join(extra_result_fields)}")
+        status = str(result.get("status") or "")
+        evidence_paths = result.get("evidence_paths")
+        conflict_codes = result.get("conflict_codes")
+        string_limits = {
+            "candidate_id": 128,
+            "input_term": 160,
+            "canonical_name": 200,
+            "identity_key": 200,
+            "unresolved_reason": 500,
+        }
+        for field, limit in string_limits.items():
+            value = result.get(field)
+            if not isinstance(value, str):
+                errors.append(f"{path}.{field} 必须是 string")
+                continue
+            if len(value) > limit:
+                errors.append(f"{path}.{field} 不得超过 {limit} 字符")
+            normalized = value.strip().casefold()
+            if field in {"input_term", "canonical_name", "identity_key", "unresolved_reason"} and (
+                "://" in normalized
+                or normalized.startswith(("/", "~/", "file:", "users/", "home/", "private/"))
+                or re.match(r"^[a-z]:[\\/]", normalized)
+            ):
+                errors.append(f"{path}.{field} 不得包含 URL 或本地/私密路径")
+        if status not in {"confirmed", "unresolved"}:
+            errors.append(f"{path}.status 必须是 confirmed 或 unresolved")
+        if not isinstance(evidence_paths, list) or not isinstance(conflict_codes, list):
+            errors.append(f"{path}.evidence_paths/conflict_codes 必须是 JSON array")
+            continue
+        if len(evidence_paths) > 16 or len(conflict_codes) > 16:
+            errors.append(f"{path}.evidence_paths/conflict_codes 每项不得超过 16 个")
+        for code in conflict_codes:
+            if not isinstance(code, str) or not code.strip() or len(code) > 100:
+                errors.append(f"{path}.conflict_codes 每项必须是 1-100 字符的 string")
+            elif "://" in code.casefold() or code.startswith(("/", "~/")):
+                errors.append(f"{path}.conflict_codes 不得包含 URL 或本地/私密路径")
+        for evidence in evidence_paths:
+            evidence_text = str(evidence).strip()
+            if not is_public_evidence_url(evidence_text) and evidence_text not in PUBLIC_SOURCE_IDS:
+                errors.append(f"{path}.evidence_paths 含非法公开证据路径: {evidence_text}")
+        if status == "confirmed" and not evidence_paths:
+            errors.append(f"{path} confirmed 必须提供逐项公开证据")
+        if status == "unresolved" and not str(result.get("unresolved_reason") or "").strip():
+            errors.append(f"{path} unresolved 必须提供 unresolved_reason")
+    return errors
+
+
+def validate_entity_verification_assembly_receipt(artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    errors: list[str] = []
+    for field in (
+        "manifest_sha256",
+        "shard_artifact_digest",
+        "entity_report_sha256",
+        "doubtful_items_sha256",
+    ):
+        if not HEX_SHA256.fullmatch(str(artifact.get(field) or "")):
+            errors.append(f"entity_verification_assembly_receipt.{field} 必须是小写 SHA-256")
+    if artifact.get("status") != "assembled":
+        errors.append("entity_verification_assembly_receipt.status 必须是 assembled")
+    candidate_ids = artifact.get("candidate_ids")
+    if not isinstance(candidate_ids, list) or not candidate_ids:
+        errors.append("entity_verification_assembly_receipt.candidate_ids 必须是非空 JSON array")
+    elif len(candidate_ids) != len({str(item) for item in candidate_ids}):
+        errors.append("entity_verification_assembly_receipt.candidate_ids 不得重复")
+    return errors
+
+
+def validate_fidelity_review_shard(artifact_type: str, artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    errors: list[str] = []
+    if not SAFE_DYNAMIC_ARTIFACT.fullmatch(artifact_type):
+        errors.append(f"{artifact_type} 动态 artifact key 不安全")
+    extra_fields = sorted(set(artifact) - set(REQUIRED_FIELDS["fidelity_review_shard"]))
+    if extra_fields:
+        errors.append(f"{artifact_type} 包含 shard 权限之外字段: {', '.join(extra_fields)}")
+    for field in ("manifest_sha256", "source_sha256", "draft_sha256", "shard_sha256"):
+        if not HEX_SHA256.fullmatch(str(artifact.get(field) or "")):
+            errors.append(f"{artifact_type}.{field} 必须是小写 SHA-256")
+    if artifact.get("status") not in FIDELITY_REVIEW_SHARD_STATUSES:
+        errors.append(f"{artifact_type}.status 必须是 complete 或 blocked")
+    for field in ("review_group_ids", "span_ids"):
+        values = artifact.get(field)
+        if not isinstance(values, list) or not values or any(not str(item) for item in values):
+            errors.append(f"{artifact_type}.{field} 必须是非空 string array")
+        elif len(values) != len(set(str(item) for item in values)):
+            errors.append(f"{artifact_type}.{field} 不得重复")
+    return errors
+
+
+def validate_fidelity_review(artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    value = artifact.get("paragraphs_reviewed")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return ["fidelity_review.paragraphs_reviewed 必须是非负整数"]
+    if value == 0 and artifact.get("mode") != "no_change":
+        return ["fidelity_review 仅 no_change 路径允许 paragraphs_reviewed=0"]
+    return []
+
+
+def validate_fidelity_review_assembly_receipt(artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    errors: list[str] = []
+    for field in ("manifest_sha256", "shard_artifact_digest", "fidelity_review_sha256"):
+        if not HEX_SHA256.fullmatch(str(artifact.get(field) or "")):
+            errors.append(f"fidelity_review_assembly_receipt.{field} 必须是小写 SHA-256")
+    if artifact.get("status") != "assembled":
+        errors.append("fidelity_review_assembly_receipt.status 必须是 assembled")
+    for field in ("review_group_ids", "span_ids"):
+        values = artifact.get(field)
+        if not isinstance(values, list):
+            errors.append(f"fidelity_review_assembly_receipt.{field} 必须是 array")
+        elif len(values) != len(set(str(item) for item in values)):
+            errors.append(f"fidelity_review_assembly_receipt.{field} 不得重复")
     return errors
 
 
@@ -904,6 +1292,10 @@ def validate_export_manifest(artifact: Any) -> list[str]:
     if not isinstance(artifact, dict):
         return []
     errors: list[str] = []
+    if artifact.get("schema_version") != "2.0":
+        errors.append("export_manifest.schema_version 必须为 2.0；legacy specialist manifest 已停用")
+    if artifact.get("generation_mode") != "deterministic_main_owned_v1":
+        errors.append("export_manifest.generation_mode 必须为 deterministic_main_owned_v1")
     if not str(artifact.get("markdown_path") or "").strip():
         errors.append("export_manifest.markdown_path 不得为空")
     markdown_sha256 = str(artifact.get("markdown_sha256") or "").strip().lower()
@@ -941,6 +1333,32 @@ def validate_export_manifest(artifact: Any) -> list[str]:
         )
     if artifact.get("export_status") not in EXPORT_STATUSES:
         errors.append("export_manifest.export_status 必须是以下之一: " + ", ".join(sorted(EXPORT_STATUSES)))
+    for field in (
+        "verification_sidecar_sha256",
+        "main_action_receipt_sha256",
+        "validator_evidence_sha256",
+        "regression_evidence_sha256",
+    ):
+        value = str(artifact.get(field) or "")
+        if value and not HEX_SHA256.fullmatch(value):
+            errors.append(f"export_manifest.{field} 必须为空或小写 SHA-256")
+    return errors
+
+
+def validate_final_semantic_review(artifact: Any) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    errors: list[str] = []
+    for field in ("scope_sha256", "draft_sha256"):
+        if not HEX_SHA256.fullmatch(str(artifact.get(field) or "")):
+            errors.append(f"final_semantic_review.{field} 必须是小写 SHA-256")
+    reviewed = artifact.get("reviewed_span_ids")
+    if not isinstance(reviewed, list) or not reviewed or any(not str(item).strip() for item in reviewed):
+        errors.append("final_semantic_review.reviewed_span_ids 必须是非空 string array")
+    elif len(reviewed) != len(set(str(item) for item in reviewed)):
+        errors.append("final_semantic_review.reviewed_span_ids 不得重复")
+    if artifact.get("status") not in {"complete", "blocked"}:
+        errors.append("final_semantic_review.status 必须是 complete 或 blocked")
     return errors
 
 
@@ -1051,14 +1469,26 @@ def validate_payload(payload: Any, required_artifacts: list[str] | None = None) 
                 errors.extend(validate_transcript_audit(artifact))
             elif artifact_schema == "source_reconciliation":
                 errors.extend(validate_source_reconciliation(artifact))
+            elif artifact_schema == "fidelity_review":
+                errors.extend(validate_fidelity_review(artifact))
             elif artifact_schema == "entity_verification_report":
                 errors.extend(validate_entity_verification_report(artifact))
+            elif artifact_schema == "entity_verification_shard":
+                errors.extend(validate_entity_verification_shard(str(artifact_type), artifact))
+            elif artifact_schema == "entity_verification_assembly_receipt":
+                errors.extend(validate_entity_verification_assembly_receipt(artifact))
+            elif artifact_schema == "fidelity_review_shard":
+                errors.extend(validate_fidelity_review_shard(str(artifact_type), artifact))
+            elif artifact_schema == "fidelity_review_assembly_receipt":
+                errors.extend(validate_fidelity_review_assembly_receipt(artifact))
             elif artifact_schema == "speaker_turn_edit":
                 errors.extend(validate_speaker_turn_edit(str(artifact_type), artifact))
             elif artifact_schema == "editing_assembly_receipt":
                 errors.extend(validate_editing_assembly_receipt(artifact))
             elif artifact_schema == "export_manifest":
                 errors.extend(validate_export_manifest(artifact))
+            elif artifact_schema == "final_semantic_review":
+                errors.extend(validate_final_semantic_review(artifact))
             elif artifact_schema == "main_action_receipt":
                 errors.extend(validate_main_action_receipt(artifact))
         else:

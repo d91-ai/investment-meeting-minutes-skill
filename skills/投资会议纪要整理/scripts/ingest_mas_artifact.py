@@ -389,6 +389,154 @@ def expand_speaker_edit_response(
     }
 
 
+def expand_entity_verification_response(
+    response: Any,
+    task_dir: Path,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    """Bind compact entity evidence to trusted dispatch metadata."""
+    if not isinstance(response, dict) or set(response) != {"task_id", "results"}:
+        raise ValueError("Entity Verifier 紧凑返回只能包含 task_id 和 results")
+    response_task_id = str(response.get("task_id") or "")
+    if not response_task_id:
+        raise ValueError("Entity Verifier 紧凑返回缺少 task_id")
+    if task_id and response_task_id != task_id:
+        raise ValueError(
+            f"Entity Verifier task_id 不匹配: expected={task_id} actual={response_task_id}"
+        )
+
+    bundle = read_json(task_dir.expanduser() / "mas_task_bundle.json")
+    if not isinstance(bundle, dict):
+        raise ValueError("MAS task bundle 必须是 JSON object")
+    from build_mas_task_bundle import validate_bundle
+
+    bundle_errors = validate_bundle(bundle)
+    if bundle_errors:
+        raise ValueError("MAS task bundle 校验失败: " + "; ".join(bundle_errors))
+    matches = [
+        task
+        for task in bundle.get("tasks", [])
+        if isinstance(task, dict) and str(task.get("task_id") or "") == response_task_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"entity task_id 未唯一匹配当前 dispatch task: {response_task_id}"
+        )
+    task = matches[0]
+    if task.get("artifact_schema") != "entity_verification_shard":
+        raise ValueError(f"task_id 不是 Entity Verifier shard task: {response_task_id}")
+    context = task.get("task_context")
+    if not isinstance(context, dict):
+        raise ValueError("Entity Verifier task 缺少 task_context")
+    packet = context.get("verification_packet")
+    if not isinstance(packet, list) or not packet:
+        raise ValueError("Entity Verifier task 缺少 verification_packet")
+    expected_ids = [str(item.get("candidate_id") or "") for item in packet if isinstance(item, dict)]
+    expected_terms = {
+        str(item.get("candidate_id") or ""): str(item.get("candidate_term") or "")
+        for item in packet
+        if isinstance(item, dict)
+    }
+    if len(expected_ids) != len(packet) or any(not item for item in expected_ids):
+        raise ValueError("Entity Verifier task verification_packet candidate_id 无效")
+
+    dispatch = read_json(task_dir.expanduser() / "dispatch_manifest.json")
+    if not isinstance(dispatch, dict) or dispatch.get("run_id") != bundle.get("run_id"):
+        raise ValueError("dispatch_manifest 未绑定当前 MAS bundle run_id")
+    dispatch_matches = [
+        item
+        for item in dispatch.get("task_files", [])
+        if isinstance(item, dict) and str(item.get("task_id") or "") == response_task_id
+    ]
+    if len(dispatch_matches) != 1:
+        raise ValueError("Entity Verifier task_id 未唯一匹配 dispatch_manifest")
+    dispatch_task = dispatch_matches[0]
+    for field in ("artifact_type", "artifact_schema", "dispatch_phase", "artifact_owner"):
+        expected_value = str(task.get(field) or task.get("role") or "")
+        if str(dispatch_task.get(field) or "") != expected_value:
+            raise ValueError(f"dispatch_manifest {field} 与 MAS bundle task 不一致")
+
+    manifest = bundle.get("entity_candidate_manifest")
+    if not isinstance(manifest, dict):
+        raise ValueError("MAS bundle 缺少 entity_candidate_manifest")
+    shard_matches = [
+        shard
+        for shard in manifest.get("shards", [])
+        if isinstance(shard, dict)
+        and str(shard.get("artifact_type") or "") == str(task.get("artifact_type") or "")
+    ]
+    if len(shard_matches) != 1:
+        raise ValueError("Entity Verifier task 未唯一匹配 entity candidate shard")
+    shard = shard_matches[0]
+    canonical_context = {
+        "manifest_sha256": str(manifest.get("manifest_sha256") or ""),
+        "source_sha256": str(manifest.get("source_sha256") or ""),
+        "candidate_set_sha256": str(manifest.get("candidate_set_sha256") or ""),
+        "shard_sha256": str(shard.get("shard_sha256") or ""),
+        "shard_id": str(shard.get("shard_id") or ""),
+        "candidate_ids": [str(item) for item in shard.get("candidate_ids", [])],
+        "group_ids": [str(item) for item in shard.get("group_ids", [])],
+        "verification_packet": shard.get("verification_packet", []),
+    }
+    if context != canonical_context:
+        raise ValueError("Entity Verifier task_context 与绑定 manifest shard 不一致")
+
+    results = response.get("results")
+    if not isinstance(results, list) or len(results) != len(expected_ids):
+        raise ValueError("Entity Verifier results 数量必须与 assigned candidates 完全一致")
+    allowed_fields = {
+        "candidate_id",
+        "status",
+        "canonical_name",
+        "identity_key",
+        "evidence_paths",
+        "conflict_codes",
+        "unresolved_reason",
+    }
+    bound_results: list[dict[str, Any]] = []
+    for index, (returned, expected_id) in enumerate(zip(results, expected_ids), start=1):
+        if not isinstance(returned, dict) or set(returned) != allowed_fields:
+            raise ValueError(
+                f"Entity Verifier results[{index}] 字段必须恰好为: "
+                + ", ".join(sorted(allowed_fields))
+            )
+        if returned.get("candidate_id") != expected_id:
+            raise ValueError(
+                "Entity Verifier 必须按 assigned candidates 原顺序返回: "
+                f"expected={expected_id} actual={returned.get('candidate_id')}"
+            )
+        bound_results.append(
+            {
+                "candidate_id": expected_id,
+                "input_term": expected_terms[expected_id],
+                "status": returned.get("status"),
+                "canonical_name": returned.get("canonical_name"),
+                "identity_key": returned.get("identity_key"),
+                "evidence_paths": returned.get("evidence_paths"),
+                "conflict_codes": returned.get("conflict_codes"),
+                "unresolved_reason": returned.get("unresolved_reason"),
+            }
+        )
+
+    return {
+        "run_id": str(bundle.get("run_id") or ""),
+        "task_id": response_task_id,
+        "dispatch_phase": str(task.get("dispatch_phase") or ""),
+        "artifact_owner": str(task.get("artifact_owner") or task.get("role") or ""),
+        "artifact_type": str(task.get("artifact_type") or ""),
+        "artifact": {
+            "manifest_sha256": str(context.get("manifest_sha256") or ""),
+            "source_sha256": str(context.get("source_sha256") or ""),
+            "candidate_set_sha256": str(context.get("candidate_set_sha256") or ""),
+            "shard_sha256": str(context.get("shard_sha256") or ""),
+            "shard_id": str(context.get("shard_id") or ""),
+            "candidate_ids": expected_ids,
+            "status": "complete",
+            "results": bound_results,
+        },
+    }
+
+
 def collector_command(task_dir: Path, through_phase: str | None = None) -> str:
     script_path = Path(__file__).with_name("collect_mas_artifacts.py")
     command = f"python3 {shlex.quote(str(script_path))} {shlex.quote(str(task_dir))} --json"
@@ -655,6 +803,15 @@ def ingest_mas_artifact(
                                 repair_history_file = str(superseded_records[-1][0])
 
     ok = ingest_status in {"written", "replaced"}
+    if (
+        ok
+        and ingest_status == "replaced"
+        and any(artifact_type.startswith("entity_verification_shard__") for artifact_type in artifact_types)
+        and (artifact_dir / "entity_verification_assembly_receipt.json").exists()
+    ):
+        warnings.append(
+            "entity verification shard 已替换；现有 assembly receipt 将被 collector 判定过期，必须重新汇总"
+        )
     return {
         "schema_version": "1.0",
         "ok": ok,
@@ -679,6 +836,7 @@ def ingest_mas_artifact_file(
     through_phase: str | None = None,
     replace_existing: bool = False,
     speaker_task_id: str | None = None,
+    entity_task_id: str | None = None,
 ) -> dict[str, Any]:
     payload, input_source, raw_text, parse_errors = load_json_input(input_path)
     if parse_errors:
@@ -741,6 +899,46 @@ def ingest_mas_artifact_file(
                 "errors": errors,
                 "warnings": [],
             }
+    compact_entity_response = (
+        isinstance(payload, dict)
+        and set(payload) == {"task_id", "results"}
+    )
+    if entity_task_id or compact_entity_response:
+        try:
+            payload = expand_entity_verification_response(
+                payload,
+                task_dir,
+                entity_task_id,
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            errors = [f"无法绑定 Entity Verifier 紧凑返回: {exc}"]
+            task_dir = task_dir.expanduser()
+            repair_dir = task_dir / "repair_history"
+            repair_path = write_repair_record(
+                repair_dir,
+                "invalid_entity_response",
+                input_source,
+                payload,
+                errors,
+                [],
+                [],
+            )
+            return {
+                "schema_version": "1.0",
+                "ok": False,
+                "ingest_status": "invalid_entity_response_not_written",
+                "input_source": input_source,
+                "task_dir": str(task_dir),
+                "artifact_dir": str(task_dir / "artifacts"),
+                "repair_history_dir": str(repair_dir),
+                "artifact_types": [],
+                "written_artifacts": [],
+                "repair_history_file": str(repair_path),
+                "validation": {"ok": False, "errors": errors, "warnings": []},
+                "next_collector_command": collector_command(task_dir, through_phase=through_phase),
+                "errors": errors,
+                "warnings": [],
+            }
     return ingest_mas_artifact(
         payload,
         task_dir,
@@ -760,6 +958,10 @@ def main() -> int:
         "--speaker-task-id",
         help="将极简 Speaker Turn Editor JSON array 绑定到此 dispatch task 后再 ingest",
     )
+    parser.add_argument(
+        "--entity-task-id",
+        help="将紧凑 Entity Verifier JSON 绑定到此 dispatch task 后再 ingest；默认从返回 task_id 自动识别",
+    )
     parser.add_argument("--json", action="store_true", help="输出 JSON；默认也是 JSON")
     args = parser.parse_args()
 
@@ -770,6 +972,7 @@ def main() -> int:
         through_phase=args.through_phase,
         replace_existing=bool(args.replace_existing),
         speaker_task_id=args.speaker_task_id,
+        entity_task_id=args.entity_task_id,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["ok"] else 1

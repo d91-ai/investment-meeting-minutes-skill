@@ -22,6 +22,10 @@ STANDALONE_GROUP_SPEAKER = re.compile(
 MARKDOWN_GROUP_SPEAKER = re.compile(
     r"^#{1,6}\s+(?P<label>[A-Za-z0-9\u4e00-\u9fff·+&（）()/-]{1,16}组)\s*#*\s*$"
 )
+STANDALONE_ANONYMOUS_SPEAKER = re.compile(
+    r"^(?P<speaker>(?:Speaker|发言人|说话人)\s*(?:\d+|[A-Za-z]+|[甲乙丙丁戊己庚辛壬癸]))\s*[：:]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def group_speaker_label(line: str) -> str:
@@ -46,13 +50,20 @@ def canonical_sha256(value: Any) -> str:
     return sha256_text(payload)
 
 
-def detect_source_turns(text: str) -> list[tuple[str, str]]:
+def normalized_anonymous_label(value: str) -> str:
+    normalized = re.sub(r"\s+", "", value.strip())
+    normalized = re.sub(r"^说话人", "发言人", normalized)
+    return normalized
+
+
+def detect_source_turns(text: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Split speaker turns without applying filler removal or prose editing."""
-    turns: list[tuple[str, str]] = []
+    turns: list[dict[str, Any]] = []
     current_speaker = ""
-    buffer: list[str] = []
+    buffer_start: int | None = None
+    buffer_end: int | None = None
     anonymous_labels: dict[str, str] = {}
-    source_lines = text.splitlines()
+    source_lines = text.splitlines(keepends=True)
     group_labels = {
         label
         for line in source_lines
@@ -60,24 +71,62 @@ def detect_source_turns(text: str) -> list[tuple[str, str]]:
     }
     repeated_group_layout = len(group_labels) >= 2
 
-    def flush() -> None:
-        nonlocal buffer
-        content = "\n".join(buffer).strip()
-        if content:
-            turns.append((current_speaker or "发言人1", content))
-        buffer = []
+    boundary_count = 0
+    standalone_boundary_count = 0
+    inline_boundary_count = 0
+    unlabeled_prefix_chars = 0
 
+    def flush() -> None:
+        nonlocal buffer_start, buffer_end
+        if buffer_start is None or buffer_end is None:
+            return
+        raw_content = text[buffer_start:buffer_end]
+        leading = len(raw_content) - len(raw_content.lstrip())
+        trailing = len(raw_content) - len(raw_content.rstrip())
+        start_char = buffer_start + leading
+        end_char = buffer_end - trailing
+        content = text[start_char:end_char]
+        if content:
+            turns.append(
+                {
+                    "speaker_label": current_speaker or "发言人1",
+                    "text": content,
+                    "source_span": {"start_char": start_char, "end_char": end_char},
+                }
+            )
+        buffer_start = None
+        buffer_end = None
+
+    offset = 0
     for line in source_lines:
+        line_start = offset
+        line_end = offset + len(line)
+        offset = line_end
         stripped = line.strip()
         if not stripped:
-            if buffer:
-                buffer.append("")
+            if buffer_start is not None:
+                buffer_end = line_end
             continue
 
         group_label = group_speaker_label(stripped)
         if repeated_group_layout and group_label:
             flush()
             current_speaker = group_label
+            boundary_count += 1
+            standalone_boundary_count += 1
+            continue
+
+        standalone = STANDALONE_ANONYMOUS_SPEAKER.fullmatch(stripped)
+        if standalone:
+            flush()
+            raw_speaker = normalized_anonymous_label(standalone.group("speaker"))
+            speaker_key = anonymous_speaker_key(raw_speaker)
+            current_speaker = anonymous_labels.setdefault(
+                speaker_key,
+                f"发言人{len(anonymous_labels) + 1}",
+            )
+            boundary_count += 1
+            standalone_boundary_count += 1
             continue
 
         matched = None
@@ -89,7 +138,11 @@ def detect_source_turns(text: str) -> list[tuple[str, str]]:
                 break
 
         if not matched:
-            buffer.append(line)
+            if buffer_start is None:
+                if not current_speaker:
+                    unlabeled_prefix_chars += len(stripped)
+                buffer_start = line_start
+            buffer_end = line_end
             continue
 
         flush()
@@ -102,71 +155,91 @@ def detect_source_turns(text: str) -> list[tuple[str, str]]:
             )
         else:
             current_speaker = raw_speaker
+        boundary_count += 1
+        inline_boundary_count += 1
 
         content = matched.groupdict().get("content", "")
         if content:
-            buffer.append(content)
+            stripped_start = line_start + (len(line) - len(line.lstrip()))
+            content_start = stripped_start + matched.start("content")
+            content_end = stripped_start + matched.end("content")
+            buffer_start = content_start
+            buffer_end = content_end
 
     flush()
-    return turns
+    exact_spans = all(
+        text[int(turn["source_span"]["start_char"]):int(turn["source_span"]["end_char"])] == turn["text"]
+        for turn in turns
+    )
+    profile = {
+        "boundary_count": boundary_count,
+        "standalone_boundary_count": standalone_boundary_count,
+        "inline_boundary_count": inline_boundary_count,
+        "speaker_count": len({str(turn["speaker_label"]) for turn in turns}),
+        "unlabeled_prefix_chars": unlabeled_prefix_chars,
+        "structure_reliable": bool(turns) and boundary_count > 0 and unlabeled_prefix_chars == 0 and exact_spans,
+        "lossless_renderable": bool(turns) and exact_spans,
+    }
+    return turns, profile
 
 
-def split_oversized_text(text: str, max_chars: int) -> list[str]:
+def split_oversized_text(text: str, max_chars: int) -> list[tuple[str, int, int]]:
     """Split an oversized turn at paragraph, then sentence, boundaries."""
     if len(text) <= max_chars:
-        return [text]
+        return [(text, 0, len(text))]
 
-    paragraphs = [paragraph.strip() for paragraph in text.splitlines() if paragraph.strip()]
-    if not paragraphs:
-        return [text]
-
-    units: list[str] = []
-    for paragraph in paragraphs:
-        remaining = paragraph
-        while len(remaining) > max_chars:
-            window = remaining[:max_chars]
-            boundary = max(
-                (window.rfind(marker) + 1 for marker in "。！？!?；;"),
-                default=0,
-            )
-            if boundary < max_chars // 2:
-                boundary = max_chars
-            units.append(remaining[:boundary].strip())
-            remaining = remaining[boundary:].strip()
-        if remaining:
-            units.append(remaining)
-
-    chunks: list[str] = []
-    current: list[str] = []
-    current_chars = 0
-    for unit in units:
-        separator_chars = 1 if current else 0
-        if current and current_chars + separator_chars + len(unit) > max_chars:
-            chunks.append("\n".join(current))
-            current = []
-            current_chars = 0
-            separator_chars = 0
-        current.append(unit)
-        current_chars += separator_chars + len(unit)
-    if current:
-        chunks.append("\n".join(current))
+    chunks: list[tuple[str, int, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text):
+            break
+        limit = min(len(text), cursor + max_chars)
+        boundary = limit
+        if limit < len(text):
+            window = text[cursor:limit]
+            paragraph_boundary = max(window.rfind("\n\n"), window.rfind("\r\n\r\n"))
+            line_boundary = window.rfind("\n")
+            sentence_boundary = max((window.rfind(marker) + 1 for marker in "。！？!?;；"), default=0)
+            candidates = [
+                value
+                for value in (paragraph_boundary + 2, line_boundary + 1, sentence_boundary)
+                if value >= max_chars // 2
+            ]
+            if candidates:
+                boundary = cursor + max(candidates)
+        chunk_end = boundary
+        while chunk_end > cursor and text[chunk_end - 1].isspace():
+            chunk_end -= 1
+        chunk = text[cursor:chunk_end]
+        if chunk:
+            chunks.append((chunk, cursor, chunk_end))
+        cursor = boundary
     return chunks
 
 
 def build_turns(source_text: str, max_chars: int = DEFAULT_MAX_CHARS) -> list[dict[str, Any]]:
-    detected = detect_source_turns(source_text)
+    detected, _ = detect_source_turns(source_text)
     if not detected:
         raise ValueError("transcript 未检测到非空发言内容")
 
     speaker_ids: dict[str, str] = {}
     turns: list[dict[str, Any]] = []
-    split_turns: list[tuple[str, str]] = []
-    for speaker_label, text in detected:
+    split_turns: list[tuple[str, str, dict[str, int]]] = []
+    for detected_turn in detected:
+        speaker_label = str(detected_turn["speaker_label"])
+        text = str(detected_turn["text"])
+        base_start = int(detected_turn["source_span"]["start_char"])
         split_turns.extend(
-            (speaker_label, chunk)
-            for chunk in split_oversized_text(text, max_chars)
+            (
+                speaker_label,
+                chunk,
+                {"start_char": base_start + local_start, "end_char": base_start + local_end},
+            )
+            for chunk, local_start, local_end in split_oversized_text(text, max_chars)
         )
-    for sequence, (speaker_label, text) in enumerate(split_turns, start=1):
+    for sequence, (speaker_label, text, source_span) in enumerate(split_turns, start=1):
         speaker_id = speaker_ids.setdefault(
             speaker_label,
             f"speaker_{len(speaker_ids) + 1:03d}",
@@ -177,6 +250,7 @@ def build_turns(source_text: str, max_chars: int = DEFAULT_MAX_CHARS) -> list[di
                 "sequence": sequence,
                 "speaker_id": speaker_id,
                 "speaker_label": speaker_label,
+                "source_span": source_span,
                 "source_sha256": sha256_text(text),
                 "text": text,
             }
@@ -252,6 +326,7 @@ def build_manifest(source_path: Path, source_text: str, max_chars: int) -> dict[
         raise ValueError("--max-chars 必须大于 0")
     if max_chars > HARD_MAX_CHARS:
         raise ValueError(f"--max-chars 不得超过硬上限 {HARD_MAX_CHARS}")
+    _, source_profile = detect_source_turns(source_text)
     turns = build_turns(source_text, max_chars=max_chars)
     shards = build_shards(
         turns,
@@ -266,6 +341,7 @@ def build_manifest(source_path: Path, source_text: str, max_chars: int) -> dict[
         "source_sha256": source_sha256,
         "turn_count": len(turns),
         "shard_count": len(shards),
+        "source_profile": source_profile,
         "turns": turns,
         "shards": shards,
     }

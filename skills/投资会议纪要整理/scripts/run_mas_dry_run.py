@@ -13,8 +13,11 @@ from typing import Any
 
 from build_mas_task_bundle import build_bundle_from_request, validate_bundle, write_dispatch_files
 from assemble_speaker_turn_edits import assemble_speaker_turn_edits
+from assemble_entity_verification_shards import assemble_entity_verification_shards
 from collect_mas_artifacts import collect_mas_run, merge_artifact_files, required_artifacts_for_phase
+from create_mas_source_manifest import create_source_manifest
 from record_mas_main_actions import record_main_actions
+from build_deterministic_export_manifest import build_deterministic_export_manifest
 from validate_mas_artifacts import file_sha256
 
 PHASES = ("pre_draft", "editing", "draft_review", "final_verification")
@@ -109,11 +112,11 @@ def load_fixture_artifacts(path: Path) -> dict[str, Any]:
 
 def artifact_identity(manifest: dict[str, Any], artifact_type: str) -> dict[str, Any]:
     run_id = str(manifest.get("run_id") or "")
-    if artifact_type == "source_manifest":
+    if artifact_type in {"source_manifest", "export_manifest"}:
         return {
             "run_id": run_id,
-            "task_id": f"{run_id}:main:source_manifest",
-            "dispatch_phase": "pre_draft",
+            "task_id": f"{run_id}:main:{artifact_type}",
+            "dispatch_phase": "pre_draft" if artifact_type == "source_manifest" else "final_verification",
             "artifact_owner": "Main Orchestrator",
         }
     if artifact_type == "editing_assembly_receipt":
@@ -205,15 +208,55 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
 
     for phase_index, phase in enumerate(PHASES):
         required_now = required_artifacts_for_phase(bundle, phase)
+        entity_parallel = (
+            isinstance(bundle.get("entity_verification"), dict)
+            and bundle["entity_verification"].get("effective_mode") == "parallel"
+        )
         emitted_this_phase: list[str] = []
         for artifact_type in required_now:
             if artifact_type in emitted_artifacts:
                 continue
             if artifact_type == "editing_assembly_receipt":
                 continue
-            if artifact_type in fixture_artifacts:
+            if entity_parallel and artifact_type in {
+                "entity_verification_report",
+                "doubtful_items",
+                "entity_verification_assembly_receipt",
+            }:
+                continue
+            if artifact_type == "source_manifest":
+                artifact, source_warnings = create_source_manifest(bundle)
+                errors.extend(str(item) for item in source_warnings if str(item).startswith("ERROR:"))
+            elif artifact_type == "export_manifest":
+                validator_paths: list[Path] = []
+                for validator_name in ("validate_utf8_text.py", "validate_meeting_minutes_contract.py"):
+                    evidence_path = task_dir / f"synthetic.{validator_name}.json"
+                    write_json(evidence_path, {"name": validator_name, "ok": True})
+                    validator_paths.append(evidence_path)
+                regression_path = task_dir / "synthetic.run_meeting_minutes_regression.py.json"
+                write_json(
+                    regression_path,
+                    {"name": "run_meeting_minutes_regression.py", "case_count": 1, "ok": True},
+                )
+                export_result = build_deterministic_export_manifest(
+                    task_dir,
+                    synthetic_markdown,
+                    verification_sidecar_path=(
+                        task_dir / "synthetic.verification.json"
+                        if synthetic_verification_payload(fixture_artifacts).get("records")
+                        else None
+                    ),
+                    validator_evidence_paths=validator_paths,
+                    regression_evidence_path=regression_path,
+                )
+                artifact_path = Path(str(export_result["artifact_file"]))
+                emitted_artifacts.add(artifact_type)
+                emitted_this_phase.append(artifact_type)
+                artifact_files.append({"artifact_type": artifact_type, "path": str(artifact_path)})
+                continue
+            elif artifact_type in fixture_artifacts:
                 artifact = copy.deepcopy(fixture_artifacts[artifact_type])
-            elif artifact_type.startswith("speaker_turn_edit__"):
+            elif artifact_type.startswith(("speaker_turn_edit__", "entity_verification_shard__")):
                 task = next(
                     (
                         item
@@ -223,33 +266,54 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
                     None,
                 )
                 shape = task.get("expected_output_shape") if isinstance(task, dict) else None
-                artifact = shape.get("artifact") if isinstance(shape, dict) else None
+                if artifact_type.startswith("entity_verification_shard__") and isinstance(shape, dict):
+                    from ingest_mas_artifact import expand_entity_verification_response
+
+                    expanded = expand_entity_verification_response(shape, task_dir)
+                    artifact = expanded.get("artifact")
+                else:
+                    artifact = shape.get("artifact") if isinstance(shape, dict) else None
                 if not isinstance(artifact, dict):
-                    errors.append(f"MAS dry-run cannot synthesize speaker edit artifact: {artifact_type}")
+                    errors.append(f"MAS dry-run cannot synthesize shard artifact: {artifact_type}")
                     continue
                 artifact = copy.deepcopy(artifact)
-                context_turns = {
-                    str(turn.get("turn_id") or ""): turn
-                    for turn in task.get("task_context", {}).get("turns", [])
-                    if isinstance(turn, dict)
-                }
-                for returned_turn in artifact.get("edited_turns", []):
-                    if not isinstance(returned_turn, dict):
-                        continue
-                    source_turn = context_turns.get(str(returned_turn.get("turn_id") or ""))
-                    if isinstance(source_turn, dict):
-                        returned_turn["edited_text"] = str(source_turn.get("text") or "")
+                if artifact_type.startswith("speaker_turn_edit__"):
+                    context_turns = {
+                        str(turn.get("turn_id") or ""): turn
+                        for turn in task.get("task_context", {}).get("turns", [])
+                        if isinstance(turn, dict)
+                    }
+                    for returned_turn in artifact.get("edited_turns", []):
+                        if not isinstance(returned_turn, dict):
+                            continue
+                        source_turn = context_turns.get(str(returned_turn.get("turn_id") or ""))
+                        if isinstance(source_turn, dict):
+                            returned_turn["edited_text"] = str(source_turn.get("text") or "")
             else:
                 errors.append(f"MAS dry-run fixture missing artifact: {artifact_type}")
                 continue
-            if artifact_type == "export_manifest" and isinstance(artifact, dict):
-                artifact["markdown_path"] = str(synthetic_markdown)
-                artifact["markdown_sha256"] = file_sha256(synthetic_markdown)
-                artifact["main_actions_verified"] = True
             artifact_path = write_artifact(artifact_dir, manifest, artifact_type, artifact)
             emitted_artifacts.add(artifact_type)
             emitted_this_phase.append(artifact_type)
             artifact_files.append({"artifact_type": artifact_type, "path": str(artifact_path)})
+        if phase == "pre_draft" and entity_parallel:
+            try:
+                entity_result = assemble_entity_verification_shards(task_dir)
+                for artifact_type, path in entity_result.get("artifacts", {}).items():
+                    emitted_artifacts.add(str(artifact_type))
+                    emitted_this_phase.append(str(artifact_type))
+                    artifact_files.append({"artifact_type": str(artifact_type), "path": str(path)})
+                doubtful_path = Path(str(entity_result.get("artifacts", {}).get("doubtful_items") or ""))
+                doubtful_envelope = read_json(doubtful_path)
+                if isinstance(doubtful_envelope, dict) and isinstance(doubtful_envelope.get("artifact"), list):
+                    fixture_artifacts["doubtful_items"] = copy.deepcopy(doubtful_envelope["artifact"])
+                    synthetic_markdown.write_text(synthetic_final_markdown(fixture_artifacts), encoding="utf-8")
+                    write_json(
+                        task_dir / "synthetic.verification.json",
+                        synthetic_verification_payload(fixture_artifacts),
+                    )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                errors.append(f"MAS dry-run entity verification assembly failed: {exc}")
         if phase == "editing" and "editing_assembly_receipt" in required_now:
             try:
                 assembly_result = assemble_speaker_turn_edits(task_dir)
@@ -269,7 +333,10 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
         write_json(summary_path, summary)
         next_action = summary.get("next_action", {})
         receipt_result: dict[str, Any] | None = None
-        if next_action.get("type") == "apply_main_actions_before_final_verification":
+        if (
+            next_action.get("type") == "apply_main_actions_before_final_verification"
+            and PHASES.index(phase) >= PHASES.index("draft_review")
+        ):
             receipt_result = record_main_actions(
                 task_dir,
                 synthetic_markdown,
@@ -295,7 +362,15 @@ def run_mas_dry_run(request_path: Path, artifact_fixture_path: Path, task_dir: P
         if not summary.get("ok"):
             stop_reason = f"collector_not_ok:{phase}"
             break
-        if phase_index < len(PHASES) - 1 and next_action.get("type") != "collect_or_dispatch_phase_artifacts":
+        deferred_main_actions = (
+            next_action.get("type") == "apply_main_actions_before_final_verification"
+            and PHASES.index(phase) < PHASES.index("draft_review")
+        )
+        if (
+            phase_index < len(PHASES) - 1
+            and next_action.get("type") != "collect_or_dispatch_phase_artifacts"
+            and not deferred_main_actions
+        ):
             stop_reason = f"next_action_not_phase_dispatch:{next_action.get('type')}"
             break
 

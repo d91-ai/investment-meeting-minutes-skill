@@ -15,6 +15,27 @@
       "required_terms": ["未确认的证券代码不得进入标题", "只有源材料中仍无法确认的最小片段在原句原位置加粗", "不得进入小段标题的标的部分"]
     },
     {
+      "name": "专家交流语言清理规则检查",
+      "mode": "reference_expert_language_cleanup",
+      "check": "text_contains",
+      "file": "../meeting_types/expert_call.md",
+      "required_terms": ["语言清理与否定保真", "然后然后", "不得机械删除连续否定词", "不是 A，而是 B", "需求并没有下滑"]
+    },
+    {
+      "name": "校对规则否定与观点强度保真检查",
+      "mode": "reference_polarity_preservation",
+      "check": "text_contains",
+      "file": "../verification_policy.md",
+      "required_terms": ["逐句核对否定、双重否定、自我纠正和转折方向", "不得通过全局替换", "不是 A，而是 B", "可能", "未必", "暂时", "倾向于"]
+    },
+    {
+      "name": "Fidelity Reviewer 语言校对执行提示检查",
+      "mode": "mas_fidelity_language_prompt",
+      "check": "text_contains",
+      "file": "../../scripts/build_mas_task_bundle.py",
+      "required_terms": ["residual meaningless fillers or mechanical connector repetition", "negation, self-correction, and polarity drift", "never classify repeated negatives as removable filler", "put any polarity or strength drift in omission_findings"]
+    },
+    {
       "name": "MAS 编排契约目标模式检查",
       "mode": "reference_mas_orchestration_goal",
       "check": "text_contains",
@@ -1543,6 +1564,21 @@
       "required_terms": ["专家交流", "问答线索", "设备订单"]
     },
     {
+      "name": "专家交流明显口语残留提示样例",
+      "mode": "expert_call_language_surface_warning",
+      "source_mode": "document",
+      "file": "expert_call_language_surface_warning.md",
+      "required_warning_terms": ["寒暄与实质内容粘连", "连续重复连接词“然后”"]
+    },
+    {
+      "name": "专家交流清理后否定与观点强度保真正例",
+      "mode": "expert_call_language_clean",
+      "source_mode": "document",
+      "file": "expert_call_language_clean.md",
+      "required_terms": ["不是说需求下滑，而是增速可能放缓", "需求并没有下滑", "暂时只是交付推迟", "然后看明年的需求情况"],
+      "forbidden_warning_terms": ["专家交流正文可能残留"]
+    },
+    {
       "name": "专家交流裸提问格式负例",
       "mode": "expert_call_bare_q_negative",
       "source_mode": "document",
@@ -1704,6 +1740,15 @@
       "mode": "mas_decision_fidelity_ai_insertion",
       "check": "mas_decision",
       "file": "mas_artifacts_fidelity_ai_insertion_negative.json",
+      "require_artifacts": ["fidelity_review"],
+      "expect_decision": "repair_required",
+      "require_actions": ["revise_draft_and_repeat_semantic_review"]
+    },
+    {
+      "name": "专家交流否定与观点强度漂移的忠实度负例",
+      "mode": "mas_decision_fidelity_polarity_drift",
+      "check": "mas_decision",
+      "file": "mas_artifacts_fidelity_polarity_drift_negative.json",
       "require_artifacts": ["fidelity_review"],
       "expect_decision": "repair_required",
       "require_actions": ["revise_draft_and_repeat_semantic_review"]

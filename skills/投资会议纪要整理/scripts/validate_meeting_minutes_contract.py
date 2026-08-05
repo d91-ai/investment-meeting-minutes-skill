@@ -116,6 +116,10 @@ TIMESTAMP_INDEX_REQUIRED_FIELDS = ["source", "precision", "text", "start", "end"
 RELIABLE_TIMESTAMP_PRECISIONS = {"sentence", "phrase"}
 LOW_TIMESTAMP_PRECISIONS = {"segment", "chunk", "unavailable"}
 MAX_RELIABLE_VAD_SEGMENT_MS = 10000
+EXPERT_SURFACE_WARNING_PATTERNS = [
+    (re.compile(r"然后\s*[，,、。；;]?\s*然后"), "连续重复连接词“然后”"),
+    (re.compile(r"(?:好的\s*[，,。；;、]?\s*)?谢谢\s*[，,。；;、]?\s*然后(?:还有)?"), "寒暄与实质内容粘连"),
+]
 
 
 def body_section(markdown: str) -> str:
@@ -160,6 +164,22 @@ def expert_questions_without_answers(markdown: str) -> list[str]:
         ]
         if not answer_lines:
             findings.append(match.group(0).strip())
+    return findings
+
+
+def expert_language_surface_warnings(markdown: str, meeting_type: str) -> list[str]:
+    if MEETING_TYPE_ALIASES.get(meeting_type, meeting_type) != "专家交流":
+        return []
+    body = body_section(markdown)
+    findings: list[str] = []
+    for pattern, label in EXPERT_SURFACE_WARNING_PATTERNS:
+        match = pattern.search(body)
+        if not match:
+            continue
+        start = max(0, match.start() - 24)
+        end = min(len(body), match.end() + 24)
+        preview = re.sub(r"\s+", " ", body[start:end]).strip()
+        findings.append(f"专家交流正文可能残留{label}，请结合源材料复核: {preview}")
     return findings
 
 
@@ -892,6 +912,7 @@ def validate_contract(
     meeting_type = markdown_field(markdown, "会议类型")
     errors.extend(validate_meeting_type_reference(markdown, meeting_type))
     warnings.extend(review_meeting_heading_warnings(markdown, meeting_type))
+    warnings.extend(expert_language_surface_warnings(markdown, meeting_type))
 
     body_position = markdown.find("## 一、发言整理")
     if body_position < 0:

@@ -194,6 +194,9 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
             "summary compression",
             "third-person rewrite",
             "omitted reasons or numbers",
+            "residual meaningless fillers or mechanical connector repetition",
+            "negation, self-correction, and polarity drift",
+            "lost uncertainty, conditions, or time scope",
             "merged speaker turns",
             "speaker-order drift",
         ],
@@ -775,6 +778,14 @@ def prompt_for_task(
         lines.append("Return reviewed_markdown_path and the SHA-256 of the exact draft bytes you reviewed.")
         lines.append("paragraphs_reviewed must be a positive integer for the actual reviewed scope.")
         lines.append("If source mapping is insufficient, add the exact paragraph to source_mapping_failures; do not infer missing speech.")
+        lines.append(
+            "Review language cleanup conservatively: flag residual standalone courtesies, meaningless fillers, broken sentences, "
+            "and mechanical connector repetition, but never classify repeated negatives as removable filler without source context."
+        )
+        lines.append(
+            "Compare every negation, self-correction, uncertainty marker, condition, time scope, number, and causal link with the source; "
+            "put any polarity or strength drift in omission_findings and recommended_revisions."
+        )
     elif artifact_schema == "export_manifest":
         lines.append("Return markdown_sha256 for markdown_path and set main_actions_verified as a boolean.")
         lines.append("validators_run must contain exactly validate_utf8_text.py and validate_meeting_minutes_contract.py with boolean ok.")

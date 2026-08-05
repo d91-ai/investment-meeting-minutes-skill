@@ -1345,6 +1345,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                         edited = str(turn.get("edited_text") or "")
                         for filler in ("嗯，那个，", "呃，", "然后然后，"):
                             edited = edited.replace(filler, "")
+                        edited = edited.replace("不不，", "不，").replace("没有没有，", "没有，")
                         turn["edited_text"] = edited
                 minimal_response = [
                     {
@@ -1408,10 +1409,17 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             working_path = Path(str(assembly.get("working_draft") or ""))
             if working_path.is_file():
                 working_text = working_path.read_text(encoding="utf-8")
-                for forbidden in ("嗯，那个，", "呃，", "然后然后，"):
+                for forbidden in ("嗯，那个，", "呃，", "然后然后，", "不不，", "没有没有，"):
                     if forbidden in working_text:
                         errors.append(f"speaker edit 工作稿仍保留目标 filler: {forbidden}")
-                preserved = ("我觉得需求还是比较强", "我们没有减仓", "当前仓位是两成", "我不会加仓")
+                preserved = (
+                    "我觉得需求还是比较强",
+                    "我们没有减仓",
+                    "当前仓位是两成",
+                    "不，我不是说需求下滑，而是增速可能放缓",
+                    "我不会加仓",
+                    "没有，需求并没有下滑，暂时只是交付推迟",
+                )
                 if any(term not in working_text for term in preserved):
                     errors.append("speaker edit 工作稿丢失第一人称、否定、数字或条件")
                 positions = [working_text.find(term) for term in preserved]
@@ -3041,6 +3049,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
     expect_fail = bool(case.get("expect_fail"))
     required_error_terms = [str(term) for term in case.get("required_error_terms", [])]
     required_warning_terms = [str(term) for term in case.get("required_warning_terms", [])]
+    forbidden_warning_terms = [str(term) for term in case.get("forbidden_warning_terms", [])]
     error_text = "\n".join(str(error) for error in result.get("errors", []))
     warning_text = "\n".join(str(warning) for warning in result.get("warnings", []))
     expectation_errors: list[str] = []
@@ -3053,10 +3062,13 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         result["ok"] = not expectation_errors
         result["expected_failure"] = raw_ok is False
         result["expectation_errors"] = expectation_errors
-    if not expect_fail and required_warning_terms:
+    if not expect_fail and (required_warning_terms or forbidden_warning_terms):
         for term in required_warning_terms:
             if term not in warning_text:
                 expectation_errors.append(f"样例缺少预期 warning 片段: {term}")
+        for term in forbidden_warning_terms:
+            if term in warning_text:
+                expectation_errors.append(f"样例包含禁止 warning 片段: {term}")
         result["ok"] = bool(result["ok"]) and not expectation_errors
         result["expectation_errors"] = expectation_errors
     result = {

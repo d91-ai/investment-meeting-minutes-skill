@@ -1,0 +1,18 @@
+{
+  "artifacts": {
+    "fidelity_review": {
+      "reviewed_markdown_path": "NOTE.md",
+      "reviewed_markdown_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "paragraphs_reviewed": 1,
+      "source_mapping_failures": [],
+      "summary_compression_findings": [],
+      "pronoun_rewrite_findings": [],
+      "omission_findings": [
+        "源材料为‘需求并没有下滑，暂时只是交付推迟’，草稿删除否定和‘暂时’，改变了方向与强度"
+      ],
+      "recommended_revisions": [
+        "恢复否定、暂时性和交付推迟条件后重新执行忠实度审核"
+      ]
+    }
+  }
+}

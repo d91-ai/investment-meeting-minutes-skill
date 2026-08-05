@@ -40,10 +40,11 @@ description: "Use when Codex needs to turn a Chinese investment meeting recordin
 python3 scripts/validate_utf8_text.py NOTE.md --require-cjk
 python3 scripts/validate_meeting_minutes_contract.py NOTE.md --json
 python3 scripts/run_meeting_minutes_regression.py
-python3 scripts/export_to_obsidian.py NOTE.md
+python3 scripts/collect_mas_artifacts.py "$MAS_DISPATCH" --through-phase draft_review --out "$MAS_DISPATCH/mas_run_summary.json" --combined-out "$MAS_DISPATCH/mas_artifacts_collected.json"
+python3 scripts/export_to_obsidian.py NOTE.md --mas-summary "$MAS_DISPATCH/mas_run_summary.json"
 ```
 
-缺失、失败、过期、零范围或尚未落实的必要审核会阻断导出。正式交付只包含最终 Markdown；verification sidecar 和 MAS artifact 是内部审核材料。
+正式导出脚本会再次执行 UTF-8、主 Markdown 契约和固定回归，并要求 MAS `draft_review` 已完成、没有待落实动作，且语义审核绑定当前 Markdown 路径与 SHA-256。缺失、失败、过期、零范围或尚未落实的必要审核会阻断导出。导出后再执行 `final_verification`；最终验证未通过时不得向用户交付。正式交付只包含最终 Markdown；verification sidecar 和 MAS artifact 是内部审核材料。
 
 ## Reference Routing
 

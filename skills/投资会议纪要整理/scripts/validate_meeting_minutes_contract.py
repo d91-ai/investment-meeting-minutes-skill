@@ -91,6 +91,9 @@ QUESTION_LINE_RE = re.compile(r"^【[^】\n]+】[ \t]*$", re.MULTILINE)
 QUESTION_LIKE_LINE_RE = re.compile(r"^(?:\*\*)?【[^】\n]+】(?:\*\*)?[ \t]*$")
 REVIEW_SUBSECTION_HEADING_RE = re.compile(r"^#### 【(?P<content>[^】\n]+)】\s*$")
 TARGET_WITH_CODE_RE = re.compile(r"^[^()（）｜|\s]+\([^()\s｜|]+\)$")
+COMPANY_TARGET_RE = re.compile(
+    r"^[^()（）｜|\r\n]+\((?:\d{6}\.(?:SH|SZ|BJ)|\d{4,5}\.HK|[A-Z][A-Z0-9.-]{0,9})\)$"
+)
 BOLD_RE = re.compile(r"\*\*([^*\r\n]+)\*\*")
 STOCK_CODE_RE = re.compile(
     r"(?:\((?:\d{5,6}\.(?:SH|SZ|BJ|HK)|[A-Z][A-Z0-9.-]{0,9})\)|"
@@ -191,6 +194,10 @@ def validate_meeting_type_reference(markdown: str, meeting_type: str) -> list[st
             errors.append("公司交流的会议标题应使用 XX公司交流会议")
         if not metadata_field_present(markdown, "会议标的"):
             errors.append("公司交流必须包含会议元信息字段: 会议标的")
+        else:
+            meeting_target = markdown_field(markdown, "会议标的")
+            if not COMPANY_TARGET_RE.fullmatch(meeting_target):
+                errors.append("公司交流会议标的必须使用已核验的单一 公司名(代码)，不得混入板块、行业或待确认占位")
         if not subheadings:
             errors.append("公司交流必须按实际会议环节使用三级标题")
         if invalid_questions:

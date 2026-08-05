@@ -21,6 +21,26 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+try:
+    import fcntl as _regression_fcntl  # noqa: F401
+except ModuleNotFoundError:
+    # Production keeps native POSIX locking; the regression harness supplies a
+    # process-local equivalent so deterministic tests can also run on Windows.
+    _regression_lock = threading.RLock()
+    _regression_fcntl = types.ModuleType("fcntl")
+    _regression_fcntl.LOCK_SH = 1
+    _regression_fcntl.LOCK_EX = 2
+    _regression_fcntl.LOCK_UN = 8
+
+    def _regression_flock(_fd: int, operation: int) -> None:
+        if operation == _regression_fcntl.LOCK_UN:
+            _regression_lock.release()
+        else:
+            _regression_lock.acquire()
+
+    _regression_fcntl.flock = _regression_flock
+    sys.modules["fcntl"] = _regression_fcntl
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 DEFAULT_CASES_PATH = SKILL_DIR / "references/regression_samples/cases.json"
@@ -58,7 +78,7 @@ from run_mas_dry_run import (  # noqa: E402
 )
 from record_mas_main_actions import record_main_actions  # noqa: E402
 from archive_raw_inputs import archive_files  # noqa: E402
-from export_to_obsidian import export_note  # noqa: E402
+from export_to_obsidian import export_note, file_sha256 as export_file_sha256, validate_mas_draft_gate  # noqa: E402
 import archive_raw_inputs as archive_module  # noqa: E402
 import export_to_obsidian as export_module  # noqa: E402
 from process_transcript import build_output, detect_segments  # noqa: E402
@@ -77,6 +97,30 @@ def read_cases(path: Path) -> list[dict[str, Any]]:
     if not isinstance(cases, list):
         raise ValueError(f"回归样例格式错误: {path}")
     return cases
+
+
+@contextlib.contextmanager
+def windows_subprocess_fcntl_shim() -> Any:
+    if os.name != "nt":
+        yield
+        return
+    previous_pythonpath = os.environ.get("PYTHONPATH")
+    with tempfile.TemporaryDirectory(prefix="meeting-minutes-fcntl-shim-") as tmpdir:
+        shim_path = Path(tmpdir) / "fcntl.py"
+        shim_path.write_text(
+            "LOCK_SH = 1\nLOCK_EX = 2\nLOCK_UN = 8\ndef flock(_fd, _operation):\n    return None\n",
+            encoding="utf-8",
+        )
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            item for item in (tmpdir, previous_pythonpath or "") if item
+        )
+        try:
+            yield
+        finally:
+            if previous_pythonpath is None:
+                os.environ.pop("PYTHONPATH", None)
+            else:
+                os.environ["PYTHONPATH"] = previous_pythonpath
 
 
 def dispatch_context(task_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -198,6 +242,47 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             "errors": errors,
             "warnings": warnings,
         }
+    elif case.get("check") == "export_mas_draft_gate":
+        with tempfile.TemporaryDirectory(prefix="meeting-minutes-export-gate-") as tmpdir:
+            task_dir = Path(tmpdir)
+            artifact_path = task_dir / "fidelity_review.json"
+            artifact_path.write_text(
+                json.dumps(
+                    {
+                        "artifact_type": "fidelity_review",
+                        "artifact": {
+                            "reviewed_markdown_path": str(file_path.resolve()),
+                            "reviewed_markdown_sha256": export_file_sha256(file_path.resolve()),
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            summary_path = task_dir / "mas_run_summary.json"
+            summary = {
+                "ok": True,
+                "task_dir": str(task_dir),
+                "phase_gates": [{"phase": "draft_review", "status": "complete"}],
+                "next_action": {"type": "collect_or_dispatch_phase_artifacts", "phase": "final_verification"},
+                "artifact_types": ["fidelity_review"],
+                "artifact_sources": [{"artifact_type": "fidelity_review", "path": str(artifact_path)}],
+            }
+            summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            valid_result = validate_mas_draft_gate(summary_path, file_path)
+            summary["next_action"] = {
+                "type": "apply_main_actions_before_final_verification",
+                "phase": "draft_review",
+            }
+            summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            blocked_result = validate_mas_draft_gate(summary_path, file_path)
+            errors = []
+            if valid_result.get("ok") is not True:
+                errors.append(f"有效 MAS draft_review 门禁被错误拒绝: {valid_result}")
+            if blocked_result.get("ok") is not False:
+                errors.append("仍有 main actions 的 MAS summary 未阻断导出")
+            result = {"ok": not errors, "errors": errors, "warnings": []}
     elif case.get("check") == "export_filename":
         with tempfile.TemporaryDirectory(prefix="meeting-minutes-export-") as tmpdir:
             errors = []
@@ -555,6 +640,13 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             child_code = "\n".join(
                 [
                     "import os, sys",
+                    "if os.name == 'nt':",
+                    "    import threading, types",
+                    "    lock = threading.RLock()",
+                    "    shim = types.ModuleType('fcntl')",
+                    "    shim.LOCK_SH, shim.LOCK_EX, shim.LOCK_UN = 1, 2, 8",
+                    "    shim.flock = lambda _fd, op: lock.release() if op == shim.LOCK_UN else lock.acquire()",
+                    "    sys.modules['fcntl'] = shim",
                     "from pathlib import Path",
                     "import transcribe_audio as target",
                     "output_dir = Path(sys.argv[1])",
@@ -569,7 +661,10 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 ]
             )
             child_env = os.environ.copy()
-            child_env["PYTHONPATH"] = str(SCRIPT_DIR)
+            existing_pythonpath = child_env.get("PYTHONPATH", "")
+            child_env["PYTHONPATH"] = os.pathsep.join(
+                item for item in (str(SCRIPT_DIR), existing_pythonpath) if item
+            )
             crashed = subprocess.run(
                 [sys.executable, "-c", child_code, str(output_dir), stem],
                 capture_output=True,
@@ -590,8 +685,9 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             if list(output_dir.glob(f".{stem}.sensevoice-txn-*")):
                 errors.append("SenseVoice abrupt-exit 恢复后残留 transaction 目录")
 
-            victim_stem = "foobar"
-            metachar_stem = "foo*"
+            # 方括号在 POSIX 与 Windows 文件名中均合法，同时仍可验证 glob.escape 隔离。
+            victim_stem = "fooa"
+            metachar_stem = "foo[a]"
             for suffix, content in old_contents.items():
                 (output_dir / f"{victim_stem}{suffix}").write_text(content, encoding="utf-8")
             victim_crash = subprocess.run(
@@ -2997,7 +3093,8 @@ def main() -> int:
     cases_path = Path(args.cases).expanduser()
     base_dir = cases_path.parent
     try:
-        results = [run_case(case, base_dir) for case in read_cases(cases_path)]
+        with windows_subprocess_fcntl_shim():
+            results = [run_case(case, base_dir) for case in read_cases(cases_path)]
     except Exception as exc:
         payload = {
             "ok": False,

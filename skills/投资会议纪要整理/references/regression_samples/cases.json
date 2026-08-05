@@ -1016,6 +1016,12 @@
       "expected_stem": "2026-05-11 - 测试公司 - 上市公司交流"
     },
     {
+      "name": "正式导出要求完成并绑定当前 Markdown 的 MAS 草稿审核",
+      "mode": "export_mas_draft_gate",
+      "check": "export_mas_draft_gate",
+      "file": "listed_company.md"
+    },
+    {
       "name": "专家交流导出命名使用主题",
       "mode": "export_filename_expert_call",
       "check": "export_filename",
@@ -1520,6 +1526,14 @@
       "file": "listed_company_bare_q_negative.md",
       "expect_fail": true,
       "required_error_terms": ["包含禁止输出内容"]
+    },
+    {
+      "name": "公司交流会议标的结构负例",
+      "mode": "listed_company_target_invalid_negative",
+      "source_mode": "document",
+      "file": "listed_company_target_invalid_negative.md",
+      "expect_fail": true,
+      "required_error_terms": ["公司交流会议标的必须使用已核验的单一 公司名(代码)"]
     },
     {
       "name": "专家交流类型样例",

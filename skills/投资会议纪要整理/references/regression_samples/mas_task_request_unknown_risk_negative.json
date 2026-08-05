@@ -1,7 +1,0 @@
-{
-  "run_profile": "standard",
-  "source_mode": "document_only",
-  "meeting_type": "多人复盘会",
-  "risk_flags": ["typo_unknown_risk"],
-  "materials": ["synthetic.md"]
-}

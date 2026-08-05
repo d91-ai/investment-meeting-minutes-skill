@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 REQUIRED_SECTIONS = [
-    "## 一、发言整理",
+    "## 一、会议纪要",
+    "## 二、参考原文",
 ]
 
 REQUIRED_METADATA_FIELDS = ["会议日期", "整理时间", "会议标题", "会议类型", "会议系列"]
@@ -29,8 +30,7 @@ FORBIDDEN_PATTERNS = [
     r"AI结构化总结",
     r"标的汇总表",
     r"(?m)^##+\s*(?:摘要|投研摘要|整理者总结|投资结论|核心结论)\s*$",
-    r"##\s*三[、.．]",
-    r"##\s*四[、.．]",
+    r"##\s*(?:四|五|六|七|八|九|十)[、.．]",
     r"处理说明",
     r"(?m)^\*\*输入来源\*\*[:：]",
     r"(?m)^\*\*整理说明\*\*[:：]",
@@ -54,26 +54,6 @@ FORBIDDEN_ESCAPE_HEADINGS = {
     "投研摘要",
     "投资结论",
 }
-REVIEW_SPEAKER_HEADING_TOPIC_TERMS = {
-    "AI硬件",
-    "半导体",
-    "存储",
-    "核心观点",
-    "科技",
-}
-REVIEW_SPEAKER_ROLE_TERMS = {
-    "CEO",
-    "CFO",
-    "嘉宾",
-    "专家",
-    "分析师",
-    "主持人",
-    "研究员",
-    "管理层",
-    "负责人",
-    "主管",
-}
-
 DOCUMENT_ONLY_SOURCE_MODES = {"document", "document-only", "document_only", "text", "text-only", "文稿", "纯文本"}
 AUDIO_SOURCE_MODES = {
     "audio",
@@ -119,15 +99,28 @@ MAX_RELIABLE_VAD_SEGMENT_MS = 10000
 
 def body_section(markdown: str) -> str:
     body_match = re.search(
-        r"## 一、发言整理(?P<body>.*?)(?=^## 二、存疑与待确认|\Z)",
+        r"## 一、会议纪要(?P<body>.*?)(?=^## 二、参考原文|\Z)",
         markdown,
         re.S | re.M,
     )
     return body_match.group("body") if body_match else ""
 
 
+def reference_section(markdown: str) -> str:
+    reference_match = re.search(
+        r"## 二、参考原文(?P<body>.*?)(?=^## 三、存疑与待确认|\Z)",
+        markdown,
+        re.S | re.M,
+    )
+    return reference_match.group("body") if reference_match else ""
+
+
 def body_subheadings(markdown: str) -> list[str]:
     return re.findall(r"^###(?!#)\s*(.+?)\s*$", body_section(markdown), re.MULTILINE)
+
+
+def reference_subheadings(markdown: str) -> list[str]:
+    return re.findall(r"^###(?!#)\s*(.+?)\s*$", reference_section(markdown), re.MULTILINE)
 
 
 def bold_question_lines(markdown: str) -> list[re.Match[str]]:
@@ -167,10 +160,6 @@ def validate_meeting_type_reference(markdown: str, meeting_type: str) -> list[st
     if normalized_meeting_type == "多人复盘会":
         if not subheadings:
             errors.append("多人复盘会必须按发言轮次使用三级发言人标题")
-        topic_headings = review_speaker_heading_topic_findings(subheadings)
-        if topic_headings:
-            preview = "；".join(topic_headings[:4])
-            errors.append(f"发言人标题不是标的或主题标题: {preview}")
         if "标的：" in body:
             errors.append("多人复盘会小段标题不使用 标的： 前缀；有明确标的时应先写【标的(代码)】标题行，再写【板块】标题行")
         if "后半段" in body:
@@ -190,6 +179,8 @@ def validate_meeting_type_reference(markdown: str, meeting_type: str) -> list[st
         if "标的：" in body:
             errors.append("公司交流正文不重复出现 标的： 行，标的信息只放在元信息")
     elif normalized_meeting_type == "专家交流":
+        if subheadings:
+            errors.append("专家交流会议纪要不使用三级发言人标题，只保留问题与回答")
         if not questions:
             errors.append("专家交流必须使用加粗问题格式，例如 **【问题原文】**")
         if re.search(r"(?m)^\*\*(?:Q|q|提问|问)[:：]", body):
@@ -198,20 +189,9 @@ def validate_meeting_type_reference(markdown: str, meeting_type: str) -> list[st
         if missing_answers:
             preview = "；".join(missing_answers[:4])
             errors.append(f"专家交流每个问题后必须保留对应回答: {preview}")
+        if not reference_subheadings(markdown):
+            errors.append("专家交流参考原文必须保留三级发言人标题")
     return errors
-
-
-def review_speaker_heading_topic_findings(subheadings: list[str]) -> list[str]:
-    findings: list[str] = []
-    for heading in subheadings:
-        normalized = re.sub(r"[\s｜|、/／：:（）()【】]+", "", heading)
-        if not normalized:
-            continue
-        if any(role in normalized for role in REVIEW_SPEAKER_ROLE_TERMS):
-            continue
-        if any(term in normalized for term in REVIEW_SPEAKER_HEADING_TOPIC_TERMS):
-            findings.append(f"### {heading}")
-    return findings
 
 
 def forbidden_escape_heading_findings(markdown: str) -> list[str]:
@@ -710,11 +690,11 @@ def format_allowed_headers(headers: list[list[str]]) -> str:
 
 
 def has_ambiguity_section(markdown: str) -> bool:
-    return bool(re.search(r"^## 二、存疑与待确认\s*$", markdown, re.MULTILINE))
+    return bool(re.search(r"^## 三、存疑与待确认\s*$", markdown, re.MULTILINE))
 
 
 def ambiguity_table_lines(markdown: str) -> list[str]:
-    ambiguity_match = re.search(r"## 二、存疑与待确认(?P<body>.*)$", markdown, re.S)
+    ambiguity_match = re.search(r"## 三、存疑与待确认(?P<body>.*)$", markdown, re.S)
     if not ambiguity_match:
         return []
     return [
@@ -800,11 +780,21 @@ def validate_contract(
     errors.extend(validate_meeting_type_reference(markdown, meeting_type))
     warnings.extend(review_meeting_heading_warnings(markdown, meeting_type))
 
-    body_position = markdown.find("## 一、发言整理")
+    body_position = markdown.find("## 一、会议纪要")
     if body_position < 0:
-        errors.append("缺少必需章节: ## 一、发言整理")
-    ambiguity_position = markdown.find("## 二、存疑与待确认")
-    if body_position >= 0 and ambiguity_position >= 0 and body_position > ambiguity_position:
+        errors.append("缺少必需章节: ## 一、会议纪要")
+    reference_position = markdown.find("## 二、参考原文")
+    if reference_position < 0:
+        errors.append("缺少必需章节: ## 二、参考原文")
+    elif not reference_section(markdown).strip():
+        errors.append("## 二、参考原文 不得为空")
+    ambiguity_position = markdown.find("## 三、存疑与待确认")
+    positions = [
+        position
+        for position in (body_position, reference_position, ambiguity_position)
+        if position >= 0
+    ]
+    if positions != sorted(positions):
         errors.append("必需章节顺序错误")
 
     for pattern in FORBIDDEN_PATTERNS:
@@ -827,17 +817,17 @@ def validate_contract(
         preview = "；".join(sector_headings_with_primary_prefix[:6])
         errors.append(f"多人复盘会板块行只展示二级板块，不得包含一级板块前缀或分隔符: {preview}")
 
-    has_body_section = "## 一、发言整理" in markdown
+    has_body_section = "## 一、会议纪要" in markdown
     has_subheading = bool(re.search(r"^###(?!#)\s+", markdown, re.MULTILINE))
     has_bold_question = bool(bold_question_lines(markdown))
     if has_body_section and not has_subheading and not has_bold_question:
-        warnings.append("发言整理中未检测到三级发言人标题")
+        warnings.append("会议纪要中未检测到三级发言人标题")
 
     bold_terms = body_bold_terms(markdown)
     ambiguity_exists = has_ambiguity_section(markdown)
     if not ambiguity_exists and bold_terms:
         preview = "、".join(bold_terms[:8])
-        errors.append(f"正文存在加粗存疑词但缺少 ## 二、存疑与待确认: {preview}")
+        errors.append(f"正文存在加粗存疑词但缺少 ## 三、存疑与待确认: {preview}")
 
     if ambiguity_exists:
         table_lines = ambiguity_table_lines(markdown)

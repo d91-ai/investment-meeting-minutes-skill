@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build a deterministic, source-faithful speaker-turn editing manifest."""
+"""Parse explicit speaker turns and plan capacity-bounded long-material packages.
+
+This script is intentionally mechanical. It does not clean prose, infer a
+speaker, decide Q&A relationships, or judge what information may be removed.
+The main model reviews and may adjust every package boundary.
+"""
 
 from __future__ import annotations
 
@@ -7,396 +12,327 @@ import argparse
 import hashlib
 import json
 import re
-import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from process_transcript import EXPLICIT_SPEAKER_PATTERNS, anonymous_speaker_key
+DEFAULT_TARGET_CHARS = 12_000
+DEFAULT_HARD_LIMIT_CHARS = 16_000
 
-SCHEMA_VERSION = "1.0"
-DEFAULT_MAX_CHARS = 12_000
-HARD_MAX_CHARS = 16_000
-STANDALONE_GROUP_SPEAKER = re.compile(
-    r"^[A-Za-z0-9\u4e00-\u9fff·+&（）()/-]{1,16}组$"
-)
-MARKDOWN_GROUP_SPEAKER = re.compile(
-    r"^#{1,6}\s+(?P<label>[A-Za-z0-9\u4e00-\u9fff·+&（）()/-]{1,16}组)\s*#*\s*$"
-)
-STANDALONE_ANONYMOUS_SPEAKER = re.compile(
-    r"^(?P<speaker>(?:Speaker|发言人|说话人)\s*(?:\d+|[A-Za-z]+|[甲乙丙丁戊己庚辛壬癸]))\s*[：:]?\s*$",
+ANONYMOUS_LABEL_RE = re.compile(
+    r"^(?P<label>(?:说话人|发言人|Speaker)\s*(?P<id>[A-Za-z0-9甲乙丙丁戊己庚辛壬癸]+))"
+    r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?\s*(?:[：:]\s*(?P<content>.*))?$",
     re.IGNORECASE,
 )
+BRACKET_LABEL_RE = re.compile(
+    r"^[【\[](?P<label>[^】\]]{1,24})[】\]]\s*(?:[：:]\s*)?(?P<content>.*)$"
+)
+DEFAULT_ROLE_LABELS = {
+    "主持人",
+    "分析师",
+    "研究员",
+    "基金经理",
+    "嘉宾",
+    "专家",
+    "管理层",
+    "负责人",
+    "董秘",
+    "提问者",
+}
 
 
-def group_speaker_label(line: str) -> str:
-    stripped = line.strip()
-    if STANDALONE_GROUP_SPEAKER.fullmatch(stripped):
-        return stripped
-    matched = MARKDOWN_GROUP_SPEAKER.fullmatch(stripped)
-    return str(matched.group("label")) if matched else ""
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+def _normalize_anonymous(label: str) -> str:
+    compact = re.sub(r"\s+", "", label)
+    matched = re.fullmatch(r"(?:说话人|发言人|speaker)(.+)", compact, re.IGNORECASE)
+    return f"发言人{matched.group(1)}" if matched else label.strip()
 
 
-def canonical_sha256(value: Any) -> str:
-    payload = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+def _match_speaker_line(line: str, known_speakers: set[str]) -> tuple[str, int | None] | None:
+    content = line.rstrip("\r\n")
+    match_content = re.sub(
+        r"^\[(?:\d{1,3}:\d{2}|\d{1,2}:\d{2}:\d{2})\]\s*",
+        "",
+        content.strip(),
+        count=1,
     )
-    return sha256_text(payload)
+    matched = ANONYMOUS_LABEL_RE.fullmatch(match_content)
+    if matched:
+        label = _normalize_anonymous(matched.group("label"))
+        inline = matched.group("content")
+        if inline:
+            return label, content.rfind(inline)
+        return label, None
+
+    matched = BRACKET_LABEL_RE.fullmatch(match_content)
+    if matched:
+        label = matched.group("label").strip()
+        if label not in DEFAULT_ROLE_LABELS and label not in known_speakers:
+            return None
+        inline = matched.group("content")
+        if inline:
+            return label, content.rfind(inline)
+        return label, None
+
+    labels = sorted(DEFAULT_ROLE_LABELS | known_speakers, key=len, reverse=True)
+    if labels:
+        role_match = re.fullmatch(
+            rf"(?P<label>{'|'.join(re.escape(item) for item in labels)})\s*[：:]\s*(?P<content>.*)",
+            match_content,
+        )
+        if role_match:
+            inline = role_match.group("content")
+            return role_match.group("label"), content.rfind(inline) if inline else None
+    return None
 
 
-def normalized_anonymous_label(value: str) -> str:
-    normalized = re.sub(r"\s+", "", value.strip())
-    normalized = re.sub(r"^说话人", "发言人", normalized)
-    return normalized
+def _trimmed_span(source: str, start: int, end: int) -> tuple[int, int, str] | None:
+    raw = source[start:end]
+    if not raw.strip():
+        return None
+    left = len(raw) - len(raw.lstrip())
+    right = len(raw.rstrip())
+    actual_start = start + left
+    actual_end = start + right
+    return actual_start, actual_end, source[actual_start:actual_end]
 
 
-def detect_source_turns(text: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Split speaker turns without applying filler removal or prose editing."""
-    turns: list[dict[str, Any]] = []
-    current_speaker = ""
-    buffer_start: int | None = None
-    buffer_end: int | None = None
-    anonymous_labels: dict[str, str] = {}
-    source_lines = text.splitlines(keepends=True)
-    group_labels = {
-        label
-        for line in source_lines
-        if (label := group_speaker_label(line))
-    }
-    repeated_group_layout = len(group_labels) >= 2
-
-    boundary_count = 0
-    standalone_boundary_count = 0
-    inline_boundary_count = 0
-    unlabeled_prefix_chars = 0
-
-    def flush() -> None:
-        nonlocal buffer_start, buffer_end
-        if buffer_start is None or buffer_end is None:
-            return
-        raw_content = text[buffer_start:buffer_end]
-        leading = len(raw_content) - len(raw_content.lstrip())
-        trailing = len(raw_content) - len(raw_content.rstrip())
-        start_char = buffer_start + leading
-        end_char = buffer_end - trailing
-        content = text[start_char:end_char]
-        if content:
-            turns.append(
-                {
-                    "speaker_label": current_speaker or "发言人1",
-                    "text": content,
-                    "source_span": {"start_char": start_char, "end_char": end_char},
-                }
-            )
-        buffer_start = None
-        buffer_end = None
-
+def parse_explicit_turns(source: str, known_speakers: Iterable[str] = ()) -> list[dict[str, Any]]:
+    known = {item.strip() for item in known_speakers if item.strip()}
+    raw_turns: list[tuple[str, int, int]] = []
+    current_speaker = "发言人1"
+    current_start = 0
     offset = 0
-    for line in source_lines:
+
+    for line in source.splitlines(keepends=True):
         line_start = offset
         line_end = offset + len(line)
+        matched = _match_speaker_line(line, known)
+        if matched is not None:
+            previous = _trimmed_span(source, current_start, line_start)
+            if previous is not None:
+                raw_turns.append((current_speaker, previous[0], previous[1]))
+            current_speaker, inline_index = matched
+            current_start = line_end if inline_index is None else line_start + inline_index
         offset = line_end
-        stripped = line.strip()
-        if not stripped:
-            if buffer_start is not None:
-                buffer_end = line_end
-            continue
 
-        group_label = group_speaker_label(stripped)
-        if repeated_group_layout and group_label:
-            flush()
-            current_speaker = group_label
-            boundary_count += 1
-            standalone_boundary_count += 1
-            continue
+    final = _trimmed_span(source, current_start, len(source))
+    if final is not None:
+        raw_turns.append((current_speaker, final[0], final[1]))
+    if not raw_turns and source.strip():
+        trimmed = _trimmed_span(source, 0, len(source))
+        assert trimmed is not None
+        raw_turns.append(("发言人1", trimmed[0], trimmed[1]))
 
-        standalone = STANDALONE_ANONYMOUS_SPEAKER.fullmatch(stripped)
-        if standalone:
-            flush()
-            raw_speaker = normalized_anonymous_label(standalone.group("speaker"))
-            speaker_key = anonymous_speaker_key(raw_speaker)
-            current_speaker = anonymous_labels.setdefault(
-                speaker_key,
-                f"发言人{len(anonymous_labels) + 1}",
-            )
-            boundary_count += 1
-            standalone_boundary_count += 1
-            continue
-
-        matched = None
-        anonymous = False
-        for pattern, is_anonymous in EXPLICIT_SPEAKER_PATTERNS:
-            matched = pattern.match(stripped)
-            if matched:
-                anonymous = is_anonymous
-                break
-
-        if not matched:
-            if buffer_start is None:
-                if not current_speaker:
-                    unlabeled_prefix_chars += len(stripped)
-                buffer_start = line_start
-            buffer_end = line_end
-            continue
-
-        flush()
-        raw_speaker = matched.group("speaker").strip()
-        if anonymous:
-            speaker_key = anonymous_speaker_key(raw_speaker)
-            current_speaker = anonymous_labels.setdefault(
-                speaker_key,
-                f"发言人{len(anonymous_labels) + 1}",
-            )
-        else:
-            current_speaker = raw_speaker
-        boundary_count += 1
-        inline_boundary_count += 1
-
-        content = matched.groupdict().get("content", "")
-        if content:
-            stripped_start = line_start + (len(line) - len(line.lstrip()))
-            content_start = stripped_start + matched.start("content")
-            content_end = stripped_start + matched.end("content")
-            buffer_start = content_start
-            buffer_end = content_end
-
-    flush()
-    exact_spans = all(
-        text[int(turn["source_span"]["start_char"]):int(turn["source_span"]["end_char"])] == turn["text"]
-        for turn in turns
-    )
-    profile = {
-        "boundary_count": boundary_count,
-        "standalone_boundary_count": standalone_boundary_count,
-        "inline_boundary_count": inline_boundary_count,
-        "speaker_count": len({str(turn["speaker_label"]) for turn in turns}),
-        "unlabeled_prefix_chars": unlabeled_prefix_chars,
-        "structure_reliable": bool(turns) and boundary_count > 0 and unlabeled_prefix_chars == 0 and exact_spans,
-        "lossless_renderable": bool(turns) and exact_spans,
-    }
-    return turns, profile
-
-
-def split_oversized_text(text: str, max_chars: int) -> list[tuple[str, int, int]]:
-    """Split an oversized turn at paragraph, then sentence, boundaries."""
-    if len(text) <= max_chars:
-        return [(text, 0, len(text))]
-
-    chunks: list[tuple[str, int, int]] = []
-    cursor = 0
-    while cursor < len(text):
-        while cursor < len(text) and text[cursor].isspace():
-            cursor += 1
-        if cursor >= len(text):
-            break
-        limit = min(len(text), cursor + max_chars)
-        boundary = limit
-        if limit < len(text):
-            window = text[cursor:limit]
-            paragraph_boundary = max(window.rfind("\n\n"), window.rfind("\r\n\r\n"))
-            line_boundary = window.rfind("\n")
-            sentence_boundary = max((window.rfind(marker) + 1 for marker in "。！？!?;；"), default=0)
-            candidates = [
-                value
-                for value in (paragraph_boundary + 2, line_boundary + 1, sentence_boundary)
-                if value >= max_chars // 2
-            ]
-            if candidates:
-                boundary = cursor + max(candidates)
-        chunk_end = boundary
-        while chunk_end > cursor and text[chunk_end - 1].isspace():
-            chunk_end -= 1
-        chunk = text[cursor:chunk_end]
-        if chunk:
-            chunks.append((chunk, cursor, chunk_end))
-        cursor = boundary
-    return chunks
-
-
-def build_turns(source_text: str, max_chars: int = DEFAULT_MAX_CHARS) -> list[dict[str, Any]]:
-    detected, _ = detect_source_turns(source_text)
-    if not detected:
-        raise ValueError("transcript 未检测到非空发言内容")
-
-    speaker_ids: dict[str, str] = {}
     turns: list[dict[str, Any]] = []
-    split_turns: list[tuple[str, str, dict[str, int]]] = []
-    for detected_turn in detected:
-        speaker_label = str(detected_turn["speaker_label"])
-        text = str(detected_turn["text"])
-        base_start = int(detected_turn["source_span"]["start_char"])
-        split_turns.extend(
-            (
-                speaker_label,
-                chunk,
-                {"start_char": base_start + local_start, "end_char": base_start + local_end},
-            )
-            for chunk, local_start, local_end in split_oversized_text(text, max_chars)
-        )
-    for sequence, (speaker_label, text, source_span) in enumerate(split_turns, start=1):
-        speaker_id = speaker_ids.setdefault(
-            speaker_label,
-            f"speaker_{len(speaker_ids) + 1:03d}",
-        )
+    for sequence, (speaker, start, end) in enumerate(raw_turns, start=1):
+        text = source[start:end]
         turns.append(
             {
-                "turn_id": f"turn_{sequence:06d}",
+                "turn_id": f"turn_{sequence:04d}",
                 "sequence": sequence,
-                "speaker_id": speaker_id,
-                "speaker_label": speaker_label,
-                "source_span": source_span,
-                "source_sha256": sha256_text(text),
+                "speaker_label": speaker,
                 "text": text,
+                "char_count": len(text),
+                "source_span": {"start_char": start, "end_char": end},
+                "text_sha256": sha256_text(text),
             }
         )
     return turns
 
 
-def build_shards(
+def _split_point(text: str, hard_limit: int) -> int:
+    window = text[: hard_limit + 1]
+    minimum = max(1, hard_limit // 2)
+    candidates: list[int] = []
+    for marker in ("\n\n", "\n", "。", "！", "？", "；", ".", "!", "?", ";"):
+        point = window.rfind(marker)
+        if point >= minimum:
+            candidates.append(point + len(marker))
+    return max(candidates) if candidates else hard_limit
+
+
+def split_oversized_turns(turns: list[dict[str, Any]], hard_limit: int) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for turn in turns:
+        text = str(turn["text"])
+        if len(text) <= hard_limit:
+            result.append(dict(turn))
+            continue
+        relative = 0
+        part = 1
+        while relative < len(text):
+            remaining = text[relative:]
+            size = len(remaining) if len(remaining) <= hard_limit else _split_point(remaining, hard_limit)
+            piece = remaining[:size]
+            leading = len(piece) - len(piece.lstrip())
+            trailing = len(piece.rstrip())
+            if trailing > leading:
+                piece_start = relative + leading
+                piece_end = relative + trailing
+                shown = text[piece_start:piece_end]
+                absolute_start = int(turn["source_span"]["start_char"]) + piece_start
+                result.append(
+                    {
+                        **turn,
+                        "text": shown,
+                        "char_count": len(shown),
+                        "source_span": {
+                            "start_char": absolute_start,
+                            "end_char": absolute_start + len(shown),
+                        },
+                        "text_sha256": sha256_text(shown),
+                        "split_part": part,
+                    }
+                )
+                part += 1
+            relative += max(1, size)
+
+    for sequence, turn in enumerate(result, start=1):
+        turn["turn_id"] = f"turn_{sequence:04d}"
+        turn["sequence"] = sequence
+    return result
+
+
+def _packages_from_breaks(
+    turns: list[dict[str, Any]], starts: list[str], hard_limit: int
+) -> list[list[dict[str, Any]]]:
+    ids = [str(turn["turn_id"]) for turn in turns]
+    if not starts or starts[0] != ids[0]:
+        raise ValueError("package_breaks 必须以第一个 turn_id 开始")
+    if len(starts) != len(set(starts)) or any(item not in ids for item in starts):
+        raise ValueError("package_breaks 包含重复或未知 turn_id")
+    indexes = sorted(ids.index(item) for item in starts)
+    if [ids[index] for index in indexes] != starts:
+        raise ValueError("package_breaks 必须按来源顺序排列")
+    packages: list[list[dict[str, Any]]] = []
+    for index, start in enumerate(indexes):
+        end = indexes[index + 1] if index + 1 < len(indexes) else len(turns)
+        package = turns[start:end]
+        if sum(int(turn["char_count"]) for turn in package) > hard_limit:
+            raise ValueError("模型指定的 package 超过 16,000 字硬上限")
+        packages.append(package)
+    return packages
+
+
+def package_turns(
     turns: list[dict[str, Any]],
-    *,
-    source_name: str,
-    source_sha256: str,
-    max_chars: int,
+    target_chars: int = DEFAULT_TARGET_CHARS,
+    hard_limit_chars: int = DEFAULT_HARD_LIMIT_CHARS,
+    package_breaks: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    if max_chars <= 0:
-        raise ValueError("--max-chars 必须大于 0")
-    if max_chars > HARD_MAX_CHARS:
-        raise ValueError(f"--max-chars 不得超过硬上限 {HARD_MAX_CHARS}")
+    if target_chars <= 0 or hard_limit_chars < target_chars:
+        raise ValueError("字符阈值必须满足 0 < target_chars <= hard_limit_chars")
+    if any(int(turn["char_count"]) > hard_limit_chars for turn in turns):
+        raise ValueError("存在未拆分的超限 turn")
 
-    shards: list[dict[str, Any]] = []
-    current_part: list[dict[str, Any]] = []
-    current_chars = 0
+    if package_breaks is not None:
+        raw_packages = _packages_from_breaks(turns, package_breaks, hard_limit_chars)
+    else:
+        raw_packages: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        current_chars = 0
+        for turn in turns:
+            turn_chars = int(turn["char_count"])
+            if current and current_chars + turn_chars > target_chars:
+                raw_packages.append(current)
+                current = []
+                current_chars = 0
+            current.append(turn)
+            current_chars += turn_chars
+        if current:
+            raw_packages.append(current)
 
-    def flush() -> None:
-        nonlocal current_part, current_chars
-        if not current_part:
-            return
-        package_number = len(shards) + 1
-        artifact_type = f"speaker_turn_edit__package_{package_number:03d}"
-        speaker_ids = list(
-            dict.fromkeys(str(turn["speaker_id"]) for turn in current_part)
-        )
-        speaker_labels = list(
-            dict.fromkeys(str(turn["speaker_label"]) for turn in current_part)
-        )
-        input_payload = {
-            "source_name": source_name,
-            "source_sha256": source_sha256,
-            "speaker_ids": speaker_ids,
-            "speaker_labels": speaker_labels,
-            "turns": current_part,
-        }
-        shards.append(
+    packages: list[dict[str, Any]] = []
+    for sequence, package in enumerate(raw_packages, start=1):
+        char_count = sum(int(turn["char_count"]) for turn in package)
+        if char_count > hard_limit_chars:
+            raise ValueError("生成的 package 超过 hard limit")
+        packages.append(
             {
-                "shard_id": artifact_type,
-                "artifact_type": artifact_type,
-                "speaker_ids": speaker_ids,
-                "speaker_labels": speaker_labels,
-                "package": package_number,
-                "turn_ids": [turn["turn_id"] for turn in current_part],
-                "turn_count": len(current_part),
-                "char_count": current_chars,
-                "input_sha256": canonical_sha256(input_payload),
+                "package_id": f"package_{sequence:03d}",
+                "sequence": sequence,
+                "turn_ids": [str(turn["turn_id"]) for turn in package],
+                "char_count": char_count,
+                "over_target": char_count > target_chars,
+                "boundary_review_required": sequence < len(raw_packages),
             }
         )
-        current_part = []
-        current_chars = 0
-
-    for turn in turns:
-        turn_chars = len(str(turn["text"]))
-        if current_part and current_chars + turn_chars > max_chars:
-            flush()
-        current_part.append(turn)
-        current_chars += turn_chars
-    flush()
-
-    return shards
+    return packages
 
 
-def build_manifest(source_path: Path, source_text: str, max_chars: int) -> dict[str, Any]:
-    source_sha256 = sha256_text(source_text)
-    if max_chars <= 0:
-        raise ValueError("--max-chars 必须大于 0")
-    if max_chars > HARD_MAX_CHARS:
-        raise ValueError(f"--max-chars 不得超过硬上限 {HARD_MAX_CHARS}")
-    _, source_profile = detect_source_turns(source_text)
-    turns = build_turns(source_text, max_chars=max_chars)
-    shards = build_shards(
-        turns,
-        source_name=source_path.name,
-        source_sha256=source_sha256,
-        max_chars=max_chars,
+def build_manifest(
+    source: str,
+    *,
+    source_name: str = "source.txt",
+    target_chars: int = DEFAULT_TARGET_CHARS,
+    hard_limit_chars: int = DEFAULT_HARD_LIMIT_CHARS,
+    known_speakers: Iterable[str] = (),
+    package_breaks: list[str] | None = None,
+) -> dict[str, Any]:
+    if not source.strip():
+        raise ValueError("来源文本为空")
+    turns = parse_explicit_turns(source, known_speakers)
+    turns = split_oversized_turns(turns, hard_limit_chars)
+    source_char_count = len(source)
+    mode = "direct" if source_char_count <= target_chars else "sharded"
+    packages = (
+        []
+        if mode == "direct"
+        else package_turns(turns, target_chars, hard_limit_chars, package_breaks)
     )
-    manifest: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "artifact_type": "speaker_turn_manifest",
-        "source_name": source_path.name,
-        "source_sha256": source_sha256,
-        "turn_count": len(turns),
-        "shard_count": len(shards),
-        "source_profile": source_profile,
+    return {
+        "schema_version": "1.0",
+        "source_name": Path(source_name).name,
+        "source_sha256": sha256_text(source),
+        "source_char_count": source_char_count,
+        "routing": {
+            "mode": mode,
+            "target_chars": target_chars,
+            "hard_limit_chars": hard_limit_chars,
+            "total_length_is_unbounded": True,
+        },
         "turns": turns,
-        "shards": shards,
+        "packages": packages,
+        "requires_semantic_boundary_review": len(packages) > 1,
     }
-    manifest["manifest_sha256"] = canonical_sha256(manifest)
-    return manifest
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="按发言人生成可并行编辑的 speaker-turn manifest。"
-    )
-    parser.add_argument("input", type=Path, help="UTF-8 原始 transcript 路径")
-    parser.add_argument("--out", type=Path, required=True, help="manifest JSON 输出路径")
-    parser.add_argument(
-        "--max-chars",
-        type=int,
-        default=DEFAULT_MAX_CHARS,
-        help=(
-            f"单工作包目标上限（默认 {DEFAULT_MAX_CHARS}，硬上限 "
-            f"{HARD_MAX_CHARS}；只打包相邻完整 turns，超长 turn 优先按自然段拆分）"
-        ),
-    )
-    return parser.parse_args()
 
 
 def main() -> int:
-    args = parse_args()
-    try:
-        raw_bytes = args.input.read_bytes()
-        if raw_bytes.startswith(b"\xef\xbb\xbf"):
-            raise ValueError("输入文件必须为 UTF-8 without BOM")
-        source_text = raw_bytes.decode("utf-8")
-        manifest = build_manifest(args.input, source_text, args.max_chars)
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    parser = argparse.ArgumentParser(description="解析显式发言轮次并规划长材料工作包")
+    parser.add_argument("source", type=Path, help="UTF-8 来源文本")
+    parser.add_argument("--out", required=True, type=Path, help="manifest JSON 输出路径")
+    parser.add_argument("--target-chars", type=int, default=DEFAULT_TARGET_CHARS)
+    parser.add_argument("--hard-limit-chars", type=int, default=DEFAULT_HARD_LIMIT_CHARS)
+    parser.add_argument("--known-speaker", action="append", default=[])
+    parser.add_argument("--package-breaks", type=Path, help="模型确认的 package 起始 turn_id JSON array")
+    args = parser.parse_args()
 
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "out": str(args.out),
-                "turn_count": manifest["turn_count"],
-                "shard_count": manifest["shard_count"],
-                "manifest_sha256": manifest["manifest_sha256"],
-            },
-            ensure_ascii=False,
+    try:
+        source = args.source.read_text(encoding="utf-8")
+        package_breaks = None
+        if args.package_breaks:
+            loaded = json.loads(args.package_breaks.read_text(encoding="utf-8"))
+            if not isinstance(loaded, list) or not all(isinstance(item, str) for item in loaded):
+                raise ValueError("package_breaks 必须是 turn_id JSON array")
+            package_breaks = loaded
+        manifest = build_manifest(
+            source,
+            source_name=args.source.name,
+            target_chars=args.target_chars,
+            hard_limit_chars=args.hard_limit_chars,
+            known_speakers=args.known_speaker,
+            package_breaks=package_breaks,
         )
-    )
-    return 0
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"ok": False, "errors": [str(exc)]}, ensure_ascii=False, indent=2))
+        return 1
 
 
 if __name__ == "__main__":

@@ -12,9 +12,95 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+MINUTES_SEGMENT_KINDS = {"question", "answer", "paragraph"}
+
 
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _normalize_reference_segments(
+    item: dict[str, Any], turn_id: str, default_speaker: str
+) -> list[dict[str, str]]:
+    raw_segments = item.get("reference_segments")
+    if raw_segments is None:
+        reference_text = item.get("reference_text")
+        if not isinstance(reference_text, str) or not reference_text.strip():
+            raise ValueError(f"{turn_id}.reference_text 必须是非空字符串")
+        return [
+            {
+                "speaker_label": default_speaker,
+                "text": reference_text.strip(),
+            }
+        ]
+    if not isinstance(raw_segments, list):
+        raise ValueError(f"{turn_id}.reference_segments 必须是 JSON array")
+
+    normalized: list[dict[str, str]] = []
+    for index, segment in enumerate(raw_segments, start=1):
+        if not isinstance(segment, dict):
+            raise ValueError(f"{turn_id}.reference_segments[{index}] 必须是 JSON object")
+        speaker_label = segment.get("speaker_label")
+        text = segment.get("text")
+        if not isinstance(speaker_label, str) or not speaker_label.strip():
+            raise ValueError(
+                f"{turn_id}.reference_segments[{index}].speaker_label 必须是非空字符串"
+            )
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(
+                f"{turn_id}.reference_segments[{index}].text 必须是非空字符串"
+            )
+        normalized.append(
+            {
+                "speaker_label": speaker_label.strip(),
+                "text": text.strip(),
+            }
+        )
+    return normalized
+
+
+def _normalize_minutes_segments(
+    item: dict[str, Any], turn_id: str, default_speaker: str
+) -> list[dict[str, str]]:
+    raw_segments = item.get("minutes_segments")
+    if raw_segments is None:
+        minutes_text = item.get("minutes_text")
+        if not isinstance(minutes_text, str):
+            raise ValueError(f"{turn_id}.minutes_text 必须是字符串")
+        text = minutes_text.strip()
+        return [
+            {"kind": "paragraph", "speaker_label": default_speaker, "text": text}
+        ] if text else []
+    if not isinstance(raw_segments, list):
+        raise ValueError(f"{turn_id}.minutes_segments 必须是 JSON array")
+
+    normalized: list[dict[str, str]] = []
+    for index, segment in enumerate(raw_segments, start=1):
+        if not isinstance(segment, dict):
+            raise ValueError(f"{turn_id}.minutes_segments[{index}] 必须是 JSON object")
+        kind = segment.get("kind")
+        speaker_label = segment.get("speaker_label", default_speaker)
+        text = segment.get("text")
+        if not isinstance(kind, str) or kind not in MINUTES_SEGMENT_KINDS:
+            raise ValueError(
+                f"{turn_id}.minutes_segments[{index}].kind 必须是 question/answer/paragraph"
+            )
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(
+                f"{turn_id}.minutes_segments[{index}].text 必须是非空字符串"
+            )
+        if not isinstance(speaker_label, str) or not speaker_label.strip():
+            raise ValueError(
+                f"{turn_id}.minutes_segments[{index}].speaker_label 必须是非空字符串"
+            )
+        normalized.append(
+            {
+                "kind": str(kind),
+                "speaker_label": speaker_label.strip(),
+                "text": text.strip(),
+            }
+        )
+    return normalized
 
 
 def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -26,7 +112,11 @@ def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]
         raise ValueError("manifest 缺少 turns 或 packages")
 
     turn_by_id = {str(turn.get("turn_id")): turn for turn in turns if isinstance(turn, dict)}
+    if len(turn_by_id) != len(turns):
+        raise ValueError("manifest.turns 包含重复或无效 turn_id")
     expected_package_ids = [str(package.get("package_id")) for package in packages]
+    if len(expected_package_ids) != len(set(expected_package_ids)):
+        raise ValueError("manifest.packages 包含重复 package_id")
     return_by_package: dict[str, dict[str, Any]] = {}
     for payload in returns:
         if not isinstance(payload, dict):
@@ -50,7 +140,9 @@ def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]
         payload_turns = return_by_package[package_id].get("turns")
         if not isinstance(payload_turns, list):
             raise ValueError(f"{package_id}.turns 必须是 JSON array")
-        returned_ids = [str(item.get("turn_id") or "") for item in payload_turns if isinstance(item, dict)]
+        if any(not isinstance(item, dict) for item in payload_turns):
+            raise ValueError(f"{package_id}.turns 的每项必须是 JSON object")
+        returned_ids = [str(item.get("turn_id") or "") for item in payload_turns]
         if returned_ids != expected_turn_ids:
             raise ValueError(f"{package_id} 的 turn_id 必须与 manifest 完全一致并保持顺序")
         for item in payload_turns:
@@ -58,21 +150,38 @@ def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]
             if turn_id in seen_turns:
                 raise ValueError(f"重复 turn_id: {turn_id}")
             seen_turns.add(turn_id)
-            reference_text = item.get("reference_text")
-            minutes_text = item.get("minutes_text")
-            if not isinstance(reference_text, str) or not reference_text.strip():
-                raise ValueError(f"{turn_id}.reference_text 必须是非空字符串")
-            if not isinstance(minutes_text, str):
-                raise ValueError(f"{turn_id}.minutes_text 必须是字符串")
             source_turn = turn_by_id[turn_id]
+            default_speaker = str(source_turn["speaker_label"])
+            reference_segments = _normalize_reference_segments(item, turn_id, default_speaker)
+            minutes_segments = _normalize_minutes_segments(item, turn_id, default_speaker)
+            reference_omission_reason = item.get("reference_omission_reason")
+            minutes_omission_reason = item.get("minutes_omission_reason")
+            if "reference_segments" in item and not reference_segments and (
+                not isinstance(reference_omission_reason, str) or not reference_omission_reason.strip()
+            ):
+                raise ValueError(
+                    f"{turn_id}.reference_segments 为空时必须提供 reference_omission_reason"
+                )
+            if not minutes_segments and (
+                not isinstance(minutes_omission_reason, str) or not minutes_omission_reason.strip()
+            ):
+                raise ValueError(
+                    f"{turn_id}.minutes_segments 为空时必须提供 minutes_omission_reason"
+                )
+            normalized_turn = {
+                "package_id": package_id,
+                "turn_id": turn_id,
+                "sequence": int(source_turn["sequence"]),
+                "speaker_label": default_speaker,
+                "reference_segments": reference_segments,
+                "minutes_segments": minutes_segments,
+            }
+            if isinstance(reference_omission_reason, str) and reference_omission_reason.strip():
+                normalized_turn["reference_omission_reason"] = reference_omission_reason.strip()
+            if isinstance(minutes_omission_reason, str) and minutes_omission_reason.strip():
+                normalized_turn["minutes_omission_reason"] = minutes_omission_reason.strip()
             ordered.append(
-                {
-                    "turn_id": turn_id,
-                    "sequence": int(source_turn["sequence"]),
-                    "speaker_label": str(source_turn["speaker_label"]),
-                    "reference_text": reference_text.strip(),
-                    "minutes_text": minutes_text.strip(),
-                }
+                normalized_turn
             )
 
     expected_all = [str(turn["turn_id"]) for turn in sorted(turns, key=lambda item: int(item["sequence"]))]
@@ -81,7 +190,7 @@ def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]
         raise ValueError("组装结果未按来源顺序完整覆盖所有 turn")
 
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "source_sha256": str(manifest.get("source_sha256") or ""),
         "turns": ordered,
         "coverage": {

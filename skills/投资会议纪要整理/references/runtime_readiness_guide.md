@@ -35,19 +35,21 @@ python3 scripts/check_investment_workflow_health.py --profile full --strict
 
 各 profile 含义：
 
-- `asr`：只检查本地转写前置条件、SenseVoice/Paraformer 服务和模型缓存。音频转写前使用。
+- `asr`：只检查本地转写前置条件、SenseVoice 服务以及 SenseVoice/fsmn-vad 模型缓存。音频转写前使用。
 - `document`：检查 UTF-8 文本处理、DOCX 解析、本地输入/临时/输出目录权限。文档密集任务前使用。
 - `export`：检查本地 Markdown validator、Markdown 导出器、本地输出目录和同目录 hard-link 原子发布能力。最终 Markdown 导出前使用。
 - `full`：运行全部本地基础检查。用于部署验收，不建议每次会议纪要都跑。
 
 strict 模式按 profile 检查对应资源：
 
-- `asr --strict`：缺少 `funasr`、`modelscope`、`soundfile`、`librosa`、本地 SenseVoice 主模型缓存、本地 Paraformer 辅助模型缓存、本地 fsmn-vad 模型缓存、运行中的 SenseVoice bridge 健康检查接口或服务上报的模型缓存时应失败。
+- `asr --strict`：缺少 `funasr`、`modelscope`、`soundfile`、`librosa`、ASR runtime 可用的 `ffmpeg`（PATH 或 `imageio-ffmpeg`）、本地 SenseVoice 主模型缓存、本地 fsmn-vad 模型缓存、运行中的 SenseVoice bridge 健康检查接口或服务上报的模型缓存时应失败。
 - `document --strict`：缺少 `docx`、UTF-8 文本处理、临时目录、本地输入目录或本地输出目录时应失败。
 - `export --strict`：缺少本地输出目录、Markdown validator、Markdown 导出器或安全原子发布能力时应失败。
 - `full --strict`：运行以上全部本地基础检查。
 
-当前维护的音频工作流是：SenseVoice 作为主转写来源，Paraformer 只作为辅助校对和时间戳证据。`timestamp_index.json` 可由脚本在 SenseVoice 与 Paraformer 可用时间戳 anchor 间选择，并记录 `timestamp_index_source`。Paraformer 结果不得自动替换 SenseVoice 主转写。额外 ASR 引擎、说话人分离、无关分段路径不属于当前基础 skill 合约，只有用户明确要求时才启用。
+当前维护的音频工作流只使用 SenseVoiceSmall 与 fsmn-vad。`timestamp_index.json` 来自完整音频的 VAD 全局毫秒边界，并记录 `timestamp_index_source=sensevoice_vad_segment`。额外 ASR 引擎、说话人分离和无关分段路径不属于当前基础 skill 合约。
+
+SenseVoice VAD 路径先用一次 ffmpeg 标准化完整音频，再从同一 PCM 时间轴切出短片段，并使用 FunASR 原生批处理推理；不再为每个短片段重复启动 ffmpeg。批处理不兼容时会在当前分段集合内改为顺序推理；若顺序推理仍失败，本次转写明确失败，不会对整场音频再做一轮 60 秒分块转写。只有 VAD 初始化、音频标准化、VAD 未返回有效分段或分段切片等「尚未开始有效 SenseVoice segment 推理」的前置失败，才使用 60 秒纯文本兜底。
 
 只检查 ASR 缓存时使用：
 

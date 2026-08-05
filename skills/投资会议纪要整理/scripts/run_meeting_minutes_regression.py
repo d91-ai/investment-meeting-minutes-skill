@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,10 @@ DEFAULT_CASES_PATH = SKILL_DIR / "references/regression_samples/cases.json"
 from assemble_speaker_turn_edits import assemble_returns  # noqa: E402
 from build_speaker_turn_manifest import build_manifest  # noqa: E402
 from export_to_obsidian import detect_filename_title, normalize_meeting_date  # noqa: E402
+from transcribe_audio import (  # noqa: E402
+    _audio_segment_to_wav,
+    _generate_sensevoice_segment_results,
+)
 from validate_meeting_minutes_contract import (  # noqa: E402
     validate_contract,
     validate_timestamp_index_file,
@@ -83,6 +89,23 @@ def check_partition(scenario: str) -> tuple[list[str], list[str]]:
         texts = [turn["text"] for turn in manifest["turns"]]
         if speakers != ["发言人1", "发言人2"] or texts != ["第一段", "第二段"]:
             errors.append("行首时间戳后的显式发言人标签必须被识别并从正文 span 中移除")
+    elif scenario == "balanced_allowed":
+        source = _turn_source([1_000] * 29)
+        initial = build_manifest(source)
+        turn_ids = [turn["turn_id"] for turn in initial["turns"]]
+        balanced = build_manifest(source, allowed_break_turn_ids=turn_ids[1:])
+        sizes = [int(package["char_count"]) for package in balanced["packages"]]
+        if len(sizes) != 3 or max(sizes) - min(sizes) > 1_000:
+            errors.append(f"合法边界内应形成三个近似等长 package，实际为 {sizes}")
+    elif scenario == "balanced_respects_allowed":
+        source = _turn_source([1_000] * 30)
+        initial = build_manifest(source)
+        turn_ids = [turn["turn_id"] for turn in initial["turns"]]
+        allowed = [turn_ids[10], turn_ids[20]]
+        balanced = build_manifest(source, allowed_break_turn_ids=allowed)
+        starts = [package["turn_ids"][0] for package in balanced["packages"]]
+        if starts != [turn_ids[0], *allowed]:
+            errors.append(f"均衡分包使用了模型未批准的边界: {starts}")
     else:
         errors.append(f"未知 partition scenario: {scenario}")
     return errors, warnings
@@ -109,6 +132,142 @@ def check_assembly() -> tuple[list[str], list[str]]:
     expected = [turn["turn_id"] for turn in manifest["turns"]]
     actual = [turn["turn_id"] for turn in assembled["turns"]]
     errors = [] if assembled["coverage"]["complete"] and actual == expected else ["长材料组装未完整保持来源顺序"]
+
+    broken = json.loads(json.dumps(returns, ensure_ascii=False))
+    broken[0]["turns"][0]["minutes_text"] = ""
+    try:
+        assemble_returns(manifest, broken)
+    except ValueError as exc:
+        if "minutes_omission_reason" not in str(exc):
+            errors.append("旧格式纪要为空时的错误应指明 minutes_omission_reason")
+    else:
+        errors.append("旧格式 minutes_text 为空且无删除理由时必须拒绝组装")
+    return errors, []
+
+
+def check_structured_assembly() -> tuple[list[str], list[str]]:
+    manifest = build_manifest(_turn_source([7_000, 7_000, 7_000]))
+    returns = []
+    first_turn_id = str(manifest["turns"][0]["turn_id"])
+    second_turn_id = str(manifest["turns"][1]["turn_id"])
+    for package in manifest["packages"]:
+        payload_turns = []
+        for turn_id in package["turn_ids"]:
+            if turn_id == first_turn_id:
+                payload_turns.append(
+                    {
+                        "turn_id": turn_id,
+                        "reference_segments": [
+                            {"speaker_label": "提问者", "text": "整理后的问题"},
+                            {"speaker_label": "专家", "text": "整理后的回答"},
+                        ],
+                        "minutes_segments": [
+                            {"kind": "question", "speaker_label": "提问者", "text": "问题"},
+                            {"kind": "answer", "speaker_label": "专家", "text": "回答"},
+                        ],
+                    }
+                )
+            elif turn_id == second_turn_id:
+                payload_turns.append(
+                    {
+                        "turn_id": turn_id,
+                        "reference_segments": [],
+                        "reference_omission_reason": "整轮为无信息流程用语",
+                        "minutes_segments": [],
+                        "minutes_omission_reason": "整轮无实质信息",
+                    }
+                )
+            else:
+                payload_turns.append(
+                    {
+                        "turn_id": turn_id,
+                        "reference_segments": [
+                            {"speaker_label": "专家", "text": f"参考-{turn_id}"}
+                        ],
+                        "minutes_segments": [
+                            {"kind": "paragraph", "speaker_label": "专家", "text": f"纪要-{turn_id}"}
+                        ],
+                    }
+                )
+        returns.append({"schema_version": "1.1", "package_id": package["package_id"], "turns": payload_turns})
+
+    assembled = assemble_returns(manifest, returns)
+    errors: list[str] = []
+    first = assembled["turns"][0]
+    second = assembled["turns"][1]
+    if assembled["schema_version"] != "1.1" or len(first["reference_segments"]) != 2:
+        errors.append("v1.1 组装必须保留同一 source turn 内的多个语义片段")
+    if [item["speaker_label"] for item in first["minutes_segments"]] != ["提问者", "专家"]:
+        errors.append("v1.1 组装必须保留混合问答的片段发言人")
+    if second["reference_segments"] or second.get("reference_omission_reason") != "整轮为无信息流程用语":
+        errors.append("空参考原文片段必须保留明确删除理由")
+
+    broken = json.loads(json.dumps(returns, ensure_ascii=False))
+    for package in broken:
+        for item in package["turns"]:
+            if item["turn_id"] == second_turn_id:
+                item.pop("reference_omission_reason", None)
+    try:
+        assemble_returns(manifest, broken)
+    except ValueError as exc:
+        if "reference_omission_reason" not in str(exc):
+            errors.append("空参考原文片段缺少理由时错误信息不明确")
+    else:
+        errors.append("空参考原文片段缺少理由时必须拒绝组装")
+    return errors, []
+
+
+def check_asr_performance_helper(scenario: str) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    if scenario == "pcm_slice":
+        with tempfile.TemporaryDirectory(prefix="meeting-asr-regression-") as tmp:
+            source = Path(tmp) / "normalized.wav"
+            output = Path(tmp) / "segment.wav"
+            with wave.open(str(source), "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(16_000)
+                audio.writeframes(b"\x01\x00" * 32_000)
+            _audio_segment_to_wav(source, output, 250, 1_250)
+            with wave.open(str(output), "rb") as segment:
+                if segment.getnchannels() != 1 or segment.getframerate() != 16_000:
+                    errors.append("PCM 分段必须保持 mono/16k 参数")
+                if segment.getnframes() != 16_000:
+                    errors.append(f"1 秒 PCM 分段帧数错误: {segment.getnframes()}")
+    elif scenario == "segment_batch":
+        class FakeBatchModel:
+            def __init__(self) -> None:
+                self.calls: list[Any] = []
+
+            def generate(self, *, input: Any, **_: Any) -> list[dict[str, str]]:
+                self.calls.append(input)
+                if not isinstance(input, list):
+                    raise AssertionError("expected one batched input list")
+                return [{"text": Path(item).stem} for item in input]
+
+        model = FakeBatchModel()
+        paths = [Path(f"segment_{index:05d}.wav") for index in range(8)]
+        results, mode = _generate_sensevoice_segment_results(model, paths, "zh")
+        if mode != "dynamic_batch" or len(model.calls) != 1 or len(results) != len(paths):
+            errors.append("SenseVoice VAD segments 必须优先通过一次 native dynamic batch 调用")
+    elif scenario == "segment_failure_terminal":
+        class AlwaysFailModel:
+            def generate(self, *, input: Any, **_: Any) -> list[dict[str, str]]:
+                raise RuntimeError(f"segment inference failed: {input}")
+
+        try:
+            _generate_sensevoice_segment_results(
+                AlwaysFailModel(),
+                [Path("segment_00000.wav")],
+                "zh",
+            )
+        except RuntimeError as exc:
+            if "batch and sequential segment inference both failed" not in str(exc):
+                errors.append("segment 推理失败应保留 batch 与 sequential 错误证据")
+        else:
+            errors.append("batch 与 sequential 都失败时必须明确失败，不得静默降级")
+    else:
+        errors.append(f"未知 ASR performance helper scenario: {scenario}")
     return errors, []
 
 
@@ -172,7 +331,12 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         elif check == "partition":
             errors, warnings = check_partition(str(case.get("scenario") or ""))
         elif check == "assembly":
-            errors, warnings = check_assembly()
+            if case.get("scenario") == "structured":
+                errors, warnings = check_structured_assembly()
+            else:
+                errors, warnings = check_assembly()
+        elif check == "asr_performance_helper":
+            errors, warnings = check_asr_performance_helper(str(case.get("scenario") or ""))
         else:
             errors.append(f"未知 check: {check}")
     except Exception as exc:

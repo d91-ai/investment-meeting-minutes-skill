@@ -98,6 +98,33 @@ def asr_runtime_python() -> Path:
     return Path(sys.executable)
 
 
+def asr_ffmpeg_check(*, strict: bool, python_executable: Path) -> dict[str, Any]:
+    probe = """
+import shutil
+
+path = shutil.which("ffmpeg")
+if not path:
+    try:
+        import imageio_ffmpeg
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        path = ""
+print(path or "")
+raise SystemExit(0 if path else 1)
+"""
+    returncode, stdout, stderr = run_command([str(python_executable), "-c", probe], timeout=20)
+    if returncode == 0 and stdout.strip():
+        return check("ok", "音频解码: ffmpeg", "ASR runtime 可解析 ffmpeg", path=stdout.strip())
+    status = "error" if strict else "warning"
+    return check(
+        status,
+        "音频解码: ffmpeg",
+        "ASR runtime 找不到 ffmpeg，也无法通过 imageio-ffmpeg 提供；正式转写会失败",
+        python=str(python_executable),
+        stderr=stderr.strip(),
+    )
+
+
 def document_runtime_python() -> Path:
     if DEFAULT_DOCUMENT_PYTHON_VALUE:
         candidate = Path(DEFAULT_DOCUMENT_PYTHON_VALUE).expanduser()
@@ -150,7 +177,7 @@ def asr_model_cache_check(*, strict: bool) -> dict[str, Any]:
         )
 
     models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
-    required_model_names = {"sensevoice", "paraformer", "vad"}
+    required_model_names = {"sensevoice", "vad"}
     required_incomplete = {
         name: model if isinstance(model, dict) else {"complete": False, "missing": ["not reported"]}
         for name in required_model_names
@@ -161,7 +188,7 @@ def asr_model_cache_check(*, strict: bool) -> dict[str, Any]:
         return check(
             "ok",
             "ASR 模型缓存",
-            "SenseVoice 主模型、Paraformer 辅助模型和 fsmn-vad 模型缓存完整",
+            "SenseVoice 主模型和 fsmn-vad 模型缓存完整",
             cache_root=payload.get("cache_root"),
             models=models,
         )
@@ -169,7 +196,7 @@ def asr_model_cache_check(*, strict: bool) -> dict[str, Any]:
     return check(
         status,
         "ASR 模型缓存",
-        "SenseVoice/Paraformer/fsmn-vad 模型缓存不完整；运行期禁止远程查找或下载模型",
+        "SenseVoice/fsmn-vad 模型缓存不完整；运行期禁止远程查找或下载模型",
         cache_root=payload.get("cache_root"),
         incomplete=required_incomplete,
         stderr=stderr.strip(),
@@ -188,7 +215,7 @@ def sensevoice_service_model_cache_check(*, strict: bool) -> dict[str, Any]:
 
     model_cache = payload.get("model_cache") if isinstance(payload.get("model_cache"), dict) else {}
     models = model_cache.get("models") if isinstance(model_cache.get("models"), dict) else {}
-    required_model_names = {"sensevoice", "paraformer", "vad"}
+    required_model_names = {"sensevoice", "vad"}
     required_incomplete = {
         model_name: model if isinstance(model, dict) else {"complete": False, "missing": ["not reported"]}
         for model_name in required_model_names
@@ -199,7 +226,7 @@ def sensevoice_service_model_cache_check(*, strict: bool) -> dict[str, Any]:
         return check(
             "ok",
             name,
-            "服务使用的 SenseVoice 主模型、Paraformer 辅助模型和 fsmn-vad 模型缓存完整",
+            "服务使用的 SenseVoice 主模型和 fsmn-vad 模型缓存完整",
             cache_root=model_cache.get("cache_root"),
             python=model_cache.get("python"),
         )
@@ -207,7 +234,7 @@ def sensevoice_service_model_cache_check(*, strict: bool) -> dict[str, Any]:
     return check(
         status,
         name,
-        "服务使用的 SenseVoice/Paraformer/fsmn-vad 模型缓存不完整；运行期禁止远程下载模型",
+        "服务使用的 SenseVoice/fsmn-vad 模型缓存不完整；运行期禁止远程下载模型",
         cache_root=model_cache.get("cache_root"),
         python=model_cache.get("python"),
         incomplete=required_incomplete,
@@ -276,8 +303,6 @@ def sensevoice_service_smoke_check(*, strict: bool) -> dict[str, Any]:
             engine=payload.get("engine"),
             model=payload.get("model"),
             timestamp_detected=payload.get("timestamp_detected"),
-            auxiliary_ok=payload.get("auxiliary_ok"),
-            auxiliary_status=payload.get("auxiliary_status"),
             text_preview=str(payload.get("text") or "")[:80],
         )
     status = "error" if strict else "warning"
@@ -375,6 +400,7 @@ def asr_checks(strict: bool, *, runtime_smoke: bool) -> list[dict[str, Any]]:
         python_module_check(name, module, strict=strict, python_executable=runtime_python)
         for name, module in ASR_RUNTIME_MODULES
     ]
+    checks.append(asr_ffmpeg_check(strict=strict, python_executable=runtime_python))
     checks.append(asr_model_cache_check(strict=strict))
     checks.append(sensevoice_service_model_cache_check(strict=strict))
     if runtime_smoke:

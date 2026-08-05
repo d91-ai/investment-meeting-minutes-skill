@@ -16,7 +16,7 @@
       "id": "long_material_workflow",
       "check": "text_contains",
       "file": "../long_material_workflow.md",
-      "required_terms": ["短材料由主流程直接生成双正文，不启用 MAS", "12,000", "16,000", "完整问题", "脚本只负责字符统计、顺序和覆盖"]
+      "required_terms": ["短材料由主流程直接生成双正文，不启用 MAS", "12,000", "16,000", "完整问题", "脚本只负责字符统计、顺序和覆盖", "不得直接引用输入", "allowed_break_turn_ids", "schema v1.1"]
     },
 
     {"id": "text_only", "check": "markdown", "source_mode": "document_only", "file": "text_only.md", "required_terms": ["中芯国际", "订单能见度改善", "没有加仓"]},
@@ -61,6 +61,12 @@
     {"id": "partition_oversized_group_fallback", "check": "partition", "scenario": "oversized"},
     {"id": "partition_exact_order_and_coverage", "check": "partition", "scenario": "coverage"},
     {"id": "partition_timestamped_speaker_labels", "check": "partition", "scenario": "timestamped_labels"},
-    {"id": "long_material_assembly", "check": "assembly"}
+    {"id": "partition_balanced_allowed_boundaries", "check": "partition", "scenario": "balanced_allowed"},
+    {"id": "partition_balanced_respects_allowed_boundaries", "check": "partition", "scenario": "balanced_respects_allowed"},
+    {"id": "long_material_assembly", "check": "assembly"},
+    {"id": "long_material_structured_assembly", "check": "assembly", "scenario": "structured"},
+    {"id": "asr_pcm_segment_slice", "check": "asr_performance_helper", "scenario": "pcm_slice"},
+    {"id": "asr_segment_failure_terminal", "check": "asr_performance_helper", "scenario": "segment_failure_terminal"},
+    {"id": "asr_segment_dynamic_batch", "check": "asr_performance_helper", "scenario": "segment_batch"}
   ]
 }

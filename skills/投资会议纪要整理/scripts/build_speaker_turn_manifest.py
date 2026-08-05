@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Iterable
@@ -217,11 +218,145 @@ def _packages_from_breaks(
     return packages
 
 
+def _balanced_packages_from_allowed_breaks(
+    turns: list[dict[str, Any]],
+    target_chars: int,
+    hard_limit_chars: int,
+    allowed_break_turn_ids: list[str],
+) -> list[list[dict[str, Any]]]:
+    """Choose balanced packages without crossing model-confirmed boundaries.
+
+    ``allowed_break_turn_ids`` identifies turns that may start a new package;
+    the first turn is always an implicit package start and the end of the
+    source is always an implicit final boundary.  The number of packages is
+    fixed by the total turn length and target size.  Among legal partitions we
+    minimize the largest package first, then the sum of absolute deviations
+    from the equal-share size (``total_chars / package_count``).  Failing to
+    find a hard-limit-safe partition is an error rather than a fallback to an
+    illegal boundary.
+    """
+
+    if not turns:
+        return []
+    if not isinstance(allowed_break_turn_ids, list) or not all(
+        isinstance(item, str) and item.strip() for item in allowed_break_turn_ids
+    ):
+        raise ValueError("allowed_break_turn_ids 必须是非空字符串 turn_id JSON array")
+    ids = [str(turn["turn_id"]) for turn in turns]
+    if len(allowed_break_turn_ids) != len(set(allowed_break_turn_ids)):
+        raise ValueError("allowed_break_turn_ids 包含重复 turn_id")
+    unknown = [item for item in allowed_break_turn_ids if item not in ids]
+    if unknown:
+        raise ValueError("allowed_break_turn_ids 包含未知 turn_id: " + ", ".join(unknown))
+
+    total_chars = sum(int(turn["char_count"]) for turn in turns)
+    package_count = max(1, math.ceil(total_chars / target_chars))
+    if package_count == 1:
+        if total_chars > hard_limit_chars:
+            raise ValueError("单包超过 hard limit，且无法在合法边界中切分")
+        return [turns]
+
+    # A legal break is a package-start index.  Sort the model-provided set so
+    # callers may provide JSON in any order while retaining deterministic cuts.
+    legal_positions = {0}
+    legal_positions.update(ids.index(item) for item in allowed_break_turn_ids)
+    legal_positions.update({len(turns)})
+    positions = sorted(legal_positions)
+    if len(positions) - 1 < package_count:
+        raise ValueError(
+            "allowed_break_turn_ids 不足以形成所需 package_count="
+            f"{package_count}"
+        )
+
+    prefix = [0]
+    for turn in turns:
+        prefix.append(prefix[-1] + int(turn["char_count"]))
+
+    # First solve the minimax partition. For a fixed endpoint and package
+    # count, the smallest achievable maximum is safe to retain: any larger
+    # prefix maximum can never improve a future maximum.
+    max_states: list[dict[int, int]] = [{} for _ in range(package_count + 1)]
+    max_states[0][0] = 0
+    for count in range(1, package_count + 1):
+        for end in positions:
+            if end == 0 or end < count or end > len(turns):
+                continue
+            # Leave at least one legal endpoint for every remaining package.
+            end_position = positions.index(end)
+            remaining_packages = package_count - count
+            if len(positions) - end_position - 1 < remaining_packages:
+                continue
+            best_max: int | None = None
+            for start in positions:
+                if start >= end:
+                    break
+                previous = max_states[count - 1].get(start)
+                if previous is None:
+                    continue
+                size = prefix[end] - prefix[start]
+                if size > hard_limit_chars:
+                    continue
+                candidate_max = max(previous, size)
+                if best_max is None or candidate_max < best_max:
+                    best_max = candidate_max
+            if best_max is not None:
+                max_states[count][end] = best_max
+
+    optimal_max = max_states[package_count].get(len(turns))
+    if optimal_max is None:
+        raise ValueError(
+            "allowed_break_turn_ids 无法在 hard limit 内形成 "
+            f"{package_count} 个 package"
+        )
+
+    # With the optimal maximum fixed, minimize the additive equal-share
+    # deviation. Scaling by package_count keeps the objective integral:
+    # abs(size - total_chars / package_count) * package_count.
+    deviation_states: list[dict[int, tuple[int, tuple[int, ...]]]] = [
+        {} for _ in range(package_count + 1)
+    ]
+    deviation_states[0][0] = (0, ())
+    for count in range(1, package_count + 1):
+        for end in positions:
+            if end == 0 or end < count or end > len(turns):
+                continue
+            end_position = positions.index(end)
+            remaining_packages = package_count - count
+            if len(positions) - end_position - 1 < remaining_packages:
+                continue
+            best: tuple[int, tuple[int, ...]] | None = None
+            for start in positions:
+                if start >= end:
+                    break
+                previous = deviation_states[count - 1].get(start)
+                if previous is None:
+                    continue
+                size = prefix[end] - prefix[start]
+                if size > optimal_max:
+                    continue
+                candidate = (
+                    previous[0] + abs(size * package_count - total_chars),
+                    previous[1] + (end,),
+                )
+                if best is None or candidate < best:
+                    best = candidate
+            if best is not None:
+                deviation_states[count][end] = best
+
+    final = deviation_states[package_count].get(len(turns))
+    if final is None:
+        raise ValueError("无法在最优最大包限制内完成均衡分包")
+    cut_positions = final[1][:-1]
+    boundaries = (0,) + cut_positions + (len(turns),)
+    return [turns[start:end] for start, end in zip(boundaries, boundaries[1:])]
+
+
 def package_turns(
     turns: list[dict[str, Any]],
     target_chars: int = DEFAULT_TARGET_CHARS,
     hard_limit_chars: int = DEFAULT_HARD_LIMIT_CHARS,
     package_breaks: list[str] | None = None,
+    allowed_break_turn_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     if target_chars <= 0 or hard_limit_chars < target_chars:
         raise ValueError("字符阈值必须满足 0 < target_chars <= hard_limit_chars")
@@ -230,6 +365,13 @@ def package_turns(
 
     if package_breaks is not None:
         raw_packages = _packages_from_breaks(turns, package_breaks, hard_limit_chars)
+    elif allowed_break_turn_ids is not None:
+        raw_packages = _balanced_packages_from_allowed_breaks(
+            turns,
+            target_chars,
+            hard_limit_chars,
+            allowed_break_turn_ids,
+        )
     else:
         raw_packages: list[list[dict[str, Any]]] = []
         current: list[dict[str, Any]] = []
@@ -271,6 +413,7 @@ def build_manifest(
     hard_limit_chars: int = DEFAULT_HARD_LIMIT_CHARS,
     known_speakers: Iterable[str] = (),
     package_breaks: list[str] | None = None,
+    allowed_break_turn_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     if not source.strip():
         raise ValueError("来源文本为空")
@@ -281,19 +424,32 @@ def build_manifest(
     packages = (
         []
         if mode == "direct"
-        else package_turns(turns, target_chars, hard_limit_chars, package_breaks)
+        else package_turns(
+            turns,
+            target_chars,
+            hard_limit_chars,
+            package_breaks,
+            allowed_break_turn_ids,
+        )
     )
+    routing = {
+        "mode": mode,
+        "target_chars": target_chars,
+        "hard_limit_chars": hard_limit_chars,
+        "total_length_is_unbounded": True,
+    }
+    if mode == "sharded" and allowed_break_turn_ids is not None and package_breaks is None:
+        routing["allowed_break_turn_ids"] = list(allowed_break_turn_ids)
+        routing["balanced_package_count"] = max(
+            1,
+            math.ceil(sum(int(turn["char_count"]) for turn in turns) / target_chars),
+        )
     return {
         "schema_version": "1.0",
         "source_name": Path(source_name).name,
         "source_sha256": sha256_text(source),
         "source_char_count": source_char_count,
-        "routing": {
-            "mode": mode,
-            "target_chars": target_chars,
-            "hard_limit_chars": hard_limit_chars,
-            "total_length_is_unbounded": True,
-        },
+        "routing": routing,
         "turns": turns,
         "packages": packages,
         "requires_semantic_boundary_review": len(packages) > 1,
@@ -308,6 +464,12 @@ def main() -> int:
     parser.add_argument("--hard-limit-chars", type=int, default=DEFAULT_HARD_LIMIT_CHARS)
     parser.add_argument("--known-speaker", action="append", default=[])
     parser.add_argument("--package-breaks", type=Path, help="模型确认的 package 起始 turn_id JSON array")
+    parser.add_argument(
+        "--allowed-break-turn-ids",
+        "--allowed-breaks",
+        dest="allowed_break_turn_ids",
+        help="模型确认的可切包起始 turn_id JSON array（文件路径或内联 JSON）",
+    )
     args = parser.parse_args()
 
     try:
@@ -318,6 +480,17 @@ def main() -> int:
             if not isinstance(loaded, list) or not all(isinstance(item, str) for item in loaded):
                 raise ValueError("package_breaks 必须是 turn_id JSON array")
             package_breaks = loaded
+        allowed_break_turn_ids = None
+        if args.allowed_break_turn_ids:
+            allowed_argument = args.allowed_break_turn_ids.strip()
+            if allowed_argument.startswith("["):
+                raw_allowed = allowed_argument
+            else:
+                raw_allowed = Path(allowed_argument).read_text(encoding="utf-8")
+            loaded = json.loads(raw_allowed)
+            if not isinstance(loaded, list) or not all(isinstance(item, str) for item in loaded):
+                raise ValueError("allowed_break_turn_ids 必须是 turn_id JSON array")
+            allowed_break_turn_ids = loaded
         manifest = build_manifest(
             source,
             source_name=args.source.name,
@@ -325,6 +498,7 @@ def main() -> int:
             hard_limit_chars=args.hard_limit_chars,
             known_speakers=args.known_speaker,
             package_breaks=package_breaks,
+            allowed_break_turn_ids=allowed_break_turn_ids,
         )
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

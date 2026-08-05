@@ -23,8 +23,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 TRANSCRIBE_SCRIPT = SCRIPT_DIR / "transcribe_audio.py"
 DEFAULT_PRIMARY_ENGINE = "sensevoice"
 DEFAULT_PRIMARY_MODEL = "iic/SenseVoiceSmall"
-DEFAULT_AUXILIARY_ENGINE = "paraformer"
-DEFAULT_AUXILIARY_MODEL = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
 DEFAULT_VAD_MODEL = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 DEFAULT_MODEL_CACHE = os.environ.get(
     "SENSEVOICE_MODEL_CACHE",
@@ -50,7 +48,6 @@ TRANSCRIBE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
 LOG_DIR = Path(os.environ.get("KUMAAI_SYNC_LOG_DIR", str(Path.home() / "Library/Logs/kumaai-sync")))
 MODEL_REQUIREMENTS = {
     "sensevoice": ("iic/SenseVoiceSmall", ("config.yaml", "model.pt")),
-    "paraformer": (DEFAULT_AUXILIARY_MODEL, ("config.yaml", "model.pt")),
     "vad": (DEFAULT_VAD_MODEL, ("config.yaml", "model.pt")),
 }
 
@@ -179,15 +176,6 @@ def _clean_filename(filename: str | None) -> str:
     return "".join(keep).strip() or "audio_upload"
 
 
-def _field_text(form: MultipartForm, key: str, default: str = "") -> str:
-    if key not in form:
-        return default
-    value = form.getvalue(key)
-    if isinstance(value, list):
-        value = value[0] if value else default
-    return str(value or default).strip()
-
-
 def _read_transcript_txt(output_dir: Path, stem: str) -> str:
     text_path = output_dir / f"{stem}.txt"
     return text_path.read_text(encoding="utf-8", errors="replace").strip() if text_path.exists() else ""
@@ -250,8 +238,6 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
                     "model": DEFAULT_PRIMARY_MODEL,
                     "primary_engine": DEFAULT_PRIMARY_ENGINE,
                     "primary_model": DEFAULT_PRIMARY_MODEL,
-                    "auxiliary_engine": DEFAULT_AUXILIARY_ENGINE,
-                    "auxiliary_model": DEFAULT_AUXILIARY_MODEL,
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                     "max_concurrent_transcriptions": MAX_CONCURRENT_TRANSCRIPTIONS,
                     "model_cache": _model_cache_status(),
@@ -301,7 +287,6 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             _json_response(self, 400, {"ok": False, "error": str(exc), "text": ""})
             return
-
         filename = _clean_filename(file_item.filename)
         suffix = Path(filename).suffix or ".audio"
         with tempfile.TemporaryDirectory(prefix="sensevoice-local-") as tmp:
@@ -354,17 +339,7 @@ class SenseVoiceHandler(BaseHTTPRequestHandler):
                 # consumed; callers must use the inline timestamp_index.
                 "timestamp_index_path": "",
                 "timestamp_index_source": primary_json.get("timestamp_index_source") or "",
-                "auxiliary_engine": primary_json.get("auxiliary_engine") or "",
-                "auxiliary_model": primary_json.get("auxiliary_model") or "",
-                "auxiliary_text": primary_json.get("auxiliary_text") or "",
-                "auxiliary_ok": bool(primary_json.get("auxiliary_ok")),
-                "auxiliary_status": primary_json.get("auxiliary_status") or "",
-                "asr_comparison_diff": primary_json.get("asr_comparison_diff") or "",
-                "auxiliary_transcripts": {
-                    "paraformer": primary_json.get("auxiliary_text") or "",
-                }
-                if primary_json.get("auxiliary_text")
-                else {},
+                "sensevoice_inference_mode": primary_json.get("sensevoice_inference_mode") or "",
             }
             if not primary_ok:
                 payload["error"] = primary_error or "SenseVoice transcription failed"

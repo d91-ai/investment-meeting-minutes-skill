@@ -8,8 +8,12 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "skills/投资会议纪要整理/scripts"))
 
 from archive_raw_inputs import (
     DEFAULT_ARCHIVE_ROOT,
@@ -128,6 +132,10 @@ def main() -> int:
     args = parser.parse_args()
 
     archive_root = Path(args.archive_root).expanduser().resolve()
+    if not archive_root.exists():
+        parser.error(f"归档根目录不存在: {archive_root}")
+    if not archive_root.is_dir():
+        parser.error(f"归档根路径不是目录: {archive_root}")
     moves = organize(archive_root, args.date, args.apply)
     for source, target in moves:
         action = "MOVE" if args.apply else "DRY-RUN"

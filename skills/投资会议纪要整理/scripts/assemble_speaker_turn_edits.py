@@ -24,15 +24,7 @@ def _normalize_reference_segments(
 ) -> list[dict[str, str]]:
     raw_segments = item.get("reference_segments")
     if raw_segments is None:
-        reference_text = item.get("reference_text")
-        if not isinstance(reference_text, str) or not reference_text.strip():
-            raise ValueError(f"{turn_id}.reference_text 必须是非空字符串")
-        return [
-            {
-                "speaker_label": default_speaker,
-                "text": reference_text.strip(),
-            }
-        ]
+        raise ValueError(f"{turn_id}.reference_segments 必须是 JSON array")
     if not isinstance(raw_segments, list):
         raise ValueError(f"{turn_id}.reference_segments 必须是 JSON array")
 
@@ -64,13 +56,7 @@ def _normalize_minutes_segments(
 ) -> list[dict[str, str]]:
     raw_segments = item.get("minutes_segments")
     if raw_segments is None:
-        minutes_text = item.get("minutes_text")
-        if not isinstance(minutes_text, str):
-            raise ValueError(f"{turn_id}.minutes_text 必须是字符串")
-        text = minutes_text.strip()
-        return [
-            {"kind": "paragraph", "speaker_label": default_speaker, "text": text}
-        ] if text else []
+        raise ValueError(f"{turn_id}.minutes_segments 必须是 JSON array")
     if not isinstance(raw_segments, list):
         raise ValueError(f"{turn_id}.minutes_segments 必须是 JSON array")
 
@@ -104,8 +90,6 @@ def _normalize_minutes_segments(
 
 
 def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    if manifest.get("routing", {}).get("mode") != "sharded":
-        raise ValueError("只有 sharded 长材料需要组装 package returns")
     turns = manifest.get("turns")
     packages = manifest.get("packages")
     if not isinstance(turns, list) or not isinstance(packages, list) or not packages:
@@ -156,7 +140,7 @@ def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]
             minutes_segments = _normalize_minutes_segments(item, turn_id, default_speaker)
             reference_omission_reason = item.get("reference_omission_reason")
             minutes_omission_reason = item.get("minutes_omission_reason")
-            if "reference_segments" in item and not reference_segments and (
+            if not reference_segments and (
                 not isinstance(reference_omission_reason, str) or not reference_omission_reason.strip()
             ):
                 raise ValueError(
@@ -190,8 +174,7 @@ def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]
         raise ValueError("组装结果未按来源顺序完整覆盖所有 turn")
 
     return {
-        "schema_version": "1.1",
-        "source_sha256": str(manifest.get("source_sha256") or ""),
+        "schema_version": "1.0",
         "turns": ordered,
         "coverage": {
             "complete": True,

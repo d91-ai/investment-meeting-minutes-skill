@@ -47,8 +47,6 @@ SENSEVOICE_MANAGED_OUTPUT_SUFFIXES = (
     ".txt",
     ".json",
     ".timestamp_index.json",
-    ".paraformer.txt",
-    ".paraformer.timestamp_index.json",
 )
 
 
@@ -892,12 +890,6 @@ def main() -> int:
         help="转录文件输出目录，默认当前目录",
     )
     parser.add_argument(
-        "--engine",
-        default="auto",
-        choices=["auto", "sensevoice"],
-        help="兼容旧调用的主 ASR 引擎参数；主转写固定使用 SenseVoice",
-    )
-    parser.add_argument(
         "--model",
         default=DEFAULT_SENSEVOICE_MODEL,
         help="SenseVoice 模型名，默认 iic/SenseVoiceSmall",
@@ -963,19 +955,15 @@ def main() -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.engine in {"auto", "sensevoice"}:
-        return _run_sensevoice(
-            input_file=input_file,
-            output_dir=output_dir,
-            model_name=args.model,
-            language=args.language,
-            output_format=args.output_format,
-            allow_remote_model_lookup=args.allow_remote_model_lookup,
-            include_raw_json=args.debug_raw_json,
-        )
-
-    print("未知 ASR 引擎；只能使用 SenseVoice。", file=sys.stderr)
-    return 2
+    return _run_sensevoice(
+        input_file=input_file,
+        output_dir=output_dir,
+        model_name=args.model,
+        language=args.language,
+        output_format=args.output_format,
+        allow_remote_model_lookup=args.allow_remote_model_lookup,
+        include_raw_json=args.debug_raw_json,
+    )
 
 
 if __name__ == "__main__":

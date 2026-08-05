@@ -16,11 +16,12 @@
 
 1. 读取文稿；有音频时使用本地 SenseVoiceSmall＋fsmn-vad 完成一次转录与时间轴准备，不再对整场音频运行第二套 ASR。
 2. 音频和文稿同时存在时，由主流程比较覆盖、顺序、逐字性、噪声、遗漏和人工修正后选择正文源。
-3. 统计选定正文源的字符数。
-4. 约 12,000 字以内由主流程直接生成双正文，不启用 MAS。
-5. 超过约 12,000 字时，模型确认发言轮次和合法 Q&A 边界，脚本在合法边界中均衡分包；输入不必预先标注发言人，无法确认身份时使用匿名编号。16,000 字只限制单包，不限制会议总长度。
-6. 长材料包内完成混合问答、短回复和双正文整理；主流程直接组装，并只对跨包衔接与具体风险做一次全局语义复核。
-7. 运行 UTF-8 和 Markdown 结构校验后导出。
+3. 根据上下文耦合和延迟选择路线：强连续上下文且容量允许时直接生成；存在清晰独立板块或完整 Q&A 边界时可用少量并行段。不使用固定字数路由。
+4. 分段只发生在自然段、发言轮次或完整 Q&A 之间。脚本只做线性容量分包，不生成全文预标注副本，也不求全局最优。
+5. 无发言人标签时，基模在生成正文的同一次处理中判断保守的匿名轮次。
+6. 每段完成来源对照后直接定稿；主流程只处理接缝、格式、统一实体写法和具体冲突，不再进行第二轮全文语义复核。
+7. 存疑候选先检查其在整场会议中的全部出现位置和相关上下文；仍未解决的公开身份问题先做定向查询，查询后仍不唯一才进入存疑。
+8. 运行 UTF-8 和 Markdown 客观结构校验。归档和 Obsidian 导出仅在用户明确要求时执行。
 
 语病修正、无用信息、重复、短回复归属、问答边界、实体唯一性、标的归因和原意漂移都由模型结合上下文判断。脚本不使用关键词或硬规则替代这些语义判断。
 
@@ -32,10 +33,10 @@
 - `references/verification_policy.md`：名称、代码、术语核验边界。
 - `references/long_material_workflow.md`：仅长材料加载的轻量分包流程。
 - `scripts/transcribe_audio.py`：本地 ASR。
-- `scripts/build_speaker_turn_manifest.py`：长材料 turn 与建议包规划。
+- `scripts/build_speaker_turn_manifest.py`：显式 turn 解析与线性容量分包。
 - `scripts/assemble_speaker_turn_edits.py`：长材料返回的顺序和覆盖检查。
 - `scripts/validate_meeting_minutes_contract.py`：客观 Markdown 结构校验。
-- `scripts/export_to_obsidian.py`：本地 Markdown 导出。
+- `tools/meeting_minutes/`：不进入安装 Skill 的可选归档、导出和历史迁移工具。
 
 ## 开发验证
 
@@ -43,7 +44,7 @@
 
 ```bash
 python3 skills/投资会议纪要整理/scripts/validate_utf8_text.py README.md skills/投资会议纪要整理 --recursive --portable-skill
-python3 skills/投资会议纪要整理/scripts/run_meeting_minutes_regression.py --json
+python3 tests/meeting_minutes/run_regression.py --json
 ```
 
 验证具体纪要：
@@ -53,12 +54,10 @@ python3 skills/投资会议纪要整理/scripts/validate_utf8_text.py NOTE.md --
 python3 skills/投资会议纪要整理/scripts/validate_meeting_minutes_contract.py NOTE.md --json
 ```
 
-运行环境检查：
+首次使用音频或机器环境改变后，只检查本地模型缓存：
 
 ```bash
-python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile asr --strict
-python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile document
-python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile export
+python3 skills/投资会议纪要整理/scripts/transcribe_audio.py --check-model-cache
 ```
 
 ## 隐私边界

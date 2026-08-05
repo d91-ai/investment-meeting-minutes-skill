@@ -1,6 +1,6 @@
 ---
 name: investment-meeting-minutes
-description: "Use when Codex needs to turn a Chinese investment meeting recording, transcript, DOCX/TXT/Markdown document, or mixed audio+text materials into source-faithful Markdown meeting minutes with a concise meeting-minutes section, a lightly cleaned reference-original section, speaker/Q&A preservation, entity correction, optional doubtful items, archiving, and local export."
+description: "Use when Codex needs to turn a Chinese investment meeting recording, transcript, DOCX/TXT/Markdown document, or mixed audio+text materials into source-faithful Markdown meeting minutes with a concise meeting-minutes section, a lightly cleaned reference-original section, speaker/Q&A preservation, entity correction, and optional doubtful items."
 ---
 
 # Investment Meeting Minutes
@@ -25,20 +25,17 @@ Both bodies preserve real order, speaker perspective, first person, logic, uncer
 - Never use public evidence to confirm or reject private customer relationships, orders, capacity, prices, figures, forecasts, internal progress, or other statements made in the meeting.
 - If the user requests read-only analysis, no archive, no file writes, or a feasibility discussion, do not archive, export, or modify files.
 
-## Routing by material length
+## Routing by context and latency
 
-Measure the selected source text before body generation.
+Use `direct` when the selected source and both required bodies fit reliably in one model pass and the meeting depends on continuous global context. Use a few parallel source spans when the material has clean independent sections or complete Q&A boundaries and parallel generation will materially reduce latency. Do not route by a fixed character threshold.
 
-- At or below about 12,000 Chinese characters: use `direct`. The main workflow produces both bodies in one pass. Do not start MAS or body-editor subagents.
-- Above about 12,000 characters: use the long-material workflow in `references/long_material_workflow.md`.
-- The 16,000-character hard limit applies to one package, never to the whole meeting. Long meetings must continue through as many packages as necessary.
-- Package complete Q&A or continuous-answer groups whenever possible. Among model-approved boundaries, balance package sizes so one large package does not determine the whole parallel critical path. A deterministic script may choose among approved boundaries and check order, capacity, and complete coverage, but the model decides which boundaries are semantically valid.
+Use `references/long_material_workflow.md` when one pass is unsafe or clean independent spans make parallel generation faster. Split once at natural paragraph, speaker-turn, or complete Q&A boundaries while reading the source. Do not create a separate full-source speaker-labeling copy or solve a globally optimal package plan.
 
 ## Workflow
 
 ### 1. Prepare sources
 
-Archive raw files with `scripts/archive_raw_inputs.py` before transcription or writing unless the user has disabled writes or archive. Read `references/archive_naming_contract.md` when resolving final filenames.
+Archiving is not part of the base workflow and is never a prerequisite for transcription or writing. Handle an explicit archive request as a separate local-delivery task after the note is complete.
 
 Source modes:
 
@@ -52,7 +49,7 @@ Use UTF-8 without BOM for Markdown, TXT, JSON, CSV, TSV, and YAML. Python text I
 
 Use `scripts/transcribe_audio.py`: SenseVoiceSmall produces the transcript and fsmn-vad provides the global short-segment timeline. Do not run a second full-audio ASR. Resolve names, terms, numbers, and abbreviations from current-session context and permitted identity evidence; preserve genuinely unclear audio as doubtful. Do not use Whisper as a fallback.
 
-Before first use, machine changes, or production-like audio, read `references/runtime_readiness_guide.md` and run the relevant `scripts/check_investment_workflow_health.py` profile.
+Before first audio use or after a machine change, run `python3 scripts/transcribe_audio.py --check-model-cache`. This is a deployment check, not a per-meeting gate.
 
 Timestamp rules and reliable-anchor requirements remain in `references/output_contract.md`.
 
@@ -60,15 +57,15 @@ Timestamp rules and reliable-anchor requirements remain in `references/output_co
 
 Use the model to inspect short replies, mixed-speaker lines, answer-to-next-question transitions, and ambiguous labels before editing. Explicit speaker labels are evidence, not an input requirement. When labels are absent, infer only the turn or Q&A boundary supported by discourse context and use conservative `发言人1/2/...` labels when identity is uncertain. Never mechanically assign a short reply to the previous speaker or invent an identity.
 
-For long material with reliable explicit labels, `scripts/build_speaker_turn_manifest.py` may parse them and propose capacity-bounded packages. Pass model-confirmed names through `--known-speaker` when the source uses named labels. When labels are missing or unreliable, the main model first makes a source-ordered working copy that adds only conservative anonymous turn/Q&A boundaries without cleaning or rewriting the source wording; then build the manifest from that copy. Review candidate package boundaries semantically, pass only valid Q&A boundaries back to the script, and let it choose a balanced package plan. A normal question and its answer should remain together. Do not add a deterministic speaker classifier or infer personal identity in the script.
+When long material has reliable explicit labels, `scripts/build_speaker_turn_manifest.py` may parse them and make a linear capacity-bounded package plan. Pass model-confirmed names through `--known-speaker` when the source uses named labels. When labels are missing or unreliable, do not create a second full-source working copy: infer conservative anonymous turns while processing each source span and preserve label continuity across adjacent spans. A normal question and its answer should remain together. Do not add a deterministic speaker classifier or infer personal identity in the script.
 
 ### 4. Resolve names, codes, and terms
 
 Follow `references/verification_policy.md`.
 
-- Start with meeting context and user corrections.
-- Query only genuinely unresolved names, codes, and terms. `scripts/query_symbol_candidates.py` supplies candidates, not final truth.
-- Batch related lookups when useful. Send external tools only the candidate and necessary public aliases, never private meeting excerpts or relationship context.
+- Do not finalize a doubtful item from package-local context. For each candidate, inspect every occurrence and the relevant surrounding passages across the current meeting before deciding.
+- Start with meeting context and user corrections. Close anything that the current session identifies uniquely, including obvious ASR forms constrained by nearby explanations, numbers, or parallel terms.
+- For a still-unresolved public company, institution, security code, product, technology, model, or abbreviation, use available local candidates or a targeted external lookup before adding it to `doubtful_items`. Batch the small unresolved set when useful. `scripts/query_symbol_candidates.py` supplies candidates, not final truth. Send external tools only the candidate and necessary public aliases, never private meeting excerpts or relationship context.
 - Correct a form only when current-session evidence or identity evidence makes the correction unique. Otherwise preserve the source fragment and add one `doubtful_items` record.
 - Do not build a full entity inventory, candidate manifest, reason-code state machine, verification shard, or assembly receipt.
 
@@ -84,15 +81,15 @@ Generate both sections from the same ordered source turns.
 
 For `会议纪要`, correct grammar and remove only content that adds no distinct information in context. Keep useful examples, reasons, conditions, comparisons, emphasis, uncertainty, numbers, timing, actions, and Q&A order. Adjacent same-speaker turns inside one continuous answer may become consecutive paragraphs; never merge different speakers.
 
-For `参考原文`, apply only light cleanup. Account for every source turn and do not apply the stronger condensation used in `会议纪要`. A wholly meaningless turn may produce no body text. In long-material package returns, record the omission reason so the main model can review the deletion; the direct path needs no additional artifact or gate.
+For `参考原文`, apply only light cleanup. Account for every source turn and do not apply the stronger condensation used in `会议纪要`. A wholly meaningless turn may produce no body text; record a short omission reason only in a long-material package where an entire source turn is removed. The direct path needs no additional artifact or gate.
 
 `参考原文` is still a model-edited readable body, not a direct copy of the input. Remove meaningless speech and filler, repair obvious grammar and sentence breaks, and omit visible source timestamps in the same model pass. Do not add a separate timestamp-cleaning stage when the model can ignore them directly.
 
 For `专家交流`, hide all speaker headings in `会议纪要` and retain only ordered bold questions with answers. Keep speaker headings and real turn boundaries in `参考原文`.
 
-### 6. Review once against the source
+### 6. Review where the text is generated
 
-Before export, perform one model-based source-fidelity review. Check:
+For `direct`, check the generated bodies against the source in the same main workflow. For long material, each package performs this check for its own source span before returning body-ready text. Check:
 
 - every substantive paragraph maps to the correct source speaker and Q&A group;
 - no distinct fact, reason, condition, comparison, number, time, action, uncertainty, or negation was lost or strengthened;
@@ -101,30 +98,26 @@ Before export, perform one model-based source-fidelity review. Check:
 - `参考原文` remains source-aligned;
 - entities and target headings follow the selected meeting-type rules.
 
-For direct, clear material, the main workflow performs this review. Long-material packages must already resolve mixed Q&A, short-reply attribution, readable reference prose, and minutes prose before assembly. The main workflow performs one global review for cross-package continuity, source fidelity, meeting-type structure, and flagged conflicts; it corrects concrete defects but does not routinely rewrite every completed package. Use one independent review agent only for a concrete high-risk conflict. Do not create lexical diff manifests, fidelity shards, final-semantic receipts, or artifact gates.
+After long-material assembly, the main workflow only fixes ordering, meeting-type formatting, adjacent-span continuity, globally unique entity spelling, and explicitly flagged conflicts. It must not reread and semantically re-review the full source, rewrite completed packages, or launch an independent full-source reviewer. For a concrete high-risk conflict, reopen only the relevant source span plus the minimum neighboring context and change it only when that evidence supports the change. Do not create lexical diff manifests, fidelity shards, final-semantic receipts, or artifact gates.
 
-### 7. Validate and export
+### 7. Validate and deliver
 
 Run only the checks that evaluate the current deliverable:
 
 ```bash
 python3 scripts/validate_utf8_text.py NOTE.md --require-cjk
 python3 scripts/validate_meeting_minutes_contract.py NOTE.md --json
-python3 scripts/export_to_obsidian.py NOTE.md
 ```
 
-`run_meeting_minutes_regression.py` is a development check for Skill or code changes. Do not run the full repository regression suite for every meeting deliverable.
+Handle an explicit Obsidian or other local-export request as a separate delivery task. Development regressions live outside the installed Skill and are never a per-meeting gate.
 
-The formal deliverable is Markdown. A same-stem verification sidecar is optional and only needed when genuine non-person doubtful items require an audit trail or the user explicitly requests it.
+The formal deliverable is Markdown. Do not create a verification sidecar in the base workflow; handle a separately requested audit artifact as a separate task.
 
 ## Resources
 
-- `scripts/archive_raw_inputs.py`: copy raw inputs into the meeting archive.
 - `scripts/transcribe_audio.py`: local ASR and timestamp preparation.
-- `scripts/build_speaker_turn_manifest.py`: long-material turn parsing and package planning only.
-- `scripts/assemble_speaker_turn_edits.py`: validate and order body-ready long-material segments without writing final Markdown.
+- `scripts/build_speaker_turn_manifest.py`: optional explicit-turn parsing and linear long-material package planning.
+- `scripts/assemble_speaker_turn_edits.py`: order one current-format return per source turn without writing final Markdown.
 - `scripts/query_symbol_candidates.py`: local security-name/code candidate lookup.
 - `scripts/validate_utf8_text.py`: encoding and portable Skill checks.
 - `scripts/validate_meeting_minutes_contract.py`: objective Markdown structure checks.
-- `scripts/export_to_obsidian.py`: local Markdown export.
-- `scripts/run_meeting_minutes_regression.py`: development-only regression.

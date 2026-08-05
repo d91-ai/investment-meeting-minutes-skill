@@ -53,7 +53,7 @@ Rules:
 - Collapse repeated whitespace.
 - Truncate very long titles before building filenames.
 - Preserve all collisions by adding a timestamp or numeric suffix; never overwrite.
-- Use `scripts/archive_raw_inputs.py --dry-run --json ...` before irreversible archive writes in automation.
+- Use `tools/meeting_minutes/archive_raw_inputs.py --dry-run --json ...` before irreversible archive writes in automation.
 
 ## Final Note Archive
 

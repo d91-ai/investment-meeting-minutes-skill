@@ -235,7 +235,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def markdown_field(markdown: str, field: str, fallback: str = "") -> str:
-    pattern = re.compile(rf"^{re.escape(field)}[:：]\s*(.+?)\s*$", re.MULTILINE)
+    pattern = re.compile(rf"^(?:-\s+)?{re.escape(field)}[:：]\s*(.+?)\s*$", re.MULTILINE)
     match = pattern.search(markdown)
     return match.group(1).strip() if match else fallback
 
@@ -260,6 +260,9 @@ def infer_review_series(content: str, source_name: str) -> str:
         return matches[0]
     if len(matches) > 1:
         raise ValueError(f"多人复盘会匹配到多个会议系列: {', '.join(matches)}；请向用户确认")
+    source_stem = Path(source_name).stem.strip()
+    if source_stem and source_stem not in FILENAME_PLACEHOLDERS:
+        return sanitize_filename(source_stem)
     raise ValueError("无法确定多人复盘会的会议系列；请从原始文件名匹配或向用户确认")
 
 
@@ -267,15 +270,22 @@ def detect_filename_title(content: str, source_name: str) -> str:
     meeting_type_raw = markdown_field(content, "会议类型", "").strip()
     meeting_type = MEETING_TYPE_ALIASES.get(meeting_type_raw, meeting_type_raw)
     meeting_title = markdown_field(content, "会议标题", "").strip()
+    source_stem = Path(source_name).stem
+    source_stem = re.sub(r"^\d{4}-\d{2}-\d{2}\s*[-_—–]?\s*", "", source_stem).strip()
 
     if meeting_type == "多人复盘会":
         return infer_review_series(content, source_name)
     if meeting_type == "公司交流":
+        if not meeting_title:
+            meeting_target = markdown_field(content, "会议标的", "").strip()
+            meeting_title = re.sub(r"[（(].*$", "", meeting_target).strip()
         company_name = strip_suffix(meeting_title, ("上市公司交流会议", "上市公司交流", "交流会议", "交流"))
         if not company_name or company_name in FILENAME_PLACEHOLDERS:
             raise ValueError("无法从会议标题确定公司名；请向用户确认")
         return sanitize_filename(f"{company_name} - 上市公司交流")
     if meeting_type == "专家交流":
+        if not meeting_title:
+            meeting_title = source_stem
         topic = strip_suffix(meeting_title, ("专家交流会议", "专家交流"))
         if not topic or topic in FILENAME_PLACEHOLDERS:
             raise ValueError("无法从会议标题确定专家交流主题；请向用户确认")

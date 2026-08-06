@@ -157,6 +157,7 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
             "numbers and dates",
             "industry terms",
             "public high-risk facts",
+            "unique-candidate context and per-item evidence",
         ],
         "secondary_artifacts": ["doubtful_items"],
     },
@@ -183,16 +184,17 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
     "fidelity_review": {
         "role": "Fidelity Reviewer",
         "dispatch_phase": "draft_review",
-        "objective": "Review whether draft prose preserves source order, pronouns, and substance.",
+        "objective": "Review the minutes and proofreading layers for source fidelity, traceability, and substance.",
         "inputs": [
             "draft Markdown",
             "exact draft Markdown path and SHA-256",
             "source spans",
+            "entity_verification_report",
             "source_reconciliation",
         ],
         "checks": [
-            "summary compression",
-            "third-person rewrite",
+            "minutes-to-proofreading traceability",
+            "unsupported summary compression or third-person rewrite",
             "omitted reasons or numbers",
             "residual meaningless fillers or mechanical connector repetition",
             "negation, self-correction, and polarity drift",
@@ -228,7 +230,7 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         "checks": [
             "UTF-8",
             "Markdown contract",
-            "doubtful table",
+            "inline doubtful markers",
             "timestamp_index",
             "verification sidecar",
             "regression result",
@@ -664,11 +666,14 @@ def output_shape_for(
         return None
 
     identity = identity or {}
+    artifact_shape = {field: placeholder(field) for field in REQUIRED_FIELDS[artifact_schema]}
+    if artifact_schema == "entity_verification_report":
+        artifact_shape["confirmed_replacements"] = {}
     if secondary_artifacts:
         shape: dict[str, Any] = {
             **identity,
             "artifacts": {
-                artifact_type: {field: placeholder(field) for field in REQUIRED_FIELDS[artifact_schema]},
+                artifact_type: artifact_shape,
             }
         }
         for secondary in secondary_artifacts:
@@ -678,7 +683,7 @@ def output_shape_for(
     return {
         **identity,
         "artifact_type": artifact_type,
-        "artifact": {field: placeholder(field) for field in REQUIRED_FIELDS[artifact_schema]},
+        "artifact": artifact_shape,
     }
 
 
@@ -761,7 +766,17 @@ def prompt_for_task(
     elif artifact_type == "entity_verification_report":
         lines.append("Every items entry must appear in exactly one of confirmed_items or unresolved_items.")
         lines.append("Do not copy local_candidate_paths into external_evidence_paths.")
-        lines.append("If entity evidence is insufficient, put the exact item in unresolved_items and doubtful_items; do not guess.")
+        lines.append(
+            "A single generated candidate is not enough. Only when the normalized candidate is unique, fits the exact source "
+            "context, has per-item reliable evidence, has no conflict, and does not change viewpoint strength, conditions, or "
+            "numeric scope may you put it in confirmed_items and map the exact source form to the replacement in "
+            "confirmed_replacements."
+        )
+        lines.append(
+            "If a candidate is unique but evidence is insufficient, stale, conflicting, or not bound to that exact item, put "
+            "the exact source form in unresolved_items and doubtful_items; do not guess. Confirmed replacements must not remain "
+            "in doubtful_items."
+        )
     elif artifact_type == "target_attribution_review":
         lines.append("Return reviewed_markdown_path and the SHA-256 of the exact draft bytes you reviewed.")
         lines.append("segments_reviewed must be a positive integer for the actual reviewed scope.")
@@ -783,8 +798,15 @@ def prompt_for_task(
             "and mechanical connector repetition, but never classify repeated negatives as removable filler without source context."
         )
         lines.append(
-            "Compare every negation, self-correction, uncertainty marker, condition, time scope, number, and causal link with the source; "
-            "put any polarity or strength drift in omission_findings and recommended_revisions."
+            "Review # 会议纪要 against # 原文校对: every material summary conclusion must have a source-supported counterpart. "
+            "Third-person minutes language is allowed, but unsupported compression is not. Compare every negation, self-correction, "
+            "uncertainty marker, condition, time scope, number, and causal link with the source; put any polarity or strength drift "
+            "in omission_findings and recommended_revisions."
+        )
+        lines.append(
+            "Accept an ordinary-font correction of a doubtful-looking source form only when entity_verification_report "
+            "confirmed_replacements binds that exact source form to a per-item evidenced replacement; otherwise flag it in "
+            "source_mapping_failures or recommended_revisions."
         )
     elif artifact_schema == "export_manifest":
         lines.append("Return markdown_sha256 for markdown_path and set main_actions_verified as a boolean.")

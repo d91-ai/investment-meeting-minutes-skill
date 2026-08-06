@@ -22,6 +22,7 @@
 - MAS 是高风险任务的过程自动化层，不是多个 agent 拼接终稿的写作机制。
 - Specialist agents 只产出与当前风险直接对应的结构化 artifact，例如 `transcript_audit`、`source_reconciliation`、`entity_verification_report`、`target_attribution_review`、`fidelity_review` 和 `export_manifest`。
 - `发言整理` 默认是可复核原文纪要，不输出摘要、压缩稿或研报化改写。
+- 经上下文和逐项可靠证据核验后唯一确认的转写修复直接使用普通字体，并退出正文粗体、`doubtful_items`、verification sidecar 和最终存疑表；单一候选但证据不足时仍保留存疑。
 - 音频加文稿输入时，先完成音频转录，再比较音频转录、`aligned_transcript` 和文稿质量；以覆盖更完整、发言顺序更可靠、逐字性更强、噪声和遗漏更少的一侧作为正文主源。
 - 联网核验只确认实体、代码、术语和公开事实，不补写会议没有说过的内容。
 - 外部核验只发送候选实体、代码、术语和必要公开事实关键词，不发送原始会议长段、发言人身份、私有链接、未公开客户/订单上下文或机密 source text。

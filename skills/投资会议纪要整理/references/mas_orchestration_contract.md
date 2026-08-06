@@ -2,6 +2,15 @@
 
 本文件定义投资会议纪要 workflow 的 MAS 目标模式。MAS 的目的不是让多个 agent 拼接终稿，而是提高端到端自动化效率、减少人工常规参与、提升最终纪要质量和可复核性。
 
+## 目录
+
+- 目标与不变边界
+- 角色与 Artifact Schema
+- MAS 默认规则与 Task Bundle
+- Codex 派发、操作和 Dry-Run
+- Synthetic Pilot Operational Rule
+- Decision Rules
+
 ## 目标
 
 - 用主流程统一调度会议纪要生产线。
@@ -15,7 +24,7 @@
 - 主流程是最终 Markdown、归档输出和交付口径的唯一写作者。
 - Specialist agents 不直接写、拼接、改写或导出最终纪要。
 - 外部资料只能确认名称、代码、术语、公开事实或候选解释，不能补写会议材料没有出现的观点。
-- `doubtful_items` 仍是终稿存疑表和 verification sidecar 的唯一事实源。
+- `doubtful_items` 仍是终稿内嵌存疑标记和 verification sidecar 的唯一事实源。
 - Validator 保持结构、编码、样例和 artifact 字段检查，不新增看好/看空、主次标的等语义硬校验。
 - 不引入 LangGraph、CrewAI、AutoGen 或其他重型 agent 框架。
 
@@ -67,6 +76,7 @@
 
 检查：
 - 公司、股票代码、客户、供应商、竞争对手、数字、时间、政策事件、产品型号和行业术语。
+- 规范化去重后候选唯一、上下文一致、具有逐项可靠证据且没有冲突时，提出普通字体直接修正并写入 `confirmed_replacements`；候选唯一但证据不足时仍写入 `unresolved_items` 和 `doubtful_items`。
 
 ### Target Attribution Reviewer
 
@@ -84,13 +94,15 @@
 
 输入：
 - 终稿草案和对应 source spans。
+- `entity_verification_report`，用于核对普通字体确认替换是否存在逐项证据映射。
 - `audio_plus_document` 额外要求已完成的 `source_reconciliation`；单一来源改用主流程已选定的正文源及选择理由，不伪造 reconciliation artifact。
 
 输出：
 - `fidelity_review`
 
 检查：
-- 总结化、第三人称改写、删减原因链/数字/时间/仓位动作/不确定表达、合并多轮发言、改变发言顺序。
+- 会议纪要层的重要结论能否回溯至原文校对层；摘要是否遗漏、拔高或弱化原因链、数字、时间、仓位动作、条件和不确定表达。
+- 原文校对层是否删减、合并或重排多轮发言，是否错误改写第一人称、否定、自我纠正和观点强度。
 - 专家会中是否残留独立寒暄、无信息填充、机械连接词重复或错误断句；是否因清理口语而改变否定、自我纠正、观点强度、条件和时间范围。
 
 ### Speaker Turn Editor
@@ -119,7 +131,7 @@
 - `export_manifest`
 
 检查：
-- UTF-8、Markdown 合约、存疑表、timestamp_index、verification sidecar、回归样例和导出结果。
+- UTF-8、Markdown 双层契约、内嵌存疑、timestamp_index、verification sidecar、回归样例和导出结果。
 
 ## Artifact Schema
 
@@ -187,9 +199,11 @@ Required fields:
 
 `confirmed_item_evidence_paths` must be a per-confirmed-item mapping. A confirmed non-person business item is not sufficient merely because `external_evidence_paths` is non-empty; each string in `confirmed_items` must map to at least one external evidence path or source identifier. Each external reference must be a public `https://` URL or one of the supported public source IDs: `a_stock_data_live`, `cninfo`, `company_website`, `exchange_disclosure`, `professional_database`, or `regulatory_disclosure`. HTTP, localhost/private-network addresses, credential-bearing query parameters, local candidate file paths, and arbitrary opaque strings are invalid. This shape check does not claim that network retrieval occurred; live verification remains a main-workflow evidence requirement.
 
+Optional `confirmed_replacements` maps each exact source mis-transcription to its normalized replacement. Every replacement must appear in `confirmed_items`, inherit that item's per-item evidence, fit the current source context, and have no conflict. A single generated candidate without sufficient evidence must not enter this mapping.
+
 ### doubtful_items
 
-Use the fields and type enum in `verification_policy.md`. This list remains the only source for final ambiguity-table rows and verification sidecar records. Every entity `unresolved_items` entry and every export `known_unverified_parts` entry must have the same exact `原始表述` in `doubtful_items`. The sidecar record set must exactly match business doubtful items whose `是否需要 sidecar=true`.
+Use the fields and type enum in `verification_policy.md`. This list contains unresolved items only and remains the only source for final inline-doubtful markers and verification sidecar records. Items in `confirmed_replacements` must not remain here. Every entity `unresolved_items` entry and every export `known_unverified_parts` entry must have the same exact `原始表述` in `doubtful_items`. The sidecar record set must exactly match business doubtful items whose `是否需要 sidecar=true`.
 
 ### target_attribution_review
 
@@ -404,18 +418,9 @@ The dry-run is deterministic and uses synthetic artifacts. In a live Codex subag
 
 `--overwrite` may delete only an existing MAS dry-run directory under the system temporary root whose basename starts with `mas-` and which contains a dry-run marker or prior MAS control file. A marker outside the temporary root never authorizes recursive deletion.
 
-## Live Codex Synthetic Pilot Findings
+## Synthetic Pilot Operational Rule
 
-The portable synthetic trace in `references/regression_samples/mas_live_pilot_trace_synthetic.json` records a live Codex subagent pilot with five read-only specialist tasks across `pre_draft`, `draft_review`, and `final_verification`. It used synthetic audio+document materials only; no real meeting materials, active skill install sync, commit, push, or final Markdown ownership transfer is part of the trace.
-
-Observed behavior:
-
-- A live Source Reconciler returned schema-invalid JSON by making `manual_review_required` a string instead of a boolean.
-- `collect_mas_artifacts.py --through-phase pre_draft` caught the invalid field and emitted `next_action.type=repair_invalid_or_duplicate_artifacts`.
-- After repair, the collector allowed dispatch to `draft_review`, then `final_verification`.
-- With all phase artifacts present and valid, the final collector still emitted `next_action.type=ask_user_for_narrow_confirmation` because unresolved source conflicts and known unverified parts remained.
-
-Operational rule: run collector validation after every phase, repair invalid or duplicate specialist artifacts before dispatching later phases, and never treat complete artifacts as automatic delivery when the valid `next_action` requests narrow user confirmation.
+The portable synthetic trace in `references/regression_samples/mas_live_pilot_trace_synthetic.json` verifies staged collection and repair behavior. Run collector validation after every phase, repair invalid or duplicate specialist artifacts before dispatching later phases, and never treat complete artifacts as automatic delivery when the valid `next_action` requests narrow user confirmation.
 
 ## Decision Rules
 
@@ -425,14 +430,16 @@ The main workflow may continue without asking the user when:
 - Required artifacts exist for the selected risk profile.
 - Source evidence is consistent or the primary source is clearly justified.
 - Non-person business facts written as confirmed have reliable external evidence.
-- `doubtful_items`, final table, and sidecar are derived from the same records.
+- `doubtful_items`, inline doubtful markers, and sidecar are derived from the same records.
 - Fidelity review has no severe omission, perspective, or order findings.
 - Contract verifier passes.
+- A normalized candidate is unique, context-consistent, individually evidenced, conflict-free, and therefore removed from the ambiguity chain after ordinary-font correction.
 
 ### 自动标存疑
 
 The main workflow should keep the source wording and add or preserve `doubtful_items` when:
 - Candidate entity is not unique.
+- A candidate is unique but evidence remains insufficient, stale, unbound to that item, or unable to exclude another interpretation.
 - External evidence is unavailable, insufficient, stale, or conflicting.
 - Timestamp anchor is unavailable or not reliable enough for inline timestamp.
 - Audio/document conflict exists but does not decide the main source.
@@ -474,15 +481,3 @@ When duplicate artifacts exist, collector output includes `duplicate_artifacts` 
 - `apply_main_actions_before_final_delivery`: apply automatic doubtful, repair, or revision actions before user-facing delivery; if the action changes the final Markdown or sidecar, rerun export and validation before delivery.
 - `continue_without_user_intervention`: continue the main workflow without asking the user.
 - `ask_user_for_narrow_confirmation`: ask only the specific confirmation implied by valid artifacts.
-
-## Implementation Order
-
-1. Keep this contract as the stable reference.
-2. Wire `SKILL.md`, README, and interface prompt to this contract.
-3. Add synthetic regression anchors for the MAS contract and entry points.
-4. Use `scripts/build_mas_task_bundle.py` to create deterministic specialist dispatch plans.
-5. Use `scripts/validate_mas_artifacts.py` for lightweight artifact field validation once artifacts are emitted.
-6. Use `scripts/summarize_mas_decisions.py` to turn valid artifacts into automatic pass, automatic doubtful handling, or user-confirmation decisions.
-7. Use `scripts/collect_mas_artifacts.py` as the default handoff layer from subagent JSON files to a validated run summary.
-8. Use `scripts/run_mas_dry_run.py` to verify staged phase handoff and trace `next_action` across synthetic runs.
-9. Run a fresh Codex subagent synthetic blind-run through generated prompts, dispatch-bound returns, ingest, main-action receipt, final verification, and recovery before production use.

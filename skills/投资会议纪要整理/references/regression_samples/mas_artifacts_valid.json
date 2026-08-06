@@ -30,11 +30,16 @@
       "manual_review_required": false
     },
     "entity_verification_report": {
-      "items": ["某某科技"],
+      "items": ["某某科技", "示例股份(000001.SZ)"],
       "local_candidate_paths": ["query_symbol_candidates.py"],
       "external_evidence_paths": ["exchange_disclosure"],
-      "confirmed_item_evidence_paths": {},
-      "confirmed_items": [],
+      "confirmed_item_evidence_paths": {
+        "示例股份(000001.SZ)": ["exchange_disclosure"]
+      },
+      "confirmed_items": ["示例股份(000001.SZ)"],
+      "confirmed_replacements": {
+        "示例股分": "示例股份(000001.SZ)"
+      },
       "unresolved_items": ["某某科技"],
       "conflicts": []
     },
@@ -47,7 +52,7 @@
         "是否需要 sidecar": true,
         "上下文依据": "发言人1在科技板块段落中提及",
         "检索/证据路径": "本地候选加交易所披露仍无法唯一确认",
-        "最终处理": "正文加粗标注并入存疑表"
+        "最终处理": "正文原位加粗并内嵌必要说明"
       }
     ],
     "target_attribution_review": {

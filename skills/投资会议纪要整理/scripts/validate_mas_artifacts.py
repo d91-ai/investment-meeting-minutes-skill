@@ -119,6 +119,20 @@ DOUBTFUL_REQUIRED_FIELDS = [
 ]
 ALLOWED_DOUBTFUL_TYPES = {"人名", "说话人身份", "公司或证券标的", "行业术语", "数字或时间", "其他业务事实"}
 NON_BUSINESS_DOUBTFUL_TYPES = {"人名", "说话人身份"}
+RESOLVED_JUDGMENT_PREFIXES = (
+    "已确认",
+    "唯一确认",
+    "确认唯一",
+    "确认无误",
+    "可以确认",
+    "可确认",
+    "已核实",
+    "唯一核实",
+    "确定为",
+    "已解决",
+    "候选唯一且证据充分",
+)
+RESOLVED_HANDLING_PREFIXES = ("普通字体", "直接修改", "直接替换", "取消粗体", "移出存疑", "不进入存疑")
 FORBIDDEN_FINAL_FIELDS = {"final_markdown", "markdown_body", "final_note", "final_body"}
 BOOLEAN_FIELD_RULES: dict[str, list[str]] = {
     "source_manifest": ["archive_allowed"],
@@ -655,6 +669,22 @@ def validate_required_fields(artifact_type: str, artifact: Any) -> list[str]:
     return []
 
 
+def starts_with_any_normalized(value: Any, prefixes: tuple[str, ...]) -> bool:
+    normalized = re.sub(r"\s+", "", str(value or "")).strip("：:，,；;")
+    return any(normalized.startswith(prefix) for prefix in prefixes)
+
+
+def is_resolved_judgment(value: Any) -> bool:
+    normalized = re.sub(r"\s+", "", str(value or "")).strip("：:，,；;")
+    return normalized == "确认" or any(normalized.startswith(prefix) for prefix in RESOLVED_JUDGMENT_PREFIXES)
+
+
+def normalize_doubt_term(value: Any) -> str:
+    normalized = str(value or "").replace("**", "")
+    normalized = re.sub(r"\s+", "", normalized).casefold()
+    return normalized.strip("，,。；;：:！？!?\"'“”‘’（）()【】《》")
+
+
 def validate_field_types(artifact_type: str, artifact: Any) -> list[str]:
     if not isinstance(artifact, dict):
         return []
@@ -869,6 +899,38 @@ def validate_entity_verification_report(artifact: Any) -> list[str]:
         errors.append("entity_verification_report items 存在未归类项: " + ", ".join(sorted(unclassified)))
     if unknown_classified:
         errors.append("entity_verification_report 归类项不在 items 中: " + ", ".join(sorted(unknown_classified)))
+    confirmed_replacements = artifact.get("confirmed_replacements", {})
+    if not isinstance(confirmed_replacements, dict):
+        errors.append("entity_verification_report confirmed_replacements 必须是 source form 到 replacement 的 JSON object")
+        confirmed_replacements = {}
+    normalized_replacement_sources: dict[str, str] = {}
+    unresolved_normalized = {normalize_doubt_term(item) for item in unresolved_items if normalize_doubt_term(item)}
+    for source_form, replacement in confirmed_replacements.items():
+        source_text = str(source_form).strip()
+        replacement_text = str(replacement).strip()
+        if not source_text or not isinstance(replacement, str) or not replacement_text:
+            errors.append("entity_verification_report confirmed_replacements 的原始表述和替换值必须是非空 string")
+            continue
+        if source_text == replacement_text:
+            errors.append(f"entity_verification_report confirmed_replacements 不得映射为相同文本: {source_text}")
+        normalized_source = normalize_doubt_term(source_text)
+        if normalized_source in normalized_replacement_sources:
+            errors.append(
+                "entity_verification_report confirmed_replacements 存在规范化后重复原始表述: "
+                f"{normalized_replacement_sources[normalized_source]}、{source_text}"
+            )
+        elif normalized_source:
+            normalized_replacement_sources[normalized_source] = source_text
+        if replacement_text not in confirmed_set:
+            errors.append(
+                "entity_verification_report confirmed_replacements 的替换值必须属于 confirmed_items: "
+                f"{source_text} -> {replacement_text}"
+            )
+        if normalized_source in unresolved_normalized:
+            errors.append(
+                "entity_verification_report confirmed_replacements 的原始表述不得同时属于 unresolved_items: "
+                + source_text
+            )
     reused_evidence = local_candidate_paths & external_evidence_paths
     if reused_evidence:
         errors.append(
@@ -1011,6 +1073,10 @@ def validate_doubtful_items(value: Any) -> list[str]:
         for field in ("原始表述", "当前判断", "上下文依据", "检索/证据路径", "最终处理"):
             if isinstance(item.get(field), str) and not item[field].strip():
                 errors.append(f"doubtful_items 第 {index + 1} 条 {field} 不得为空")
+        if is_resolved_judgment(item.get("当前判断")) or starts_with_any_normalized(
+            item.get("最终处理"), RESOLVED_HANDLING_PREFIXES
+        ):
+            errors.append(f"doubtful_items 第 {index + 1} 条已确认项不得保留在存疑链")
     return errors
 
 
@@ -1022,6 +1088,7 @@ def validate_cross_artifact_consistency(artifacts: dict[str, Any]) -> list[str]:
         for item in doubtful_items
         if isinstance(doubtful_items, list) and isinstance(item, dict) and str(item.get("原始表述") or "").strip()
     } if isinstance(doubtful_items, list) else set()
+    doubtful_normalized = {normalize_doubt_term(item) for item in doubtful_raw if normalize_doubt_term(item)}
     entity_report = artifacts.get("entity_verification_report")
     if isinstance(entity_report, dict) and "doubtful_items" in artifacts:
         unresolved = {
@@ -1032,6 +1099,18 @@ def validate_cross_artifact_consistency(artifacts: dict[str, Any]) -> list[str]:
         missing = sorted(unresolved - doubtful_raw)
         if missing:
             errors.append("entity_verification_report.unresolved_items 缺少对应 doubtful_items: " + ", ".join(missing))
+        confirmed_replacements = entity_report.get("confirmed_replacements", {})
+        if isinstance(confirmed_replacements, dict):
+            leaked = sorted(
+                str(source_form).strip()
+                for source_form in confirmed_replacements
+                if normalize_doubt_term(source_form) in doubtful_normalized
+            )
+            if leaked:
+                errors.append(
+                    "entity_verification_report.confirmed_replacements 已确认项不得仍出现在 doubtful_items: "
+                    + ", ".join(leaked)
+                )
     export_manifest = artifacts.get("export_manifest")
     if isinstance(export_manifest, dict) and "doubtful_items" in artifacts:
         known_unverified = {

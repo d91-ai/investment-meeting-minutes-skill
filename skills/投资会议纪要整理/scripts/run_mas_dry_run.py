@@ -37,17 +37,21 @@ def synthetic_final_markdown(artifacts: dict[str, Any]) -> str:
         else None
     )
     lines = [
-        "# 投资会议纪要｜合成 MAS dry-run",
+        "# 会议纪要",
         "",
-        "会议日期：2026-07-11",
-        "整理时间：2026-07-11",
-        "会议标题：合成 MAS dry-run 会议",
-        "会议类型：多人复盘会",
-        "会议系列：合成回归",
+        "- 会议类型：多人复盘会",
+        "- 输入来源：合成回归材料",
+        "- 会议日期：2026-07-11",
         "",
-        "---",
+        "> 标记说明：正文内容中的加粗表示段落标题，或未完全确认、无法安全修改、原始表述缺少明确口径而需要人工复核。",
         "",
-        "## 一、发言整理",
+        "### 发言人1",
+        "",
+        "**【合成回归判断】**",
+        "",
+        "按原文校对整理当前合成回归内容。",
+        "",
+        "# 原文校对",
         "",
         "### 发言人1",
         "",
@@ -57,18 +61,11 @@ def synthetic_final_markdown(artifacts: dict[str, Any]) -> str:
     if first is None:
         lines.append("我按当前会话原文保留这段合成回归内容。")
     else:
-        raw = str(first.get("原始表述") or "合成存疑词").replace("|", "\\|")
-        current = str(first.get("当前判断") or "待人工确认").replace("|", "\\|")
-        candidate = str(first.get("候选项") or "").replace("|", "\\|")
+        raw = str(first.get("原始表述") or "合成存疑词")
+        current = str(first.get("当前判断") or "待人工确认")
         lines.extend(
             [
-                f"我在当前会话中提到 **{raw}**，需要保留原始存疑。",
-                "",
-                "## 二、存疑与待确认",
-                "",
-                "| 原始表述 | 当前判断 | 候选项 | 人工确认 |",
-                "| --- | --- | --- | --- |",
-                f"| **{raw}** | {current} | {candidate} | |",
+                f"我在当前会话中提到 **{raw}，{current}**。",
             ]
         )
     return "\n".join(lines) + "\n"

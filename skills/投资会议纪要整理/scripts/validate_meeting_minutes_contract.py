@@ -85,6 +85,20 @@ SOURCE_MODE_CHOICES = ["auto", *sorted(DOCUMENT_ONLY_SOURCE_MODES), *sorted(AUDI
 AUDIO_AMBIGUITY_HEADER = ["时间戳", "原始表述", "当前判断", "候选项", "人工确认"]
 DOCUMENT_AMBIGUITY_HEADER = ["原始表述", "当前判断", "候选项", "人工确认"]
 PLACEHOLDER_VALUES = {"", "-", "无", "暂无", "无存疑", "暂无存疑", "none", "n/a"}
+RESOLVED_JUDGMENT_PREFIXES = (
+    "已确认",
+    "唯一确认",
+    "确认唯一",
+    "确认无误",
+    "可以确认",
+    "可确认",
+    "已核实",
+    "唯一核实",
+    "确定为",
+    "已解决",
+    "候选唯一且证据充分",
+)
+RESOLVED_HANDLING_PREFIXES = ("普通字体", "直接修改", "直接替换", "取消粗体", "移出存疑", "不进入存疑")
 MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
 MEETING_TYPE_ALIASES = {"上市公司交流": "公司交流"}
 QUESTION_LINE_RE = re.compile(r"^【[^】\n]+】[ \t]*$", re.MULTILINE)
@@ -170,7 +184,8 @@ def expert_questions_without_answers(markdown: str) -> list[str]:
 def expert_language_surface_warnings(markdown: str, meeting_type: str) -> list[str]:
     if MEETING_TYPE_ALIASES.get(meeting_type, meeting_type) != "专家交流":
         return []
-    body = body_section(markdown)
+    _summary, proof = dual_sections(markdown)
+    body = proof or body_section(markdown)
     findings: list[str] = []
     for pattern, label in EXPERT_SURFACE_WARNING_PATTERNS:
         match = pattern.search(body)
@@ -349,11 +364,11 @@ def review_meeting_heading_warnings(markdown: str, meeting_type: str) -> list[st
 
 
 def metadata_field_present(markdown: str, field: str) -> bool:
-    return bool(re.search(rf"^(?:\*\*)?{re.escape(field)}(?:\*\*)?[:：]\s*\S+", markdown, re.MULTILINE))
+    return bool(re.search(rf"^-\s+{re.escape(field)}[:：]\s*\S+", markdown, re.MULTILINE))
 
 
 def markdown_field(markdown: str, field: str) -> str:
-    match = re.search(rf"^(?:\*\*)?{re.escape(field)}(?:\*\*)?[:：]\s*(.+?)\s*$", markdown, re.MULTILINE)
+    match = re.search(rf"^(?:-\s*)?(?:\*\*)?{re.escape(field)}(?:\*\*)?[:：]\s*(.+?)\s*$", markdown, re.MULTILINE)
     if not match:
         return ""
     value = match.group(1).strip()
@@ -364,7 +379,7 @@ def markdown_field(markdown: str, field: str) -> str:
 
 def validate_date_metadata(markdown: str) -> list[str]:
     errors: list[str] = []
-    for field in ("会议日期", "整理时间"):
+    for field in ("会议日期",):
         value = markdown_field(markdown, field)
         if not value:
             continue
@@ -383,6 +398,16 @@ def normalize_doubt_term(value: str) -> str:
     normalized = normalized.translate(str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"}))
     normalized = re.sub(r"\s+", "", normalized).casefold()
     return normalized.strip("，,。；;：:！？!?\"'（）()【】《》")
+
+
+def starts_with_any_normalized(value: Any, prefixes: tuple[str, ...]) -> bool:
+    normalized = re.sub(r"\s+", "", str(value or "")).strip("：:，,；;")
+    return any(normalized.startswith(prefix) for prefix in prefixes)
+
+
+def is_resolved_judgment(value: Any) -> bool:
+    normalized = re.sub(r"\s+", "", str(value or "")).strip("：:，,；;")
+    return normalized == "确认" or any(normalized.startswith(prefix) for prefix in RESOLVED_JUDGMENT_PREFIXES)
 
 
 def metadata_bold_findings(markdown: str) -> list[str]:
@@ -561,6 +586,10 @@ def validate_verification_sidecar(verification_path: Path | None, *, require_ver
         for field in ("原始表述", "当前判断", "上下文依据", "最终处理"):
             if isinstance(record.get(field), str) and not record[field].strip():
                 errors.append(f"verification 第 {index} 条 {field} 不得为空")
+        if is_resolved_judgment(record.get("当前判断")) or starts_with_any_normalized(
+            record.get("最终处理"), RESOLVED_HANDLING_PREFIXES
+        ):
+            errors.append(f"verification 第 {index} 条已确认项不得保留在 verification sidecar")
         evidence_path = record.get("检索/证据路径")
         if isinstance(evidence_path, str) and not evidence_path.strip():
             errors.append(f"verification 第 {index} 条 检索/证据路径 不得为空")
@@ -871,6 +900,23 @@ def ambiguity_rows_with_manual_confirmation(markdown: str, headers: list[str]) -
     return findings
 
 
+def resolved_ambiguity_rows(markdown: str, headers: list[str]) -> list[str]:
+    if "当前判断" not in headers:
+        return []
+    judgment_index = headers.index("当前判断")
+    original_index = headers.index("原始表述") if "原始表述" in headers else 0
+    findings: list[str] = []
+    for line in ambiguity_table_lines(markdown)[2:]:
+        if _is_separator_line(line):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if _is_placeholder_ambiguity_row(cells, original_index) or judgment_index >= len(cells):
+            continue
+        if is_resolved_judgment(cells[judgment_index]):
+            findings.append(line)
+    return findings
+
+
 def real_ambiguity_row_count(markdown: str, headers: list[str]) -> int:
     original_index = headers.index("原始表述") if "原始表述" in headers else 0
     count = 0
@@ -881,6 +927,84 @@ def real_ambiguity_row_count(markdown: str, headers: list[str]) -> int:
         if not _is_placeholder_ambiguity_row(cells, original_index):
             count += 1
     return count
+
+
+TITLE_LINE_RE = re.compile(r"^\*\*【[^】\r\n]+】\*\*[ \t]*$", re.MULTILINE)
+
+
+def dual_sections(markdown: str) -> tuple[str, str]:
+    summary_match = re.search(r"(?m)^# 会议纪要\s*$", markdown)
+    proof_match = re.search(r"(?m)^# 原文校对\s*$", markdown)
+    if not summary_match or not proof_match or summary_match.start() >= proof_match.start():
+        return "", ""
+    return markdown[summary_match.end() : proof_match.start()], markdown[proof_match.end() :]
+
+
+def standalone_title_lines(section: str) -> list[str]:
+    return [match.group(0).strip() for match in TITLE_LINE_RE.finditer(section)]
+
+
+def content_bold_terms(markdown: str) -> list[str]:
+    terms: list[str] = []
+    for raw_line in markdown.splitlines():
+        if TITLE_LINE_RE.fullmatch(raw_line.strip()):
+            continue
+        terms.extend(match.group(1).strip() for match in BOLD_RE.finditer(raw_line) if match.group(1).strip())
+    return terms
+
+
+def review_proof_heading_findings(proof: str) -> list[str]:
+    findings: list[str] = []
+    for raw_line in proof.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("####") or line.startswith("#####"):
+            continue
+        match = REVIEW_SUBSECTION_HEADING_RE.fullmatch(line)
+        if not match:
+            findings.append(f"{line}（原文校对小段标题必须使用普通字体的 `#### 【……】` 格式）")
+            continue
+        content = match.group("content")
+        if content != content.strip():
+            findings.append(f"{line}（标题方括号内不得保留首尾空格）")
+            continue
+        if "|" not in content:
+            continue
+        if content.count("|") != 1:
+            findings.append(f"{line}（半角 `|` 必须且只能出现一次）")
+            continue
+        if not re.fullmatch(r"[^|\s](?:[^|]*[^|\s])?\| [^|\s](?:[^|]*[^|\s])?", content):
+            findings.append(f"{line}（半角 `|` 前不得有空格，后必须恰好一个空格，且两侧不得为空）")
+            continue
+        target_content, sector = content.split("|", 1)
+        targets = target_content.split("｜")
+        if not targets or any(not TARGET_WITH_CODE_RE.fullmatch(target) for target in targets):
+            findings.append(f"{line}（`|` 前必须是一个或多个名称(代码)，多标的只用全角 `｜` 分隔）")
+        elif not sector[1:].strip():
+            findings.append(f"{line}（`|` 后的主题不得为空）")
+    return findings
+
+
+def inline_doubtful_mapping_findings(markdown: str, verification_path: Path | None) -> list[str]:
+    if verification_path is None or not verification_path.exists():
+        return []
+    try:
+        records = read_verification_records(verification_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return []
+    bold_terms = content_bold_terms(markdown)
+    normalized_bold = [normalize_doubt_term(term) for term in bold_terms]
+    normalized_bold = [term for term in normalized_bold if term]
+    originals = [str(record.get("原始表述") or "") for record in records]
+    findings: list[str] = []
+    for original in originals:
+        normalized = normalize_doubt_term(original)
+        if normalized and not any(normalized in marked for marked in normalized_bold):
+            findings.append(f"verification 存疑项未在正文内嵌粗体中出现: {original}")
+    for term in bold_terms:
+        normalized = normalize_doubt_term(term)
+        if normalized and not any(normalize_doubt_term(original) in normalized for original in originals if normalize_doubt_term(original)):
+            findings.append(f"正文粗体存疑片段未在 verification sidecar 中登记: {term}")
+    return findings
 
 
 def validate_contract(
@@ -894,32 +1018,32 @@ def validate_contract(
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
-    normalized_source_mode = normalize_source_mode(source_mode)
-    normalized_timestamp_mode = normalize_timestamp_mode(timestamp_mode, require_audio_timestamps)
-    ambiguity_headers: list[str] = []
-
     stripped = markdown.lstrip()
     if not stripped.startswith("# "):
         errors.append("Markdown 必须以一级标题开头")
-    elif not re.search(r"(?m)^# 投资会议纪要(?:\s|｜|$)", stripped):
-        errors.append("一级标题必须以 # 投资会议纪要 开头")
+    elif not re.search(r"(?m)^# 会议纪要\s*$", stripped):
+        errors.append("一级标题必须为 # 会议纪要")
 
-    for field in REQUIRED_METADATA_FIELDS:
+    for field in ("会议类型", "输入来源", "会议日期"):
         if not metadata_field_present(markdown, field):
             errors.append(f"缺少会议元信息字段: {field}")
     errors.extend(validate_date_metadata(markdown))
-
     meeting_type = markdown_field(markdown, "会议类型")
-    errors.extend(validate_meeting_type_reference(markdown, meeting_type))
-    warnings.extend(review_meeting_heading_warnings(markdown, meeting_type))
-    warnings.extend(expert_language_surface_warnings(markdown, meeting_type))
+    meeting_type = MEETING_TYPE_ALIASES.get(meeting_type, meeting_type)
+    if meeting_type not in MEETING_TYPES:
+        errors.append(f"会议类型只能是: {' / '.join(sorted(MEETING_TYPES | set(MEETING_TYPE_ALIASES)))}")
 
-    body_position = markdown.find("## 一、发言整理")
-    if body_position < 0:
-        errors.append("缺少必需章节: ## 一、发言整理")
-    ambiguity_position = markdown.find("## 二、存疑与待确认")
-    if body_position >= 0 and ambiguity_position >= 0 and body_position > ambiguity_position:
-        errors.append("必需章节顺序错误")
+    summary, proof = dual_sections(markdown)
+    if not summary or not proof:
+        errors.append("终稿必须按顺序包含 # 会议纪要 和 # 原文校对 两层")
+    if not re.search(r"(?m)^> 标记说明：.+$", markdown):
+        errors.append("缺少说明正文粗体用途的标记说明")
+    if re.search(r"(?m)^## 二、存疑与待确认\s*$", markdown):
+        errors.append("终稿不得输出 ## 二、存疑与待确认 或文末存疑表")
+    if re.search(r"(?m)^## 一、发言整理\s*$", markdown):
+        errors.append("终稿不得保留旧的 ## 一、发言整理 单层结构")
+    if re.search(r"(?m)^## 重要信息修改记录\s*$", markdown):
+        errors.append("终稿不得输出重要信息修改记录")
 
     for pattern in FORBIDDEN_PATTERNS:
         if re.search(pattern, markdown):
@@ -936,65 +1060,59 @@ def validate_contract(
     if fifth_level_headings:
         preview = "；".join(fifth_level_headings[:6])
         errors.append(f"禁止所有五级标题: {preview}")
-    bold_headings = bold_heading_findings(markdown)
-    if bold_headings:
-        preview = "；".join(bold_headings[:6])
-        errors.append(f"标题不得加粗: {preview}")
-    subsection_heading_findings = review_subsection_heading_findings(markdown, meeting_type)
-    if subsection_heading_findings:
-        preview = "；".join(subsection_heading_findings[:6])
-        errors.append(f"多人复盘会四级小段标题格式错误: {preview}")
+    if "存疑时间戳" in markdown:
+        errors.append("终稿正文不得出现存疑时间戳；时间戳仅保留在内部审核材料")
 
-    bold_findings = bold_contract_findings(markdown)
-    errors.extend(bold_findings)
+    if summary and proof:
+        for layer_name, section in (("会议纪要", summary), ("原文校对", proof)):
+            if not re.search(r"(?m)^###(?!#)\s+.+$", section):
+                errors.append(f"{layer_name}缺少三级发言人标题")
+            review_proof_has_subsection = meeting_type == "多人复盘会" and layer_name == "原文校对" and bool(
+                re.search(r"(?m)^#### 【[^】\n]+】\s*$", section)
+            )
+            if not standalone_title_lines(section) and not review_proof_has_subsection:
+                errors.append(f"{layer_name}缺少加粗的 **【……】** 概括标题")
+        if meeting_type in {"专家交流", "公司交流"}:
+            for layer_name, section in (("会议纪要", summary), ("原文校对", proof)):
+                if "Q：" in section or "提问：" in section or "A：" in section or "回答：" in section:
+                    errors.append(f"{layer_name}不得使用 Q/A、提问或回答前缀")
+        if meeting_type == "公司交流":
+            if not metadata_field_present(markdown, "会议标的"):
+                errors.append("公司交流必须包含会议元信息字段: 会议标的")
+            elif not COMPANY_TARGET_RE.fullmatch(markdown_field(markdown, "会议标的")):
+                errors.append("公司交流会议标的必须使用已核验的单一 公司名(代码)，不得混入板块、行业或待确认占位")
+        if meeting_type == "多人复盘会":
+            subsection_findings = review_proof_heading_findings(proof)
+            if subsection_findings:
+                errors.append("多人复盘会原文校对四级小段标题格式错误: " + "；".join(subsection_findings[:6]))
+            speaker_findings = review_speaker_heading_topic_findings(
+                re.findall(r"(?m)^###(?!#)\s*(.+?)\s*$", proof)
+            )
+            if speaker_findings:
+                errors.append("发言人标题不是标的或主题标题: " + "；".join(speaker_findings[:4]))
+            proof_lines = proof.splitlines()
+            for index, raw_line in enumerate(proof_lines):
+                if not raw_line.startswith("### "):
+                    continue
+                block = "\n".join(proof_lines[index + 1 :])
+                next_speaker = re.search(r"(?m)^### ", block)
+                if next_speaker:
+                    block = block[: next_speaker.start()]
+                if block.strip() and not re.search(r"(?m)^#### 【", block):
+                    warnings.append("多人复盘会原文校对发言段缺少相邻四级小段标题，建议复核")
+                    break
+    warnings.extend(expert_language_surface_warnings(markdown, meeting_type))
 
-    has_body_section = "## 一、发言整理" in markdown
-    has_subheading = bool(re.search(r"^###(?!#)\s+", markdown, re.MULTILINE))
-    has_question = bool(question_lines(markdown))
-    if has_body_section and not has_subheading and not has_question:
-        warnings.append("发言整理中未检测到三级发言人标题")
-
-    ambiguity_exists = has_ambiguity_section(markdown)
-
-    if ambiguity_exists:
-        table_lines = ambiguity_table_lines(markdown)
-        if not table_lines:
-            errors.append("存疑与待确认章节存在时必须包含 Markdown 表格；无存疑内容时应省略整节")
-        else:
-            headers = [cell.strip() for cell in table_lines[0].strip("|").split("|")]
-            ambiguity_headers = headers
-            allowed_headers = expected_ambiguity_headers(normalized_source_mode, normalized_timestamp_mode)
-            if headers not in allowed_headers:
-                errors.append(f"存疑与待确认表格表头必须固定为: {format_allowed_headers(allowed_headers)}")
-            if real_ambiguity_row_count(markdown, headers) == 0:
-                errors.append("存疑与待确认章节存在时必须包含至少一条真实存疑；无存疑内容时应省略整节")
-            manual_confirmation_rows = ambiguity_rows_with_manual_confirmation(markdown, headers)
-            if manual_confirmation_rows:
-                preview = "；".join(manual_confirmation_rows[:4])
-                errors.append(f"人工确认列必须存在于最后且保持空白，供人工填写: {preview}")
-
-    if normalized_source_mode == "document" or normalized_timestamp_mode == "unavailable":
-        timestamp_markers = contains_timestamp_markers(markdown)
-        if timestamp_markers:
-            preview = "；".join(timestamp_markers[:4])
-            errors.append(f"文稿或无可靠时间戳模式不应出现存疑时间戳或时间戳列: {preview}")
-
-    invalid_inline_timestamps = invalid_inline_timestamp_markers(markdown)
-    invalid_table_timestamps = invalid_table_timestamp_values(markdown, ambiguity_headers)
-    if invalid_inline_timestamps or invalid_table_timestamps:
-        preview = "；".join((invalid_inline_timestamps + invalid_table_timestamps)[:4])
-        errors.append(f"存疑时间戳格式必须为 MM:SS、HH:MM:SS 或同格式范围: {preview}")
-
-    inline_body_timestamps = body_inline_timestamp_markers(markdown)
-    if inline_body_timestamps:
-        preview = "；".join(inline_body_timestamps[:4])
-        errors.append(f"发言整理正文不得出现存疑时间戳；时间戳只进入过程记录或最终存疑表: {preview}")
-
-    if normalized_source_mode == "audio" or normalized_timestamp_mode == "reliable":
-        fallback_timestamps = audio_timestamp_fallbacks(markdown)
-        if fallback_timestamps:
-            preview = "；".join(fallback_timestamps[:4])
-            errors.append(f"音频来源不允许将存疑时间戳写成未提供: {preview}")
+    if markdown.count("**") % 2:
+        errors.append("粗体标记未成对闭合")
+    bold_codes = stock_code_bold_findings(markdown)
+    if bold_codes:
+        errors.append("股票代码不得加粗: " + "、".join(bold_codes[:8]))
+    for raw_line in markdown.splitlines():
+        stripped_line = raw_line.strip()
+        if "**【" in stripped_line and not TITLE_LINE_RE.fullmatch(stripped_line):
+            errors.append(f"加粗段落标题必须独占一行并使用 **【……】** 格式: {stripped_line}")
+            break
 
     for term in required_terms or []:
         if term not in markdown:
@@ -1023,13 +1141,13 @@ def main() -> int:
         "--source-mode",
         choices=SOURCE_MODE_CHOICES,
         default="auto",
-        help="来源模式；需结合 --timestamp-mode 判断存疑表是否包含时间戳列",
+        help="来源模式；时间戳仅用于内部审核材料校验",
     )
     parser.add_argument(
         "--timestamp-mode",
         choices=["auto", "reliable", "unavailable"],
         default="auto",
-        help="时间戳可靠性；reliable 要求带时间戳表头，unavailable 用于音频来源但无可靠 anchor 的无时间戳表格校验，auto 接受两者",
+        help="时间戳可靠性；仅校验内部 timestamp_index，不向终稿写入时间戳",
     )
     parser.add_argument("--require-audio-timestamps", action="store_true", help="音频来源不允许把存疑时间戳批量写成未提供")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
@@ -1070,7 +1188,10 @@ def main() -> int:
         result["verification"] = verification_result
         result["errors"].extend(verification_result["errors"])
         result["warnings"].extend(verification_result["warnings"])
+        if verification_result["ok"]:
+            result["errors"].extend(inline_doubtful_mapping_findings(markdown, verification_path))
         result["ok"] = result["ok"] and verification_result["ok"]
+        result["ok"] = result["ok"] and not result["errors"]
     if args.timestamp_index:
         timestamp_index_result = validate_timestamp_index_file(
             Path(args.timestamp_index).expanduser(),

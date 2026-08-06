@@ -45,8 +45,18 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 DEFAULT_CASES_PATH = SKILL_DIR / "references/regression_samples/cases.json"
 
+
+def utf8_subprocess_env() -> dict[str, str]:
+    """Make Python child-process output deterministic across host locales."""
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
 sys.path.insert(0, str(SCRIPT_DIR))
 from validate_meeting_minutes_contract import (  # noqa: E402
+    inline_doubtful_mapping_findings,
     validate_contract,
     validate_timestamp_index_file,
     validate_verification_sidecar,
@@ -660,7 +670,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                     "target._commit_sensevoice_outputs(output_dir, stem, {'.txt': 'CRASH TXT\\n', '.json': 'CRASH JSON\\n'})",
                 ]
             )
-            child_env = os.environ.copy()
+            child_env = utf8_subprocess_env()
             existing_pythonpath = child_env.get("PYTHONPATH", "")
             child_env["PYTHONPATH"] = os.pathsep.join(
                 item for item in (str(SCRIPT_DIR), existing_pythonpath) if item
@@ -669,6 +679,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 [sys.executable, "-c", child_code, str(output_dir), stem],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 env=child_env,
                 timeout=10,
             )
@@ -694,6 +705,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 [sys.executable, "-c", child_code, str(output_dir), victim_stem],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 env=child_env,
                 timeout=10,
             )
@@ -798,6 +810,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
+                env=utf8_subprocess_env(),
                 timeout=20,
                 check=False,
             )
@@ -1611,6 +1624,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
+                env=utf8_subprocess_env(),
                 timeout=20,
                 check=False,
             )
@@ -1633,6 +1647,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
+                    env=utf8_subprocess_env(),
                     timeout=20,
                     check=False,
                 )
@@ -1644,6 +1659,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
+                    env=utf8_subprocess_env(),
                     timeout=20,
                     check=False,
                 )
@@ -2315,6 +2331,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
+                        env=utf8_subprocess_env(),
                         timeout=20,
                         check=False,
                     )
@@ -3032,7 +3049,10 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             result["verification"] = verification_result
             result["errors"].extend(verification_result["errors"])
             result["warnings"].extend(verification_result["warnings"])
+            if verification_result["ok"]:
+                result["errors"].extend(inline_doubtful_mapping_findings(markdown, verification_path))
             result["ok"] = result["ok"] and verification_result["ok"]
+            result["ok"] = result["ok"] and not result["errors"]
         if case.get("timestamp_index_file"):
             timestamp_index_path = base_dir / str(case["timestamp_index_file"])
             timestamp_index_result = validate_timestamp_index_file(

@@ -267,6 +267,7 @@ def run_mas_phase_operator(
             "dispatch_tasks": plan.get("dispatch_tasks", []) if plan else [],
             "dispatch_batches": plan.get("dispatch_batches", []) if plan else [],
             "dispatch_waves": plan.get("dispatch_waves", []) if plan else [],
+            "parallel_dispatch_groups": plan.get("parallel_dispatch_groups", []) if plan else [],
             "max_parallel": max_parallel,
             "main_owned_missing_artifacts": plan.get("main_owned_missing_artifacts", []) if plan else [],
             "repair_errors": plan.get("repair_errors", []) if plan else [],

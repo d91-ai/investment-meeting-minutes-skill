@@ -16,6 +16,38 @@
                                          ]
                   },
                   {
+                      "name":  "语义审核前预检接受完整双层纪要",
+                      "mode":  "draft_review_preflight_valid",
+                      "check":  "draft_review_preflight",
+                      "file":  "dual_layer_expert_inline_doubtful.md",
+                      "verification_file":  "dual_layer_expert_inline_doubtful.verification.json",
+                      "source_mode":  "document_only",
+                      "expect_ready":  true
+                  },
+                  {
+                      "name":  "语义审核前预检拒绝缺少校对层的草稿",
+                      "mode":  "draft_review_preflight_invalid",
+                      "check":  "draft_review_preflight",
+                      "file":  "dual_layer_missing_proof_negative.md",
+                      "source_mode":  "document_only",
+                      "expect_ready":  false
+                  },
+                  {
+                      "name":  "同稿语义审核并行派发计划",
+                      "mode":  "mas_parallel_draft_review_plan",
+                      "check":  "mas_plan_summary",
+                      "file":  "mas_run_summary_parallel_draft_review.json",
+                      "expect_plan_status":  "dispatch_or_collect_phase",
+                      "required_terms":  [
+                                             "freeze_and_validate_draft_before_semantic_review",
+                                             "prepare_draft_review.py",
+                                             "draft_review_parallel_01",
+                                             "fidelity_review",
+                                             "target_attribution_review",
+                                             "same frozen Markdown bytes"
+                                         ]
+                  },
+                  {
                       "name":  "未确认 ticker 不得进入标题规则检查",
                       "mode":  "reference_unconfirmed_ticker_heading_boundary",
                       "check":  "text_contains",

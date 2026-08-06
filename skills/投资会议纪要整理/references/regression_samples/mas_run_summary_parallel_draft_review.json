@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+  "ok": false,
+  "task_dir": "synthetic-dispatch",
+  "next_action": {
+    "type": "collect_or_dispatch_phase_artifacts",
+    "phase": "draft_review",
+    "task_files": [
+      {
+        "artifact_type": "fidelity_review",
+        "task_id": "synthetic:fidelity-review",
+        "role": "Fidelity Reviewer",
+        "dispatch_phase": "draft_review",
+        "path": "04-fidelity_review.prompt.md"
+      },
+      {
+        "artifact_type": "target_attribution_review",
+        "task_id": "synthetic:target-attribution-review",
+        "role": "Target Attribution Reviewer",
+        "dispatch_phase": "draft_review",
+        "path": "05-target_attribution_review.prompt.md"
+      }
+    ],
+    "main_owned_missing_artifacts": [],
+    "missing_artifacts": [
+      "fidelity_review",
+      "target_attribution_review"
+    ],
+    "main_actions": [],
+    "errors": []
+  },
+  "errors": [],
+  "warnings": []
+}

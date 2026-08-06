@@ -29,8 +29,8 @@ description: "Use when Codex needs to turn a Chinese investment meeting recordin
 4. 音频输入先按 `references/runtime_readiness_guide.md` 检查环境，再使用 `scripts/transcribe_audio.py`。音频加文稿时先转录音频，比较同会话材料质量并选择正文主源。
 5. 按 `references/verification_policy.md` 校对源材料、核验实体和代码；将证据充分的唯一候选直接修正为普通字体，只把仍未解决的项目写入内部 `doubtful_items`、sidecar 与正文内嵌粗体。
 6. 默认按 `references/mas_orchestration_contract.md` 执行适用的 MAS 审核链。实体核验和双层忠实度审核为基线；多人复盘会增加标的归因审核；音频或 ASR 输入增加转写审核。审核必须绑定当前 Markdown 路径和 SHA-256。
-7. 先生成原文校对层，再据此生成会议纪要层；不得把 specialist 的自由文本或外部背景写入任一正文层。
-8. 完成摘要来源映射、顺序、遗漏、标的归因、内嵌存疑覆盖和来源忠实度复核；正文修改会使旧审核失效，必须重新审核。
+7. 先一次性生成原文校对层，再据此生成会议纪要层；不得把 specialist 的自由文本或外部背景写入任一正文层。完成实体、代码、内嵌存疑和摘要来源映射后，运行 `scripts/prepare_draft_review.py NOTE.md --out "$MAS_DISPATCH/draft_review_readiness.json" --json`。只有 `ready_for_semantic_review=true` 时才冻结当前 Markdown 字节并进入语义审核，避免把结构未完成的草稿送审。
+8. 对同一冻结稿并行执行同一 `draft_review` 阶段的忠实度审核和标的归因审核；两者必须使用 readiness receipt 中相同的路径与 SHA-256。完成顺序、遗漏、观点强度、条件、时间和来源忠实度复核；任何正文修改仍会使旧审核失效，必须在新字节上重新运行预检及受影响的语义审核，不得以性能优化为由跳过审核。
 9. 导出前运行：
 
 ```bash

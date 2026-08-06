@@ -153,6 +153,20 @@ def speaker_edit_assembly_command(task_dir: Path) -> str:
     return quote_command(["python3", str(script_path), str(task_dir), "--json"])
 
 
+def draft_review_preflight_command(task_dir: Path) -> str:
+    script_path = Path(__file__).with_name("prepare_draft_review.py")
+    return quote_command(
+        [
+            "python3",
+            str(script_path),
+            "<main-owned-current-draft.md>",
+            "--out",
+            str(task_dir / "draft_review_readiness.json"),
+            "--json",
+        ]
+    )
+
+
 def plan_status_for(action_type: str) -> str:
     if action_type == "collect_or_dispatch_phase_artifacts":
         return "dispatch_or_collect_phase"
@@ -245,6 +259,44 @@ def build_dispatch_waves(
     ]
 
 
+def build_parallel_dispatch_groups(
+    dispatch_tasks: list[dict[str, str]],
+    max_parallel: int,
+) -> list[dict[str, Any]]:
+    """Describe safe same-phase concurrency without changing task contracts."""
+    if max_parallel < 1 or max_parallel > 8:
+        raise ValueError("max_parallel must be between 1 and 8")
+    if not dispatch_tasks or all(
+        task.get("dispatch_phase") == "editing"
+        and task.get("artifact_type", "").startswith("speaker_turn_edit__")
+        for task in dispatch_tasks
+    ):
+        return []
+
+    groups: list[dict[str, Any]] = []
+    tasks_by_phase: dict[str, list[dict[str, str]]] = {}
+    for task in dispatch_tasks:
+        tasks_by_phase.setdefault(task.get("dispatch_phase", ""), []).append(task)
+    for phase, phase_tasks in tasks_by_phase.items():
+        for offset in range(0, len(phase_tasks), max_parallel):
+            members = phase_tasks[offset : offset + max_parallel]
+            groups.append(
+                {
+                    "group_id": f"{phase or 'unknown'}_parallel_{offset // max_parallel + 1:02d}",
+                    "dispatch_phase": phase,
+                    "artifact_types": [task["artifact_type"] for task in members],
+                    "task_ids": [task["task_id"] for task in members],
+                    "max_parallel": max_parallel,
+                    "shared_prerequisite": (
+                        "draft_review_readiness.json bound to the same frozen Markdown bytes"
+                        if phase == "draft_review"
+                        else "all phase prerequisites satisfied"
+                    ),
+                }
+            )
+    return groups
+
+
 def plan_from_summary(summary: dict[str, Any], max_parallel: int = 3) -> dict[str, Any]:
     errors: list[str] = []
     if summary.get("schema_version") != "1.0":
@@ -298,9 +350,25 @@ def plan_from_summary(summary: dict[str, Any], max_parallel: int = 3) -> dict[st
     repair_errors = [str(item) for item in next_action.get("errors", []) if str(item)]
     dispatch_batches = build_speaker_edit_batches(dispatch_tasks, max_parallel)
     dispatch_waves = build_dispatch_waves(dispatch_batches, max_parallel)
+    parallel_dispatch_groups = build_parallel_dispatch_groups(dispatch_tasks, max_parallel)
+    parallel_group_by_artifact = {
+        artifact_type: str(group["group_id"])
+        for group in parallel_dispatch_groups
+        for artifact_type in group["artifact_types"]
+    }
 
     recommended_steps: list[dict[str, Any]] = []
     if action_type == "collect_or_dispatch_phase_artifacts":
+        if phase == "draft_review" and dispatch_tasks:
+            recommended_steps.append(
+                {
+                    "action": "freeze_and_validate_draft_before_semantic_review",
+                    "owner": "Main Orchestrator",
+                    "command": draft_review_preflight_command(task_dir),
+                    "blocking_condition": "ready_for_semantic_review must be true",
+                    "reuse": "dispatch all same-wave semantic reviewers against the receipt path and SHA-256",
+                }
+            )
         if dispatch_batches:
             for batch in dispatch_batches:
                 recommended_steps.append(
@@ -328,6 +396,7 @@ def plan_from_summary(summary: dict[str, Any], max_parallel: int = 3) -> dict[st
                         "artifact_type": task["artifact_type"],
                         "role": task["role"],
                         "prompt_path": task["prompt_path"],
+                        "parallel_group_id": parallel_group_by_artifact.get(task["artifact_type"], ""),
                     }
                 )
         for task in dispatch_tasks:
@@ -432,6 +501,7 @@ def plan_from_summary(summary: dict[str, Any], max_parallel: int = 3) -> dict[st
         "dispatch_tasks": dispatch_tasks,
         "dispatch_batches": dispatch_batches,
         "dispatch_waves": dispatch_waves,
+        "parallel_dispatch_groups": parallel_dispatch_groups,
         "max_parallel": max_parallel,
         "tasks_per_agent_call": 1,
         "main_owned_missing_artifacts": main_owned_missing,

@@ -80,6 +80,7 @@ from build_speaker_turn_manifest import build_manifest as build_speaker_turn_man
 from ingest_mas_artifact import expand_speaker_edit_response, ingest_mas_artifact_file  # noqa: E402
 import ingest_mas_artifact as ingest_mas_artifact_module  # noqa: E402
 from plan_mas_next_action import plan_from_summary  # noqa: E402
+from prepare_draft_review import prepare_draft_review  # noqa: E402
 from run_mas_phase_operator import DEFAULT_MAX_PARALLEL, run_mas_phase_operator  # noqa: E402
 from run_mas_dry_run import (  # noqa: E402
     run_mas_dry_run,
@@ -251,6 +252,34 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             "ok": not errors,
             "errors": errors,
             "warnings": warnings,
+        }
+    elif case.get("check") == "draft_review_preflight":
+        verification_path = (
+            base_dir / str(case["verification_file"])
+            if case.get("verification_file")
+            else None
+        )
+        preflight = prepare_draft_review(
+            file_path,
+            verification_path=verification_path,
+            source_mode=str(case.get("source_mode") or "auto"),
+        )
+        expected_ready = bool(case.get("expect_ready"))
+        actual_ready = bool(preflight.get("ready_for_semantic_review"))
+        errors = []
+        if actual_ready != expected_ready:
+            errors.append(
+                f"draft-review preflight readiness mismatch: expected={expected_ready} actual={actual_ready}"
+            )
+        if actual_ready and not str(preflight.get("markdown_sha256") or ""):
+            errors.append("passing draft-review preflight did not freeze a Markdown SHA-256")
+        if not actual_ready and str(preflight.get("markdown_sha256") or ""):
+            errors.append("failed draft-review preflight unexpectedly emitted a frozen SHA-256")
+        result = {
+            **preflight,
+            "ok": not errors,
+            "errors": errors,
+            "preflight_errors": preflight.get("errors", []),
         }
     elif case.get("check") == "export_mas_draft_gate":
         with tempfile.TemporaryDirectory(prefix="meeting-minutes-export-gate-") as tmpdir:

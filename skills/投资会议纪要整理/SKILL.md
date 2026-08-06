@@ -9,7 +9,7 @@ description: "Use when Codex needs to turn a Chinese investment meeting recordin
 
 Turn the current meeting's materials into one source-faithful Markdown note. The formal output contains:
 
-- `## 一、会议纪要`: correct grammatical errors and remove contextually useless acknowledgements, procedural exchanges, oral redundancy, and repeated explanations that add no distinct information.
+- `## 一、会议纪要`: synthesize decision-relevant content into fewer, denser paragraphs. Within the same speaker turn, Q&A block, or continuous theme, merge statements that support one conclusion; retain the conclusion, key evidence, necessary causal chain, numbers, conditions, risks, actions, and uncertainty, while omitting discussion process, redundant argument, and examples that add no independent investment information.
 - `## 二、参考原文`: lightly clean filler, obvious ASR noise, meaningless repetition, and repeated false starts while preserving all source turns.
 - `## 三、存疑与待确认`: include only when a name, security code, or term cannot be uniquely identified, or the current-session sources materially conflict.
 
@@ -81,7 +81,7 @@ Load `references/output_contract.md` and exactly one meeting-type reference:
 
 Generate both sections from the same ordered source turns.
 
-For `会议纪要`, correct grammar and remove only content that adds no distinct information in context. Keep useful examples, reasons, conditions, comparisons, emphasis, uncertainty, numbers, timing, actions, and Q&A order. Adjacent same-speaker turns inside one continuous answer may become consecutive paragraphs; never merge different speakers.
+For `会议纪要`, write a materially shorter investment-research information layer rather than a lightly edited transcript. Aggregate one conclusion with its key evidence, necessary causal chain, conditions, risks, actions, numbers, and uncertainty. Retain research signals and follow-up variables even when they do not yet support an immediate decision. Omit rhetorical setup, conversational exploration, repeated support, and examples that merely illustrate an already supported point; keep an example only when it adds an independent fact, boundary, or counterexample. Preserve speaker attribution and Q&A order, and never merge different speakers. Do not target a fixed compression ratio.
 
 For `参考原文`, apply only light cleanup. Account for every source turn and do not apply the stronger condensation used in `会议纪要`. A wholly meaningless turn may produce no body text; record a short omission reason only in a long-material package where an entire source turn is removed. The direct path needs no additional artifact or gate.
 
@@ -93,10 +93,11 @@ For `专家交流`, hide all speaker headings in `会议纪要` and retain only 
 
 For `direct`, check the generated bodies against the source in the same main workflow. For long material, each package performs this check for its own source span before returning body-ready text. Check:
 
-- every substantive paragraph maps to the correct source speaker and Q&A group;
-- no distinct fact, reason, condition, comparison, number, time, action, uncertainty, or negation was lost or strengthened;
+- every substantive paragraph maps to the correct source speaker and Q&A group; every entity, number, causal claim, or conclusion newly present in the output must map back to the current-session source. External identity evidence may normalize a public name or code but must not supply a meeting fact;
+- `参考原文` lost or strengthened no distinct substantive fact, reason, condition, comparison, number, time, action, uncertainty, or negation;
+- `会议纪要` lost or strengthened no research-relevant conclusion, key evidence, quantitative anchor, condition, assumption, risk, contrary view, follow-up variable, action, uncertainty, or negation that changes the interpretation boundary;
 - short replies and questions remain attributed correctly;
-- `会议纪要` has removed genuinely useless speech without becoming a summary;
+- `会议纪要` is materially more concise and aggregated than `参考原文`, without dropping a decision-relevant conclusion, qualification, risk, or contrary view or adding an organizer's conclusion;
 - `参考原文` remains source-aligned;
 - entities and target headings follow the selected meeting-type rules.
 

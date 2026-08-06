@@ -36,18 +36,7 @@
 - `scripts/build_speaker_turn_manifest.py`：显式 turn 解析与线性容量分包。
 - `scripts/assemble_speaker_turn_edits.py`：长材料返回的顺序和覆盖检查。
 - `scripts/validate_meeting_minutes_contract.py`：客观 Markdown 结构校验。
-- `tools/meeting_minutes/`：不进入安装 Skill 的可选归档、导出和历史迁移工具。
-
-## 开发验证
-
-以下检查用于修改 Skill、脚本或输出格式之后，不作为每份会议纪要的生产门禁：
-
-```bash
-python3 skills/投资会议纪要整理/scripts/validate_utf8_text.py README.md skills/投资会议纪要整理 --recursive --portable-skill
-python3 tests/meeting_minutes/run_regression.py --json
-```
-
-验证具体纪要：
+## 验证具体纪要
 
 ```bash
 python3 skills/投资会议纪要整理/scripts/validate_utf8_text.py NOTE.md --require-cjk

@@ -56,7 +56,16 @@ def run_command(args: list[str], *, cwd: Path | None = None, timeout: int = 20) 
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     try:
-        result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=timeout, env=env)
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
     except FileNotFoundError as exc:
         return 127, "", str(exc)
     except subprocess.TimeoutExpired as exc:
@@ -387,6 +396,7 @@ def document_checks(strict: bool, *, prepare_local_dirs: bool = False) -> list[d
     checks = [
         utf8_roundtrip_check(),
         python_module_check("Python 依赖: python-docx", "docx", strict=strict, python_executable=document_python),
+        python_module_check("Python 依赖: pypinyin", "pypinyin", strict=strict, python_executable=document_python),
         temp_dir_check(),
         path_check("原始输入目录", RAW_DIR, writable=True, create_if_missing=prepare_local_dirs),
         path_check("本地输出目录", MINUTES_DIR, writable=True, create_if_missing=prepare_local_dirs),

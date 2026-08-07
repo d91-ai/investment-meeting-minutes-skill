@@ -51,7 +51,7 @@ python3 scripts/check_investment_workflow_health.py --profile full --strict
 strict 模式按 profile 检查对应资源：
 
 - `asr --strict`：缺少 `funasr`、`modelscope`、`soundfile`、`librosa`、本地 SenseVoice 主模型缓存、本地 Paraformer 辅助模型缓存、本地 fsmn-vad 模型缓存、运行中的 SenseVoice bridge 健康检查接口或服务上报的模型缓存时应失败。
-- `document --strict`：缺少 `docx`、UTF-8 文本处理、临时目录、本地输入目录或本地输出目录时应失败。
+- `document --strict`：缺少 `docx`、`pypinyin`、UTF-8 文本处理、临时目录、本地输入目录或本地输出目录时应失败。
 - `export --strict`：缺少本地输出目录、Markdown validator、Markdown 导出器或安全原子发布能力时应失败。
 - `full --strict`：运行以上全部本地基础检查。
 
@@ -93,6 +93,8 @@ python3 scripts/check_investment_workflow_health.py --profile export --prepare-l
 ## 部署准备
 
 如果 strict 模式报告依赖或模型缺失，应先修复部署环境，再处理正式会议。任何下载或安装都应作为人工部署步骤执行，不应藏在会议处理脚本里。
+
+部署文档解析和实体音近召回依赖时，在会议任务之外安装 `skills/投资会议纪要整理/requirements.txt`；正式任务中使用 `query_symbol_candidates.py --require-phonetic`，不可用时应阻断该召回步骤，不得声称已经完成拼音校对。
 
 本地路径和 Python 选择：
 

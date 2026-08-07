@@ -68,8 +68,17 @@
                                              "unresolved_insufficient",
                                              "confirmed_replacements",
                                              "不得因候选栏只有一项而自动确认",
-                                             "从 `doubtful_items`、正文粗体和 verification sidecar 中移除"
+                                             "从 `doubtful_items`、正文粗体和 verification sidecar 中移除",
+                                             "全文已确认实体",
+                                             "完整拼音、拼音首字母和近似拼音",
+                                             "拼音和首字母只用于候选召回"
                                          ]
+                  },
+                  {
+                      "name":  "拼音候选召回保持候选状态",
+                      "mode":  "symbol_phonetic_recall",
+                      "check":  "symbol_phonetic_recall",
+                      "file":  "../../scripts/query_symbol_candidates.py"
                   },
                   {
                       "name":  "专家交流语言清理规则检查",
@@ -462,6 +471,8 @@
                                         ],
                       "required_terms":  [
                                              "Do not write, modify, assemble, or export final Markdown.",
+                                             "Scan the full current-session source for already confirmed entities",
+                                             "Use aliases, full pinyin, pinyin initials, and approximate pinyin only for candidate recall",
                                              "For every entity used as a securities target in the body",
                                              "do not apply this to entities mentioned only as customers",
                                              "A single generated candidate is not enough.",

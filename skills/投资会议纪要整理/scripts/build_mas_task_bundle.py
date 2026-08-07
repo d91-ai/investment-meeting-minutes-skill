@@ -146,6 +146,7 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         "objective": "Verify non-person business entities and update doubtful_items proposals.",
         "inputs": [
             "current-session source context",
+            "confirmed entities from the full current-session source",
             "entity candidates",
             "local code candidates",
             "external evidence paths",
@@ -153,6 +154,9 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         "checks": [
             "company names",
             "stock codes",
+            "full-source entity reuse and alias matching",
+            "full-pinyin, pinyin-initial, and approximate-pinyin candidate recall",
+            "local industry context and adjacent-entity consistency",
             "customers and suppliers",
             "numbers and dates",
             "industry terms",
@@ -766,6 +770,11 @@ def prompt_for_task(
     elif artifact_type == "entity_verification_report":
         lines.append("Every items entry must appear in exactly one of confirmed_items or unresolved_items.")
         lines.append("Do not copy local_candidate_paths into external_evidence_paths.")
+        lines.append(
+            "Scan the full current-session source for already confirmed entities before generating additional candidates. "
+            "Use aliases, full pinyin, pinyin initials, and approximate pinyin only for candidate recall; never treat a "
+            "phonetic match as confirmation without matching local context, adjacent entities, and per-item reliable evidence."
+        )
         lines.append(
             "A single generated candidate is not enough. Only when the normalized candidate is unique, fits the exact source "
             "context, has per-item reliable evidence, has no conflict, and does not change viewpoint strength, conditions, or "

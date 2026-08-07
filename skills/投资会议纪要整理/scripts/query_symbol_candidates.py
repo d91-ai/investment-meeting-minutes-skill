@@ -11,8 +11,15 @@ import re
 import sys
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
+
+try:
+    from pypinyin import Style, lazy_pinyin
+except ImportError:  # Optional until phonetic recall is explicitly required.
+    Style = None  # type: ignore[assignment]
+    lazy_pinyin = None  # type: ignore[assignment]
 
 DEFAULT_WORKSPACE_ROOT = (
     Path(os.environ["INVESTMENT_MINUTES_WORKSPACE"]).expanduser()
@@ -21,6 +28,7 @@ DEFAULT_WORKSPACE_ROOT = (
 )
 DEFAULT_SYMBOL_ROOT = DEFAULT_WORKSPACE_ROOT / "03 Resources/market-symbols"
 DEFAULT_ALIAS_PATH = DEFAULT_SYMBOL_ROOT / "company_aliases.csv"
+CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 
 @dataclass
@@ -31,6 +39,7 @@ class Candidate:
     confidence: float
     match_type: str
     source: str
+    phonetic_similarity: float | None = None
 
 
 def normalize_text(value: str) -> str:
@@ -39,6 +48,54 @@ def normalize_text(value: str) -> str:
 
 def normalize_code(value: str) -> str:
     return value.strip().upper().replace(" ", "")
+
+
+def phonetic_available() -> bool:
+    return lazy_pinyin is not None and Style is not None
+
+
+def normalize_phonetic_source(value: str) -> str:
+    cleaned = re.sub(r"[（(][0-9A-Z.]+[)）]\s*$", "", value.strip(), flags=re.IGNORECASE)
+    return re.sub(r"[-‐‑–—](?:U|W|B|SW|UW)\s*$", "", cleaned, flags=re.IGNORECASE)
+
+
+@lru_cache(maxsize=32768)
+def phonetic_forms(value: str) -> tuple[str, str] | None:
+    source = normalize_phonetic_source(value)
+    if not source or not CJK_PATTERN.search(source) or not phonetic_available():
+        return None
+    syllables = [
+        re.sub(r"[^a-z0-9]", "", item.lower().replace("ü", "v"))
+        for item in lazy_pinyin(source, style=Style.NORMAL, errors=lambda chars: list(chars))  # type: ignore[misc,union-attr]
+    ]
+    syllables = [item for item in syllables if item]
+    if not syllables:
+        return None
+    return "".join(syllables), "".join(item[0] for item in syllables)
+
+
+def phonetic_match_forms(
+    query_forms: tuple[str, str],
+    target_forms: tuple[str, str],
+) -> tuple[float, str, float] | None:
+    query_full, query_initials = query_forms
+    target_full, target_initials = target_forms
+    if query_full == target_full:
+        return 0.92, "pinyin_exact", 1.0
+    similarity = SequenceMatcher(None, query_full, target_full).ratio()
+    if min(len(query_full), len(target_full)) >= 4 and similarity >= 0.82:
+        return round(0.55 + similarity * 0.3, 3), "pinyin_fuzzy", round(similarity, 3)
+    if len(query_initials) >= 2 and query_initials == target_initials:
+        return 0.62, "pinyin_initials", 1.0
+    return None
+
+
+def phonetic_match(query: str, target: str) -> tuple[float, str, float] | None:
+    query_forms = phonetic_forms(query)
+    target_forms = phonetic_forms(target)
+    if query_forms is None or target_forms is None:
+        return None
+    return phonetic_match_forms(query_forms, target_forms)
 
 
 def load_a_share(root: Path) -> list[dict[str, str]]:
@@ -112,8 +169,76 @@ def load_aliases(path: Path) -> list[dict[str, str]]:
         return [dict(row) for row in csv.DictReader(handle) if row.get("query") and row.get("symbol")]
 
 
+def load_session_entities(path: Path | None) -> list[dict[str, object]]:
+    if path is None:
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    items = payload.get("entities") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("session entities 必须是包含 entities 数组的 JSON object")
+    entities: list[dict[str, object]] = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"entities[{index}] 必须是 JSON object")
+        name = str(item.get("name") or "").strip()
+        symbol = normalize_code(str(item.get("symbol") or ""))
+        aliases = item.get("aliases", [])
+        if not name or not symbol or not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
+            raise ValueError(f"entities[{index}] 必须提供 name、symbol 和字符串 aliases 数组")
+        entities.append(
+            {
+                "name": name,
+                "symbol": symbol,
+                "market": str(item.get("market") or "").strip(),
+                "aliases": [alias.strip() for alias in aliases if alias.strip()],
+            }
+        )
+    return entities
+
+
 def load_symbol_rows(root: Path) -> list[dict[str, str]]:
     return load_a_share(root) + load_hk(root) + load_us(root)
+
+
+def market_from_symbol(symbol: str, declared: str) -> str:
+    if declared:
+        return declared
+    if symbol.endswith((".SH", ".SZ", ".BJ")):
+        return "A"
+    if symbol.endswith(".HK"):
+        return "HK"
+    return "US" if re.fullmatch(r"[A-Z.]+", symbol) else "session"
+
+
+def candidate_from_session(
+    query: str,
+    entities: list[dict[str, object]],
+    *,
+    source: str,
+) -> list[Candidate]:
+    normalized_query = normalize_text(query)
+    candidates: list[Candidate] = []
+    for entity in entities:
+        name = str(entity["name"])
+        symbol = normalize_code(str(entity["symbol"]))
+        market = market_from_symbol(symbol, str(entity.get("market") or ""))
+        forms = [name, *[str(alias) for alias in entity.get("aliases", [])]]
+        for form in forms:
+            normalized_form = normalize_text(form)
+            similarity: float | None = None
+            if normalized_query == normalized_form:
+                confidence, match_type = 0.995, "session_entity_exact"
+            elif normalized_query and (normalized_query in normalized_form or normalized_form in normalized_query):
+                confidence, match_type = 0.9, "session_entity_alias"
+            else:
+                phonetic = phonetic_match(query, form)
+                if phonetic is None:
+                    continue
+                confidence, phonetic_type, similarity = phonetic
+                confidence = min(0.96, round(confidence + 0.03, 3))
+                match_type = f"session_entity_{phonetic_type}"
+            candidates.append(Candidate(symbol, name, market, confidence, match_type, source, similarity))
+    return candidates
 
 
 def candidate_from_alias(query: str, aliases: list[dict[str, str]], *, alias_path: Path) -> list[Candidate]:
@@ -129,7 +254,10 @@ def candidate_from_alias(query: str, aliases: list[dict[str, str]], *, alias_pat
             confidence = float(row.get("partial_confidence") or 0.86)
             match_type = "alias_partial"
         else:
-            continue
+            phonetic = phonetic_match(query, row.get("query", ""))
+            if phonetic is None:
+                continue
+            confidence, match_type, similarity = phonetic
         candidates.append(
             Candidate(
                 symbol=normalize_code(row.get("symbol", "")),
@@ -138,6 +266,7 @@ def candidate_from_alias(query: str, aliases: list[dict[str, str]], *, alias_pat
                 confidence=confidence,
                 match_type=match_type,
                 source=str(alias_path),
+                phonetic_similarity=similarity if match_type.startswith("pinyin_") else None,
             )
         )
     return candidates
@@ -162,6 +291,10 @@ def score_row(query: str, row: dict[str, str]) -> Candidate | None:
     ratio = SequenceMatcher(None, normalized_query, normalized_name).ratio()
     if ratio >= 0.72:
         return Candidate(symbol, name, row["market"], round(0.55 + ratio * 0.3, 3), "name_fuzzy", row["source"])
+    phonetic = phonetic_match(raw_query, name)
+    if phonetic is not None:
+        confidence, match_type, similarity = phonetic
+        return Candidate(symbol, name, row["market"], confidence, match_type, row["source"], similarity)
     return None
 
 
@@ -191,10 +324,13 @@ def query_symbols(
     alias_path: Path,
     rows: list[dict[str, str]] | None = None,
     aliases: list[dict[str, str]] | None = None,
+    session_entities: list[dict[str, object]] | None = None,
+    session_source: str = "current_session",
 ) -> dict[str, object]:
     rows = rows if rows is not None else load_symbol_rows(root)
     aliases = aliases if aliases is not None else load_aliases(alias_path)
     candidates: list[Candidate] = []
+    candidates.extend(candidate_from_session(query, session_entities or [], source=session_source))
     candidates.extend(candidate_from_alias(query, aliases, alias_path=alias_path))
     for row in rows:
         if not market_allowed(row["market"], market):
@@ -211,6 +347,7 @@ def query_symbols(
         "status": status,
         "confirmed": False,
         "recommendation": None,
+        "phonetic_backend": "pypinyin" if phonetic_available() else "unavailable",
         "candidates": [asdict(candidate) for candidate in ranked],
     }
 
@@ -254,8 +391,14 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--root", default=str(DEFAULT_SYMBOL_ROOT), help="market-symbols 目录")
     parser.add_argument("--aliases", default=str(DEFAULT_ALIAS_PATH), help="公司别名 CSV")
+    parser.add_argument("--session-entities", help="当前会议已确认实体 JSON，仅用于本次候选召回")
+    parser.add_argument("--require-phonetic", action="store_true", help="拼音召回不可用时阻断查询")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     args = parser.parse_args()
+
+    if args.require_phonetic and not phonetic_available():
+        print("拼音召回不可用；请安装 skills/投资会议纪要整理/requirements.txt", file=sys.stderr)
+        return 2
 
     queries: list[str] = []
     if args.query:
@@ -269,8 +412,14 @@ def main() -> int:
 
     root = Path(args.root).expanduser()
     alias_path = Path(args.aliases).expanduser()
+    session_path = Path(args.session_entities).expanduser() if args.session_entities else None
     rows = load_symbol_rows(root)
     aliases = load_aliases(alias_path)
+    try:
+        session_entities = load_session_entities(session_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        print(f"无法读取当前会议实体: {exc}", file=sys.stderr)
+        return 2
     payloads = [
         query_symbols(
             query,
@@ -280,6 +429,8 @@ def main() -> int:
             alias_path=alias_path,
             rows=rows,
             aliases=aliases,
+            session_entities=session_entities,
+            session_source=str(session_path) if session_path else "current_session",
         )
         for query in queries
     ]

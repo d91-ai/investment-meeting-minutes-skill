@@ -100,6 +100,8 @@ from sensevoice_transcription_server import (  # noqa: E402
     require_audio_form_file,
 )
 import transcribe_audio as transcribe_audio_module  # noqa: E402
+import query_symbol_candidates as symbol_query_module  # noqa: E402
+from query_symbol_candidates import phonetic_match_forms, query_symbols  # noqa: E402
 
 
 def case_series_config(case: dict[str, Any], base_dir: Path) -> Path:
@@ -258,6 +260,49 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             "errors": errors,
             "warnings": warnings,
         }
+    elif case.get("check") == "symbol_phonetic_recall":
+        errors = []
+        expected_types = {
+            "exact": "pinyin_exact",
+            "fuzzy": "pinyin_fuzzy",
+            "initials": "pinyin_initials",
+        }
+        observed = {
+            "exact": phonetic_match_forms(("fancheng", "fc"), ("fancheng", "fc")),
+            "fuzzy": phonetic_match_forms(("fangcheng", "fc"), ("fancheng", "fc")),
+            "initials": phonetic_match_forms(("fuyuan", "fy"), ("fayang", "fy")),
+        }
+        for key, expected_type in expected_types.items():
+            value = observed.get(key)
+            if value is None or value[1] != expected_type:
+                errors.append(f"拼音召回类型错误: {key} expected={expected_type} actual={value}")
+
+        forms = {
+            "疑似词": ("fangcheng", "fc"),
+            "合成公司甲": ("fancheng", "fc"),
+            "合成公司乙": ("beiyuan", "by"),
+        }
+        session_entities = [
+            {"symbol": "000001.SZ", "name": "合成公司甲", "market": "A", "aliases": []},
+            {"symbol": "000002.SZ", "name": "合成公司乙", "market": "A", "aliases": []},
+        ]
+        with patch.object(symbol_query_module, "phonetic_forms", side_effect=lambda value: forms.get(value)):
+            payload = query_symbols(
+                "疑似词",
+                market="all",
+                limit=8,
+                root=base_dir,
+                alias_path=base_dir / "synthetic-aliases.csv",
+                rows=[],
+                aliases=[],
+                session_entities=session_entities,
+            )
+        candidates = payload.get("candidates", [])
+        if payload.get("status") != "candidate_only" or payload.get("confirmed") is not False:
+            errors.append("拼音召回脚本必须保持 candidate_only 且 confirmed=false")
+        if not candidates or candidates[0].get("match_type") != "session_entity_pinyin_fuzzy":
+            errors.append(f"近似拼音候选未正确排序: {candidates}")
+        result = {"ok": not errors, "errors": errors, "warnings": [], "observed": observed}
     elif case.get("check") == "draft_review_preflight":
         verification_path = (
             base_dir / str(case["verification_file"])

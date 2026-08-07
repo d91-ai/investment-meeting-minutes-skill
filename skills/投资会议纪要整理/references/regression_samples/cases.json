@@ -109,6 +109,28 @@
                                          ]
                   },
                   {
+                      "name":  "所有输入默认按原始材料重新校对",
+                      "mode":  "reference_default_raw_source_audit",
+                      "check":  "text_contains",
+                      "file":  "../verification_policy.md",
+                      "required_terms":  [
+                                             "所有输入文档均视为未经完整校对的原始材料",
+                                             "均不能证明校对已经完成",
+                                             "既有修改、存疑标记和结论只作候选线索",
+                                             "标准参考的材料只约束格式或处理标准"
+                                         ]
+                  },
+                  {
+                      "name":  "忠实度审核不得继承预处理文档结论",
+                      "mode":  "reference_fidelity_raw_source_audit",
+                      "check":  "text_contains",
+                      "file":  "../mas_orchestration_contract.md",
+                      "required_terms":  [
+                                             "将所有输入按未经完整校对的原始材料重新审核",
+                                             "不得因文件名、既有排版、粗体、存疑表或整理痕迹而继承旧结论"
+                                         ]
+                  },
+                  {
                       "name":  "Fidelity Reviewer 语言校对执行提示检查",
                       "mode":  "mas_fidelity_language_prompt",
                       "check":  "text_contains",
@@ -116,6 +138,8 @@
                       "required_terms":  [
                                              "minutes-to-proofreading traceability",
                                              "unsupported summary compression or third-person rewrite",
+                                             "document as unreviewed raw source",
+                                             "Existing edits and conclusions are clues only",
                                              "put any polarity or strength drift",
                                              "confirmed_replacements binds that exact source form"
                                          ]

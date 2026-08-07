@@ -24,6 +24,7 @@ description: "Use when Codex needs to turn a Chinese investment meeting recordin
 ## 工作流入口
 
 1. 判断用户是只读审查还是正式整理；只读任务不得归档、导出或修改文件。
+   除非用户明确指定材料为已核定终稿或仅作标准参考，所有输入文档均按未经完整校对的原始材料处理；文件名、既有排版、粗体、存疑标记或整理痕迹不得降低纠错、语言清理、实体核验和忠实度审核强度。
 2. 读取 `references/output_contract.md`，再按会议类型读取一个 Reference：多人复盘会 `meeting_types/review_meeting.md`、公司交流 `meeting_types/listed_company.md`、专家交流 `meeting_types/expert_call.md`。
 3. 按 `references/archive_naming_contract.md` 处理输入归档和文件命名。无法唯一确定会议系列、公司名或主题时向用户确认。
 4. 音频输入先按 `references/runtime_readiness_guide.md` 检查环境，再使用 `scripts/transcribe_audio.py`。音频加文稿时先转录音频，比较同会话材料质量并选择正文主源。

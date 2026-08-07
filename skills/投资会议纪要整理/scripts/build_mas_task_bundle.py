@@ -201,6 +201,7 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
             "unsupported summary compression or third-person rewrite",
             "omitted reasons or numbers",
             "residual meaningless fillers or mechanical connector repetition",
+            "residual errors or unverified conclusions inherited from apparently pre-edited input",
             "negation, self-correction, and polarity drift",
             "lost uncertainty, conditions, or time scope",
             "merged speaker turns",
@@ -802,6 +803,12 @@ def prompt_for_task(
         lines.append("Return reviewed_markdown_path and the SHA-256 of the exact draft bytes you reviewed.")
         lines.append("paragraphs_reviewed must be a positive integer for the actual reviewed scope.")
         lines.append("If source mapping is insufficient, add the exact paragraph to source_mapping_failures; do not infer missing speech.")
+        lines.append(
+            "Unless the user explicitly identifies a document as an approved final or a reference standard only, treat every input "
+            "document as unreviewed raw source. Do not trust filenames, existing formatting, bold text, doubt tables, edit traces, "
+            "or prior review labels as proof of completion; re-audit transcription errors, language cleanup, entity verification, "
+            "and sentence-level fidelity from the current source. Existing edits and conclusions are clues only."
+        )
         lines.append(
             "Review language cleanup conservatively: flag residual standalone courtesies, meaningless fillers, broken sentences, "
             "and mechanical connector repetition, but never classify repeated negatives as removable filler without source context."

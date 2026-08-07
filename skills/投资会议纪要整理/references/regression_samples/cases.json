@@ -7,8 +7,8 @@
                       "file":  "../output_contract.md",
                       "required_terms":  [
                                              "# 会议纪要",
-                                             "- 会议类型：专家交流",
-                                             "- 输入来源：录音+文本",
+                                             "- 会议类型：<会议类型>",
+                                             "- 输入来源：<输入来源>",
                                              "# 原文校对",
                                              "文末不得输出“存疑与待确认”",
                                              "独立行的 `**【……】**` 段落标题",
@@ -1767,18 +1767,10 @@
                                              "YYYY-MM-DD - 会议系列.md",
                                              "YYYY-MM-DD - 公司名 - 上市公司交流.md",
                                              "YYYY-MM-DD - 主题 - 专家交流.md",
-                                             "东方路",
-                                             "程郡",
-                                             "舵主",
-                                             "科技",
-                                             "华鑫周会",
-                                             "电子",
-                                             "苏总",
-                                             "纪博",
-                                             "崔磊",
-                                             "李旦",
-                                             "易欢欢",
-                                             "when there is no match or more than one plausible match"
+                                             "must not hard-code real meeting-series names",
+                                             "meeting_series.json",
+                                             "Keep the real configuration outside the repository",
+                                             "A missing configuration, no match, or more than one plausible match must block export"
                                          ]
                   },
                   {
@@ -1786,15 +1778,50 @@
                       "mode":  "export_filename",
                       "check":  "export_filename",
                       "file":  "text_only.md",
+                      "series_config_file":  "meeting_series.synthetic.json",
                       "meeting_date_override":  "2026-07-01",
-                      "expected_stem":  "2026-07-01 - text_only"
+                      "expected_stem":  "2026-07-01 - 合成系列甲"
                   },
                   {
                       "name":  "多人复盘会从会议标题匹配已知系列",
                       "mode":  "export_filename_infer_review_series",
                       "check":  "export_filename",
                       "file":  "export_naming_infer_series.md",
-                      "expected_stem":  "2026-07-02 - export_naming_infer_series"
+                      "series_config_file":  "meeting_series.synthetic.json",
+                      "expected_stem":  "2026-07-02 - 合成系列甲"
+                  },
+                  {
+                      "name":  "多人复盘会配置无匹配时阻断导出",
+                      "mode":  "export_review_series_no_match_negative",
+                      "check":  "export_filename",
+                      "file":  "review_series_no_match.md",
+                      "series_config_file":  "meeting_series.synthetic.json",
+                      "expect_fail":  true,
+                      "required_error_terms":  [
+                                                   "系列配置未匹配当前会议标题或文件名"
+                                               ]
+                  },
+                  {
+                      "name":  "多人复盘会配置多匹配时阻断导出",
+                      "mode":  "export_review_series_multiple_negative",
+                      "check":  "export_filename",
+                      "file":  "系列甲关键词-系列乙关键词.md",
+                      "series_config_file":  "meeting_series.synthetic.json",
+                      "expect_fail":  true,
+                      "required_error_terms":  [
+                                                   "匹配到多个会议系列"
+                                               ]
+                  },
+                  {
+                      "name":  "多人复盘会缺少系列配置时阻断导出",
+                      "mode":  "export_review_series_missing_config_negative",
+                      "check":  "export_filename",
+                      "file":  "text_only.md",
+                      "series_config_file":  "missing-meeting-series.json",
+                      "expect_fail":  true,
+                      "required_error_terms":  [
+                                                   "系列配置不存在"
+                                               ]
                   },
                   {
                       "name":  "上市公司交流导出命名使用公司名",
@@ -1821,6 +1848,7 @@
                       "mode":  "export_concurrent_unique_paths",
                       "check":  "export_concurrent",
                       "file":  "text_only.md",
+                      "series_config_file":  "meeting_series.synthetic.json",
                       "meeting_date_override":  "2026-07-01",
                       "count":  8
                   },
@@ -1838,6 +1866,7 @@
                       "mode":  "export_part_cleanup_failure",
                       "check":  "export_part_cleanup_failure",
                       "file":  "text_only.md",
+                      "series_config_file":  "meeting_series.synthetic.json",
                       "meeting_date_override":  "2026-07-01"
                   },
                   {
@@ -1853,6 +1882,7 @@
                       "mode":  "atomic_publish_unsupported",
                       "check":  "atomic_publish_unsupported",
                       "file":  "text_only.md",
+                      "series_config_file":  "meeting_series.synthetic.json",
                       "meeting_date_override":  "2026-07-01",
                       "archive_date":  "2026-07-01",
                       "meeting_title":  "合成归档"

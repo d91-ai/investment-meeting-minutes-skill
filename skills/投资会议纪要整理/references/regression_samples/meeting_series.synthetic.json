@@ -1,0 +1,18 @@
+{
+  "meeting_series": [
+    {
+      "name": "合成系列甲",
+      "aliases": [
+        "text_only",
+        "export_naming_infer_series",
+        "系列甲关键词"
+      ]
+    },
+    {
+      "name": "合成系列乙",
+      "aliases": [
+        "系列乙关键词"
+      ]
+    }
+  ]
+}

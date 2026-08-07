@@ -82,6 +82,8 @@ python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health
 python3 skills/投资会议纪要整理/scripts/check_investment_workflow_health.py --profile export
 ```
 
+多人复盘会的真实会议系列名单不写入可复用 Skill。将其保存为本地 UTF-8 JSON 配置，默认路径为 `$INVESTMENT_MINUTES_WORKSPACE/03 Resources/meeting_series.json`；也可通过 `INVESTMENT_MINUTES_SERIES_CONFIG` 或导出参数 `--series-config` 指定。配置缺失、无唯一匹配或存在冲突时，导出会阻断并要求确认会议系列。
+
 ## MAS 操作说明
 
 MAS 手动 walkthrough 使用唯一临时目录，不作为一次性全绿 validators 清单。Collector 输出必须以顶层 `ok: true` 作为继续门禁；当 `ok: false` 时，只读取 `next_action` 做补齐或修复，不消费 combined artifacts 作为有效结果。

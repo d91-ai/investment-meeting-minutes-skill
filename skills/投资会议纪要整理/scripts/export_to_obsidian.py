@@ -27,21 +27,13 @@ DEFAULT_WORKSPACE_ROOT = (
     else Path.home() / "Documents/会议纪要整理"
 )
 DEFAULT_EXPORT_DIR = DEFAULT_WORKSPACE_ROOT / "01 Projects/会议纪要"
+DEFAULT_SERIES_CONFIG = (
+    Path(os.environ["INVESTMENT_MINUTES_SERIES_CONFIG"]).expanduser()
+    if os.environ.get("INVESTMENT_MINUTES_SERIES_CONFIG")
+    else DEFAULT_WORKSPACE_ROOT / "03 Resources/meeting_series.json"
+)
 INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]+'
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-KNOWN_REVIEW_SERIES = (
-    "东方路",
-    "程郡",
-    "舵主",
-    "科技",
-    "华鑫周会",
-    "电子",
-    "苏总",
-    "纪博",
-    "崔磊",
-    "李旦",
-    "易欢欢",
-)
 MEETING_TYPE_ALIASES = {"上市公司交流": "公司交流"}
 FILENAME_PLACEHOLDERS = {"", "会议系列", "会议类型", "未命名会议", "待确认"}
 ALLOWED_PREEXPORT_ACTIONS = {
@@ -67,6 +59,12 @@ class ExportResult:
     md_path: Path
     md_created: bool
     md_message: str
+
+
+@dataclass(frozen=True)
+class ReviewSeries:
+    name: str
+    aliases: tuple[str, ...]
 
 
 def file_sha256(path: Path) -> str:
@@ -248,25 +246,69 @@ def strip_suffix(value: str, suffixes: tuple[str, ...]) -> str:
     return cleaned
 
 
-def infer_review_series(content: str, source_name: str) -> str:
+def load_review_series_config(config_path: Path) -> tuple[ReviewSeries, ...]:
+    resolved = config_path.expanduser().resolve()
+    if not resolved.is_file():
+        raise ValueError(f"多人复盘会系列配置不存在: {resolved}；请提供配置或向用户确认会议系列")
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"多人复盘会系列配置无法读取或解析: {resolved}: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("meeting_series"), list):
+        raise ValueError("多人复盘会系列配置必须是包含非空 meeting_series 数组的 JSON object")
+
+    entries: list[ReviewSeries] = []
+    seen_names: set[str] = set()
+    alias_owner: dict[str, str] = {}
+    for index, item in enumerate(payload["meeting_series"], start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"meeting_series[{index}] 必须是 JSON object")
+        name = str(item.get("name") or "").strip()
+        if not name or name in FILENAME_PLACEHOLDERS:
+            raise ValueError(f"meeting_series[{index}].name 不能为空或使用占位值")
+        if name in seen_names:
+            raise ValueError(f"多人复盘会系列规范名重复: {name}")
+        aliases_raw = item.get("aliases", [])
+        if aliases_raw is None:
+            aliases_raw = []
+        if not isinstance(aliases_raw, list) or any(not isinstance(alias, str) for alias in aliases_raw):
+            raise ValueError(f"meeting_series[{index}].aliases 必须是字符串数组")
+        aliases = tuple(dict.fromkeys(alias.strip() for alias in [name, *aliases_raw] if alias.strip()))
+        if not aliases:
+            raise ValueError(f"meeting_series[{index}] 必须至少提供规范名")
+        for alias in aliases:
+            owner = alias_owner.get(alias)
+            if owner and owner != name:
+                raise ValueError(f"多人复盘会系列别名重复归属: {alias} -> {owner}, {name}")
+            alias_owner[alias] = name
+        seen_names.add(name)
+        entries.append(ReviewSeries(name=name, aliases=aliases))
+    if not entries:
+        raise ValueError("多人复盘会系列配置的 meeting_series 不得为空")
+    return tuple(entries)
+
+
+def infer_review_series(content: str, source_name: str, series_config_path: Path) -> str:
     explicit = markdown_field(content, "会议系列", "").strip()
     if explicit not in FILENAME_PLACEHOLDERS:
         return sanitize_filename(explicit)
 
+    series_entries = load_review_series_config(series_config_path)
     meeting_title = markdown_field(content, "会议标题", "").strip()
     haystacks = (meeting_title, source_name)
-    matches = [series for series in KNOWN_REVIEW_SERIES if any(series in value for value in haystacks)]
+    matches = [
+        entry.name
+        for entry in series_entries
+        if any(alias in value for alias in entry.aliases for value in haystacks)
+    ]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
         raise ValueError(f"多人复盘会匹配到多个会议系列: {', '.join(matches)}；请向用户确认")
-    source_stem = Path(source_name).stem.strip()
-    if source_stem and source_stem not in FILENAME_PLACEHOLDERS:
-        return sanitize_filename(source_stem)
-    raise ValueError("无法确定多人复盘会的会议系列；请从原始文件名匹配或向用户确认")
+    raise ValueError("多人复盘会系列配置未匹配当前会议标题或文件名；请向用户确认")
 
 
-def detect_filename_title(content: str, source_name: str) -> str:
+def detect_filename_title(content: str, source_name: str, series_config_path: Path = DEFAULT_SERIES_CONFIG) -> str:
     meeting_type_raw = markdown_field(content, "会议类型", "").strip()
     meeting_type = MEETING_TYPE_ALIASES.get(meeting_type_raw, meeting_type_raw)
     meeting_title = markdown_field(content, "会议标题", "").strip()
@@ -274,7 +316,7 @@ def detect_filename_title(content: str, source_name: str) -> str:
     source_stem = re.sub(r"^\d{4}-\d{2}-\d{2}\s*[-_—–]?\s*", "", source_stem).strip()
 
     if meeting_type == "多人复盘会":
-        return infer_review_series(content, source_name)
+        return infer_review_series(content, source_name, series_config_path)
     if meeting_type == "公司交流":
         if not meeting_title:
             meeting_target = markdown_field(content, "会议标的", "").strip()
@@ -347,13 +389,18 @@ def cleanup_part_file(part_path: Path | None) -> None:
         warnings.warn(f"已完成 Markdown 发布，但临时 part 文件清理失败: {part_path}: {exc}", RuntimeWarning)
 
 
-def export_note(source_file: Path, export_dir: Path, date_override: str | None) -> ExportResult:
+def export_note(
+    source_file: Path,
+    export_dir: Path,
+    date_override: str | None,
+    series_config_path: Path = DEFAULT_SERIES_CONFIG,
+) -> ExportResult:
     raw_content = source_file.read_text(encoding="utf-8")
     source_encoding_ok, source_encoding_message = validate_utf8_text_file(source_file, require_cjk=True)
     if not source_encoding_ok:
         raise UnicodeError(source_encoding_message)
     meeting_date = normalize_meeting_date(date_override, raw_content)
-    title = detect_filename_title(raw_content, source_file.name)
+    title = detect_filename_title(raw_content, source_file.name, series_config_path)
     filename_base = f"{meeting_date} - {title}"
     export_dir = export_dir / meeting_date
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -395,6 +442,11 @@ def main() -> int:
     parser.add_argument("input_file", help="已整理完成的 Markdown 文件")
     parser.add_argument("--export-dir", default=str(DEFAULT_EXPORT_DIR), help=f"导出目录，默认 {DEFAULT_EXPORT_DIR}")
     parser.add_argument("--meeting-date", help="覆盖系统日期，格式 YYYY-MM-DD")
+    parser.add_argument(
+        "--series-config",
+        default=str(DEFAULT_SERIES_CONFIG),
+        help=f"多人复盘会系列配置 JSON，默认 {DEFAULT_SERIES_CONFIG}",
+    )
     parser.add_argument("--mas-summary", required=True, help="当前运行且已完成 draft_review 的 mas_run_summary.json")
     parser.add_argument("--verification", help="可选：verification sidecar JSON/JSONL")
     parser.add_argument("--require-verification", action="store_true", help="要求 verification sidecar 存在且非空")
@@ -423,7 +475,12 @@ def main() -> int:
             timestamp_mode=args.timestamp_mode,
             require_audio_timestamps=args.require_audio_timestamps,
         )
-        result = export_note(source_file, export_dir, args.meeting_date)
+        result = export_note(
+            source_file,
+            export_dir,
+            args.meeting_date,
+            Path(args.series_config).expanduser().resolve(),
+        )
     except Exception as exc:
         print(f"Markdown: 未生成 ({exc})", file=sys.stderr)
         return 1

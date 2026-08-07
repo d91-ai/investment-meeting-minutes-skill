@@ -102,6 +102,11 @@ from sensevoice_transcription_server import (  # noqa: E402
 import transcribe_audio as transcribe_audio_module  # noqa: E402
 
 
+def case_series_config(case: dict[str, Any], base_dir: Path) -> Path:
+    raw = str(case.get("series_config_file") or "").strip()
+    return (base_dir / raw).resolve() if raw else export_module.DEFAULT_SERIES_CONFIG
+
+
 def read_cases(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     cases = payload.get("cases")
@@ -332,6 +337,7 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
                     file_path,
                     Path(tmpdir),
                     str(case["meeting_date_override"]) if case.get("meeting_date_override") else None,
+                    case_series_config(case, base_dir),
                 )
                 expected_stem = str(case["expected_stem"])
                 actual_stem = result_export.md_path.stem
@@ -358,7 +364,12 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             with ThreadPoolExecutor(max_workers=count) as executor:
                 exports = list(
                     executor.map(
-                        lambda _: export_note(file_path, Path(tmpdir), str(case.get("meeting_date_override") or "")),
+                        lambda _: export_note(
+                            file_path,
+                            Path(tmpdir),
+                            str(case.get("meeting_date_override") or ""),
+                            case_series_config(case, base_dir),
+                        ),
                         range(count),
                     )
                 )
@@ -393,7 +404,12 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
 
             with patch.object(Path, "unlink", fail_part_unlink), py_warnings.catch_warnings(record=True) as caught:
                 py_warnings.simplefilter("always")
-                exported = export_note(file_path, Path(tmpdir), str(case.get("meeting_date_override") or ""))
+                exported = export_note(
+                    file_path,
+                    Path(tmpdir),
+                    str(case.get("meeting_date_override") or ""),
+                    case_series_config(case, base_dir),
+                )
             if not exported.md_created or not exported.md_path.is_file():
                 errors.append("part 清理失败不应反转已完成的 Markdown 发布")
             elif exported.md_path.read_bytes() != file_path.read_bytes():
@@ -441,7 +457,12 @@ def run_case(case: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             export_dir = Path(tmpdir) / "export"
             archive_dir = Path(tmpdir) / "archive"
             with patch.object(export_module.os, "link", side_effect=unsupported):
-                exported = export_note(file_path, export_dir, str(case.get("meeting_date_override") or ""))
+                exported = export_note(
+                    file_path,
+                    export_dir,
+                    str(case.get("meeting_date_override") or ""),
+                    case_series_config(case, base_dir),
+                )
             if exported.md_created or "不支持安全的原子无覆盖发布" not in exported.md_message:
                 errors.append("不支持 hard-link 时 Markdown 导出未明确 fail closed")
             if list(export_dir.rglob("*.md")) or list(export_dir.rglob("*.part")):

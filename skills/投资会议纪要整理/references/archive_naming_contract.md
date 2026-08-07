@@ -33,15 +33,6 @@ Allowed material labels:
 - `录像`
 - `附件`
 
-Examples:
-
-```text
-2026-06-17/2026-06-17 - AI数据中心液冷产业链交流/
-2026-06-17 - AI数据中心液冷产业链交流 - 原始01-文稿.docx
-2026-06-17 - AI数据中心液冷产业链交流 - 原始02-录音.mp3
-2026-06-17 - AI数据中心液冷产业链交流 - 原始03-附件.pdf
-```
-
 Rules:
 
 - Copy raw files; do not move or delete user originals.
@@ -81,21 +72,30 @@ Final-note filename by meeting type:
 
 Use `--meeting-date` when an explicit export date is needed; otherwise use the Markdown `会议日期` field, then the current date as the last fallback.
 
-For `多人复盘会`, fill `会议系列` before export. First match the raw input filenames against the known series below. Use the result automatically only when there is one clear match; when there is no match or more than one plausible match, ask the user to confirm instead of inventing a series or exporting a placeholder.
+For `多人复盘会`, resolve `会议系列` from an explicit confirmed field or an external local series configuration. The reusable skill package must not hard-code real meeting-series names.
 
-Known meeting series:
+The default configuration path is:
 
-- `东方路`
-- `程郡`
-- `舵主`
-- `科技`
-- `华鑫周会`
-- `电子`
-- `苏总`
-- `纪博`
-- `崔磊`
-- `李旦`
-- `易欢欢`
+```text
+$INVESTMENT_MINUTES_WORKSPACE/03 Resources/meeting_series.json
+```
+
+It may be overridden with `INVESTMENT_MINUTES_SERIES_CONFIG` or the exporter option `--series-config`. The configuration is a UTF-8 JSON object with a non-empty `meeting_series` array. Each item contains a non-empty canonical `name` and an optional string array `aliases`:
+
+```json
+{
+  "meeting_series": [
+    {
+      "name": "<规范系列名>",
+      "aliases": ["<可匹配别名>"]
+    }
+  ]
+}
+```
+
+Angle-bracket values above are schema variables only and must not be copied into a real configuration. Keep the real configuration outside the repository. Canonical names must be unique; the same alias must not belong to different series.
+
+Match only the current meeting title and source filename against configured canonical names and aliases. Use the result automatically only when there is one clear match. A missing configuration, no match, or more than one plausible match must block export and request user confirmation instead of guessing from a generic filename, inventing a series, or exporting a placeholder.
 
 For `公司交流`, derive the confirmed company name from `会议标题` such as `XX公司交流会议`; remove only the exchange suffix and preserve the company name. For `专家交流`, derive the topic from `会议标题` such as `XX主题专家交流`; remove the expert-exchange suffix and preserve the topic. If the company name or topic remains unclear, ask the user before export.
 

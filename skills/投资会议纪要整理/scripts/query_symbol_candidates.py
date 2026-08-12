@@ -21,6 +21,8 @@ DEFAULT_WORKSPACE_ROOT = (
 )
 DEFAULT_SYMBOL_ROOT = DEFAULT_WORKSPACE_ROOT / "03 Resources/market-symbols"
 DEFAULT_ALIAS_PATH = DEFAULT_SYMBOL_ROOT / "company_aliases.csv"
+CANDIDATE_GUIDANCE = "仅作候选线索；先结合会议相关上下文，仍不唯一时再做定向外部核验。未核验前不得写入确认代码，也不得仅因本地结果非唯一直接列入存疑。"
+NOT_FOUND_GUIDANCE = "不要直接写入代码；先检查会议相关上下文，公开身份问题再做定向外部查询，仍不唯一时才列入存疑与待确认。"
 
 
 @dataclass
@@ -205,12 +207,13 @@ def query_symbols(
 
     ranked = dedupe(candidate for candidate in candidates if market_allowed(candidate.market, market))[:limit]
     status = "candidate_only" if ranked else "not_found"
+    recommendation = CANDIDATE_GUIDANCE if ranked else NOT_FOUND_GUIDANCE
     return {
         "query": query,
         "market": market,
         "status": status,
         "confirmed": False,
-        "recommendation": None,
+        "recommendation": recommendation,
         "candidates": [asdict(candidate) for candidate in ranked],
     }
 
@@ -239,10 +242,7 @@ def print_text(payload: dict[str, object]) -> None:
             f"- {item['symbol']} | {item['name']} | {item['market']} | "
             f"{item['confidence']:.2f} | {item['match_type']}"
         )
-    if payload["status"] == "candidate_only":
-        print("处理建议: 仅作候选线索；使用外部证据核验后才能写入确认代码，未核验前保留存疑。")
-    else:
-        print("处理建议: 不要直接写入代码；放入“存疑与待确认”或补充人工校对参考。")
+    print(f"处理建议: {payload['recommendation']}")
 
 
 def main() -> int:

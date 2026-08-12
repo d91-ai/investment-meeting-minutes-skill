@@ -1,4 +1,6 @@
 .DS_Store
+outputs/
+work/
 __pycache__/
 *.py[cod]
 *.bak
@@ -9,3 +11,5 @@ node_modules/
 **/.meeting-minutes-internal/**
 **/*_analysis_ledger.json
 **/*_qa_report.json
+/tests/
+/tools/

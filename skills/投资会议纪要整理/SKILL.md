@@ -120,7 +120,7 @@ The formal deliverable is Markdown. Do not create a verification sidecar in the 
 
 - `scripts/transcribe_audio.py`: local ASR and timestamp preparation.
 - `scripts/build_speaker_turn_manifest.py`: optional explicit-turn parsing and linear long-material package planning.
-- `scripts/assemble_speaker_turn_edits.py`: order one current-format return per source turn without writing final Markdown.
+- `scripts/assemble_speaker_turn_edits.py`: order one current-format return per source turn without writing final Markdown; write the full process JSON to `--out` and return only a compact coverage summary on stdout.
 - `scripts/query_symbol_candidates.py`: local security-name/code candidate lookup.
 - `scripts/validate_utf8_text.py`: encoding and portable Skill checks.
 - `scripts/validate_meeting_minutes_contract.py`: objective Markdown structure checks.

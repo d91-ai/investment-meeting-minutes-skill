@@ -34,7 +34,7 @@
 - `references/long_material_workflow.md`：仅长材料加载的轻量分包流程。
 - `scripts/transcribe_audio.py`：本地 ASR。
 - `scripts/build_speaker_turn_manifest.py`：显式 turn 解析与线性容量分包。
-- `scripts/assemble_speaker_turn_edits.py`：长材料返回的顺序和覆盖检查。
+- `scripts/assemble_speaker_turn_edits.py`：长材料返回的顺序和覆盖检查；完整过程 JSON 写入 `--out`，标准输出仅返回紧凑摘要。
 - `scripts/validate_meeting_minutes_contract.py`：客观 Markdown 结构校验。
 ## 验证具体纪要
 

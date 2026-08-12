@@ -226,6 +226,15 @@ def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]
     }
 
 
+def _success_summary(result: dict[str, Any], output_path: Path) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "schema_version": result["schema_version"],
+        "turn_count": result["coverage"]["turn_count"],
+        "out": str(output_path),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="组装长材料 package returns 为有序 JSON 工作稿")
     parser.add_argument("manifest", type=Path)
@@ -238,7 +247,7 @@ def main() -> int:
         result = assemble_returns(manifest, payloads)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json.dumps(_success_summary(result, args.out), ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
         print(json.dumps({"ok": False, "errors": [str(exc)]}, ensure_ascii=False, indent=2))

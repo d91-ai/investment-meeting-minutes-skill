@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "description": "Synthetic paired cases for evaluating information density without losing source meaning. No real meeting or entity data.",
+  "cases": [
+    {
+      "id": "retain_decision_boundary",
+      "source": "发言人1：我维持谨慎看法，主要因为终端需求还没有连续两个季度改善。库存虽然下降，但价格尚未企稳，所以本季度先不加仓，等价格和订单同时确认后再看。",
+      "expected_minutes_required": ["维持谨慎看法", "终端需求还没有连续两个季度改善", "库存虽然下降", "价格尚未企稳", "本季度先不加仓", "价格和订单同时确认"],
+      "expected_reference_required": ["维持谨慎看法", "终端需求还没有连续两个季度改善", "库存虽然下降", "价格尚未企稳", "本季度先不加仓", "价格和订单同时确认"],
+      "forbidden_additions": ["建议减仓", "需求已经恶化"]
+    },
+    {
+      "id": "retain_research_signal",
+      "source": "发言人1：现在还不足以形成买入结论，不过渠道反馈说小批量验证从一个客户扩到三个客户，这个变化值得继续跟踪。",
+      "expected_minutes_required": ["还不足以形成买入结论", "小批量验证从一个客户扩到三个客户", "值得继续跟踪"],
+      "expected_reference_required": ["还不足以形成买入结论", "小批量验证从一个客户扩到三个客户", "值得继续跟踪"],
+      "forbidden_additions": ["形成买入结论", "已经大规模放量"]
+    },
+    {
+      "id": "compress_repetition_not_evidence",
+      "source": "发言人1：毛利率改善是因为高毛利产品占比提升。再说一次，核心还是产品结构变好。具体看，高毛利产品占比从20%升到30%，所以毛利率改善。",
+      "expected_minutes_required": ["毛利率改善", "高毛利产品占比从20%升到30%", "产品结构"],
+      "expected_reference_required": ["毛利率改善", "高毛利产品占比从20%升到30%", "产品结构"],
+      "minutes_may_remove": ["再说一次"],
+      "forbidden_additions": ["成本下降", "售价提升"]
+    },
+    {
+      "id": "preserve_speaker_boundary",
+      "source": "发言人1：我认为今年收入可能增长10%。发言人2：我不同意，订单可见度不足，我只假设持平。",
+      "expected_minutes_required": ["发言人1", "可能增长10%", "发言人2", "我不同意", "订单可见度不足", "只假设持平"],
+      "expected_reference_required": ["发言人1", "可能增长10%", "发言人2", "我不同意", "订单可见度不足", "只假设持平"],
+      "forbidden_additions": ["会议认为今年收入增长10%", "双方一致认为"]
+    }
+  ]
+}

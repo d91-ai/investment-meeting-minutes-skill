@@ -1,4 +1,4 @@
 interface:
   display_name: "投资会议纪要整理"
   short_description: "将中文投研录音或文稿整理为来源忠实的双层会议纪要文档"
-  default_prompt: "请使用 $investment-meeting-minutes 将当前会议材料整理为会议纪要与参考原文；按上下文耦合和延迟选择直接处理或少量并行分段，分段完成后只做接缝与具体冲突修正。最终存疑须先检查候选在整场会议中的相关上下文并完成必要的公开身份定向查询。"
+  default_prompt: "请使用 $investment-meeting-minutes 将当前会议材料整理为会议纪要与参考原文；按上下文耦合和延迟选择直接处理或少量并行分段，分段完成后只做接缝与具体冲突修正。每个候选须结合整场相关上下文和必要的公开身份定向查询得到唯一 verdict，只有 genuinely_doubtful 可进入最终存疑表。"

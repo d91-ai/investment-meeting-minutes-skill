@@ -66,7 +66,9 @@ Follow `references/verification_policy.md`.
 - Do not finalize a doubtful item from package-local context. For each candidate, inspect every occurrence and the relevant surrounding passages across the current meeting before deciding.
 - Start with meeting context and user corrections. Close anything that the current session identifies uniquely, including obvious ASR forms constrained by nearby explanations, numbers, or parallel terms.
 - For a still-unresolved public company, institution, security code, product, technology, model, or abbreviation, use available local candidates or a targeted external lookup before adding it to `doubtful_items`. Batch the small unresolved set when useful. `scripts/query_symbol_candidates.py` supplies candidates, not final truth. Send external tools only the candidate and necessary public aliases, never private meeting excerpts or relationship context.
-- Correct a form only when current-session evidence or identity evidence makes the correction unique. Otherwise preserve the source fragment and add one `doubtful_items` record.
+- Give every candidate exactly one internal verdict from `references/verification_policy.md`. Only `genuinely_doubtful` may enter `doubtful_items`; the other verdicts must close the candidate without an ambiguity row.
+- Correct a form only when current-session evidence or identity evidence makes the correction unique. A `genuinely_doubtful` item keeps the source fragment and adds one `doubtful_items` record.
+- For long material, each package candidate must carry its exact source fragment, `package_id` and `turn_id` or another reliable source locator, and the minimum surrounding context. The main workflow uses those locators to close the candidate across its current-meeting occurrences in memory; this is a targeted candidate review, not a second full-source rewrite or a new artifact.
 - Do not build a full entity inventory, candidate manifest, reason-code state machine, verification shard, or assembly receipt.
 
 ### 5. Write both bodies

@@ -89,6 +89,44 @@ def _normalize_minutes_segments(
     return normalized
 
 
+def _normalize_candidate_fragments(
+    item: dict[str, Any], turn_id: str, source_text: str
+) -> list[dict[str, str]]:
+    raw_candidates = item.get("candidate_fragments", [])
+    if not isinstance(raw_candidates, list):
+        raise ValueError(f"{turn_id}.candidate_fragments 必须是 JSON array")
+
+    normalized: list[dict[str, str]] = []
+    for index, candidate in enumerate(raw_candidates, start=1):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"{turn_id}.candidate_fragments[{index}] 必须是 JSON object")
+        if "verdict" in candidate:
+            raise ValueError(f"{turn_id}.candidate_fragments[{index}] 不得包含最终 verdict")
+        exact_fragment = candidate.get("exact_fragment")
+        context_before = candidate.get("context_before")
+        context_after = candidate.get("context_after")
+        if not isinstance(exact_fragment, str) or not exact_fragment.strip():
+            raise ValueError(
+                f"{turn_id}.candidate_fragments[{index}].exact_fragment 必须是非空字符串"
+            )
+        if exact_fragment not in source_text:
+            raise ValueError(
+                f"{turn_id}.candidate_fragments[{index}].exact_fragment 必须原样存在于来源 turn"
+            )
+        if not isinstance(context_before, str) or not isinstance(context_after, str):
+            raise ValueError(
+                f"{turn_id}.candidate_fragments[{index}] 必须包含字符串 context_before/context_after"
+            )
+        normalized.append(
+            {
+                "exact_fragment": exact_fragment,
+                "context_before": context_before,
+                "context_after": context_after,
+            }
+        )
+    return normalized
+
+
 def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]) -> dict[str, Any]:
     turns = manifest.get("turns")
     packages = manifest.get("packages")
@@ -136,8 +174,10 @@ def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]
             seen_turns.add(turn_id)
             source_turn = turn_by_id[turn_id]
             default_speaker = str(source_turn["speaker_label"])
+            source_text = str(source_turn["text"])
             reference_segments = _normalize_reference_segments(item, turn_id, default_speaker)
             minutes_segments = _normalize_minutes_segments(item, turn_id, default_speaker)
+            candidate_fragments = _normalize_candidate_fragments(item, turn_id, source_text)
             reference_omission_reason = item.get("reference_omission_reason")
             minutes_omission_reason = item.get("minutes_omission_reason")
             if not reference_segments and (
@@ -159,6 +199,7 @@ def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]
                 "speaker_label": default_speaker,
                 "reference_segments": reference_segments,
                 "minutes_segments": minutes_segments,
+                "candidate_fragments": candidate_fragments,
             }
             if isinstance(reference_omission_reason, str) and reference_omission_reason.strip():
                 normalized_turn["reference_omission_reason"] = reference_omission_reason.strip()

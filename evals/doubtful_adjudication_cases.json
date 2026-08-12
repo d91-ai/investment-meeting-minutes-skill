@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0",
+  "description": "Synthetic paired cases for model-based doubtful-item adjudication. No real meeting or entity data.",
+  "cases": [
+    {
+      "id": "context_unique",
+      "source": "发言人1：今天讨论青岚模块。青岚模块就是我们内部所称的 Q-17 电源管理模块。后面文稿里的青蓝模块都是同一个 Q-17。",
+      "candidate": "青蓝模块",
+      "identity_evidence": "not_needed",
+      "expected_verdict": "resolved_by_context",
+      "expected_doubtful_items": 0
+    },
+    {
+      "id": "identity_unique",
+      "source": "发言人1：这一段说的是上市公司蓝峤股份，代码我口述成了 60319。",
+      "candidate": "蓝峤股份 / 60319",
+      "identity_evidence": "可靠的合成交易所目录中只有蓝峤股份(603190.SH)同时匹配公司名和代码前缀；无其他同名证券。",
+      "expected_verdict": "resolved_by_identity_evidence",
+      "expected_doubtful_items": 0
+    },
+    {
+      "id": "meeting_uncertainty",
+      "source": "专家：我不确定下半年能否达到30%，需要回去核实；客户订单细节现在不方便透露。",
+      "candidate": "不确定下半年能否达到30% / 客户订单细节不方便透露",
+      "identity_evidence": "not_applicable",
+      "expected_verdict": "preserve_as_meeting_uncertainty_no_doubt",
+      "expected_doubtful_items": 0
+    },
+    {
+      "id": "self_correction",
+      "source": "发言人1：刚才说青岚是口误，应该是赤岳。这里指赤岳项目，内部代号 R-9，后文均称赤岳。",
+      "candidate": "青岚 / 赤岳",
+      "identity_evidence": "not_needed",
+      "expected_verdict": "resolved_by_context",
+      "expected_doubtful_items": 0
+    },
+    {
+      "id": "genuine_ambiguity",
+      "source": "发言人1：云桥方案用于边缘网关。发言人2：这里的云桥也可能是数据同步技术，我不确定刚才指的是哪一个。材料没有进一步说明。",
+      "candidate": "云桥",
+      "identity_evidence": "两个合成公开术语都能匹配：云桥边缘网关方案 / 云桥数据同步技术；没有证据排除任一项。",
+      "expected_verdict": "genuinely_doubtful",
+      "expected_doubtful_items": 1
+    }
+  ]
+}

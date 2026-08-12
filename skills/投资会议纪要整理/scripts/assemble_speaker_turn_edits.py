@@ -1,161 +1,257 @@
 #!/usr/bin/env python3
-"""Assemble validated speaker-turn edits in source order as a main-owned working draft."""
+"""Validate and order long-material package returns.
+
+The output is process-only JSON. It deliberately does not create Markdown,
+speaker headings, Q&A formatting, receipts, hashes, or meeting-type structure.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from collect_mas_artifacts import (
-    artifact_context_errors,
-    collect_artifact_files,
-    merge_artifact_files,
-)
-from mas_task_lock import mas_task_lock
-from validate_mas_artifacts import canonical_json_digest, file_sha256, validate_payload
+MINUTES_SEGMENT_KINDS = {"question", "answer", "paragraph"}
 
 
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+def _normalize_reference_segments(
+    item: dict[str, Any], turn_id: str, default_speaker: str
+) -> list[dict[str, str]]:
+    raw_segments = item.get("reference_segments")
+    if raw_segments is None:
+        raise ValueError(f"{turn_id}.reference_segments 必须是 JSON array")
+    if not isinstance(raw_segments, list):
+        raise ValueError(f"{turn_id}.reference_segments 必须是 JSON array")
+
+    normalized: list[dict[str, str]] = []
+    for index, segment in enumerate(raw_segments, start=1):
+        if not isinstance(segment, dict):
+            raise ValueError(f"{turn_id}.reference_segments[{index}] 必须是 JSON object")
+        speaker_label = segment.get("speaker_label")
+        text = segment.get("text")
+        if not isinstance(speaker_label, str) or not speaker_label.strip():
+            raise ValueError(
+                f"{turn_id}.reference_segments[{index}].speaker_label 必须是非空字符串"
+            )
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(
+                f"{turn_id}.reference_segments[{index}].text 必须是非空字符串"
+            )
+        normalized.append(
+            {
+                "speaker_label": speaker_label.strip(),
+                "text": text.strip(),
+            }
+        )
+    return normalized
 
 
-def assemble_speaker_turn_edits(
-    task_dir: Path,
-    output_path: Path | None = None,
-    *,
-    replace: bool = False,
-) -> dict[str, Any]:
-    task_dir = task_dir.expanduser()
-    artifact_dir = task_dir / "artifacts"
-    receipt_path = artifact_dir / "editing_assembly_receipt.json"
-    with mas_task_lock(task_dir, exclusive=True):
-        bundle = read_json(task_dir / "mas_task_bundle.json")
-        if not isinstance(bundle, dict):
-            raise ValueError("MAS task bundle 顶层必须是 JSON object")
-        manifest = bundle.get("speaker_turn_manifest")
-        if not isinstance(manifest, dict):
-            raise ValueError("当前 MAS run 未绑定 speaker_turn_manifest")
-        artifacts, _, merge_errors, duplicates = merge_artifact_files(
-            collect_artifact_files(artifact_dir)
-        )
-        errors = list(merge_errors)
-        if duplicates:
-            errors.append("存在重复 MAS artifact，不能组装 speaker turns")
-        edit_types = sorted(
-            str(shard.get("artifact_type") or "")
-            for shard in manifest.get("shards", [])
-            if isinstance(shard, dict)
-        )
-        missing = [artifact_type for artifact_type in edit_types if artifact_type not in artifacts]
-        if missing:
-            errors.append("缺少 speaker 编辑 artifact: " + ", ".join(missing))
-        edit_artifacts = {
-            artifact_type: artifacts[artifact_type]
-            for artifact_type in edit_types
-            if artifact_type in artifacts
-        }
-        validation = validate_payload({"artifacts": edit_artifacts}, required_artifacts=edit_types)
-        errors.extend(str(item) for item in validation.get("errors", []))
-        context_artifacts = {
-            key: value
-            for key, value in artifacts.items()
-            if key != "editing_assembly_receipt"
-        }
-        errors.extend(artifact_context_errors(context_artifacts, bundle, task_dir))
-        if errors:
-            raise ValueError("; ".join(dict.fromkeys(errors)))
+def _normalize_minutes_segments(
+    item: dict[str, Any], turn_id: str, default_speaker: str
+) -> list[dict[str, str]]:
+    raw_segments = item.get("minutes_segments")
+    if raw_segments is None:
+        raise ValueError(f"{turn_id}.minutes_segments 必须是 JSON array")
+    if not isinstance(raw_segments, list):
+        raise ValueError(f"{turn_id}.minutes_segments 必须是 JSON array")
 
-        edited_by_id: dict[str, dict[str, Any]] = {}
-        for artifact in edit_artifacts.values():
-            for turn in artifact.get("edited_turns", []):
-                if isinstance(turn, dict):
-                    edited_by_id[str(turn.get("turn_id") or "")] = turn
-        ordered_source_turns = sorted(
-            (turn for turn in manifest.get("turns", []) if isinstance(turn, dict)),
-            key=lambda turn: int(turn.get("sequence") or 0),
+    normalized: list[dict[str, str]] = []
+    for index, segment in enumerate(raw_segments, start=1):
+        if not isinstance(segment, dict):
+            raise ValueError(f"{turn_id}.minutes_segments[{index}] 必须是 JSON object")
+        kind = segment.get("kind")
+        speaker_label = segment.get("speaker_label", default_speaker)
+        text = segment.get("text")
+        if not isinstance(kind, str) or kind not in MINUTES_SEGMENT_KINDS:
+            raise ValueError(
+                f"{turn_id}.minutes_segments[{index}].kind 必须是 question/answer/paragraph"
+            )
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(
+                f"{turn_id}.minutes_segments[{index}].text 必须是非空字符串"
+            )
+        if not isinstance(speaker_label, str) or not speaker_label.strip():
+            raise ValueError(
+                f"{turn_id}.minutes_segments[{index}].speaker_label 必须是非空字符串"
+            )
+        normalized.append(
+            {
+                "kind": str(kind),
+                "speaker_label": speaker_label.strip(),
+                "text": text.strip(),
+            }
         )
-        lines = [
-            "<!-- main-owned working draft; not the final meeting-minutes Markdown -->",
-            "",
-        ]
-        ordered_turn_ids: list[str] = []
-        for source_turn in ordered_source_turns:
-            turn_id = str(source_turn.get("turn_id") or "")
-            edited_turn = edited_by_id.get(turn_id)
-            if not isinstance(edited_turn, dict):
-                raise ValueError(f"组装时缺少 turn: {turn_id}")
-            ordered_turn_ids.append(turn_id)
-            lines.extend(
-                [
-                    f"<!-- turn_id={turn_id} sequence={source_turn.get('sequence')} -->",
-                    f"### {source_turn.get('speaker_label')}",
-                    "",
-                    str(edited_turn.get("edited_text") or "").strip(),
-                    "",
-                ]
+    return normalized
+
+
+def _normalize_candidate_fragments(
+    item: dict[str, Any], turn_id: str, source_text: str
+) -> list[dict[str, str]]:
+    raw_candidates = item.get("candidate_fragments", [])
+    if not isinstance(raw_candidates, list):
+        raise ValueError(f"{turn_id}.candidate_fragments 必须是 JSON array")
+
+    normalized: list[dict[str, str]] = []
+    for index, candidate in enumerate(raw_candidates, start=1):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"{turn_id}.candidate_fragments[{index}] 必须是 JSON object")
+        if "verdict" in candidate:
+            raise ValueError(f"{turn_id}.candidate_fragments[{index}] 不得包含最终 verdict")
+        exact_fragment = candidate.get("exact_fragment")
+        context_before = candidate.get("context_before")
+        context_after = candidate.get("context_after")
+        if not isinstance(exact_fragment, str) or not exact_fragment.strip():
+            raise ValueError(
+                f"{turn_id}.candidate_fragments[{index}].exact_fragment 必须是非空字符串"
+            )
+        if exact_fragment not in source_text:
+            raise ValueError(
+                f"{turn_id}.candidate_fragments[{index}].exact_fragment 必须原样存在于来源 turn"
+            )
+        if not isinstance(context_before, str) or not isinstance(context_after, str):
+            raise ValueError(
+                f"{turn_id}.candidate_fragments[{index}] 必须包含字符串 context_before/context_after"
+            )
+        normalized.append(
+            {
+                "exact_fragment": exact_fragment,
+                "context_before": context_before,
+                "context_after": context_after,
+            }
+        )
+    return normalized
+
+
+def assemble_returns(manifest: dict[str, Any], returns: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    turns = manifest.get("turns")
+    packages = manifest.get("packages")
+    if not isinstance(turns, list) or not isinstance(packages, list) or not packages:
+        raise ValueError("manifest 缺少 turns 或 packages")
+
+    turn_by_id = {str(turn.get("turn_id")): turn for turn in turns if isinstance(turn, dict)}
+    if len(turn_by_id) != len(turns):
+        raise ValueError("manifest.turns 包含重复或无效 turn_id")
+    expected_package_ids = [str(package.get("package_id")) for package in packages]
+    if len(expected_package_ids) != len(set(expected_package_ids)):
+        raise ValueError("manifest.packages 包含重复 package_id")
+    return_by_package: dict[str, dict[str, Any]] = {}
+    for payload in returns:
+        if not isinstance(payload, dict):
+            raise ValueError("package return 必须是 JSON object")
+        package_id = str(payload.get("package_id") or "")
+        if package_id not in expected_package_ids:
+            raise ValueError(f"未知 package_id: {package_id}")
+        if package_id in return_by_package:
+            raise ValueError(f"重复 package return: {package_id}")
+        return_by_package[package_id] = payload
+
+    missing_packages = [item for item in expected_package_ids if item not in return_by_package]
+    if missing_packages:
+        raise ValueError("缺少 package return: " + ", ".join(missing_packages))
+
+    ordered: list[dict[str, Any]] = []
+    seen_turns: set[str] = set()
+    for package in packages:
+        package_id = str(package["package_id"])
+        expected_turn_ids = [str(item) for item in package.get("turn_ids", [])]
+        payload_turns = return_by_package[package_id].get("turns")
+        if not isinstance(payload_turns, list):
+            raise ValueError(f"{package_id}.turns 必须是 JSON array")
+        if any(not isinstance(item, dict) for item in payload_turns):
+            raise ValueError(f"{package_id}.turns 的每项必须是 JSON object")
+        returned_ids = [str(item.get("turn_id") or "") for item in payload_turns]
+        if returned_ids != expected_turn_ids:
+            raise ValueError(f"{package_id} 的 turn_id 必须与 manifest 完全一致并保持顺序")
+        for item in payload_turns:
+            turn_id = str(item["turn_id"])
+            if turn_id in seen_turns:
+                raise ValueError(f"重复 turn_id: {turn_id}")
+            seen_turns.add(turn_id)
+            source_turn = turn_by_id[turn_id]
+            default_speaker = str(source_turn["speaker_label"])
+            source_text = str(source_turn["text"])
+            reference_segments = _normalize_reference_segments(item, turn_id, default_speaker)
+            minutes_segments = _normalize_minutes_segments(item, turn_id, default_speaker)
+            candidate_fragments = _normalize_candidate_fragments(item, turn_id, source_text)
+            reference_omission_reason = item.get("reference_omission_reason")
+            minutes_omission_reason = item.get("minutes_omission_reason")
+            if not reference_segments and (
+                not isinstance(reference_omission_reason, str) or not reference_omission_reason.strip()
+            ):
+                raise ValueError(
+                    f"{turn_id}.reference_segments 为空时必须提供 reference_omission_reason"
+                )
+            if not minutes_segments and (
+                not isinstance(minutes_omission_reason, str) or not minutes_omission_reason.strip()
+            ):
+                raise ValueError(
+                    f"{turn_id}.minutes_segments 为空时必须提供 minutes_omission_reason"
+                )
+            normalized_turn = {
+                "package_id": package_id,
+                "turn_id": turn_id,
+                "sequence": int(source_turn["sequence"]),
+                "speaker_label": default_speaker,
+                "reference_segments": reference_segments,
+                "minutes_segments": minutes_segments,
+                "candidate_fragments": candidate_fragments,
+            }
+            if isinstance(reference_omission_reason, str) and reference_omission_reason.strip():
+                normalized_turn["reference_omission_reason"] = reference_omission_reason.strip()
+            if isinstance(minutes_omission_reason, str) and minutes_omission_reason.strip():
+                normalized_turn["minutes_omission_reason"] = minutes_omission_reason.strip()
+            ordered.append(
+                normalized_turn
             )
 
-        output_path = output_path or task_dir / "working" / "speaker-edited-body.md"
-        output_path = output_path.expanduser()
-        if not output_path.is_absolute():
-            output_path = task_dir / output_path
-        if (output_path.exists() or receipt_path.exists()) and not replace:
-            raise ValueError("speaker 编辑工作稿或 assembly receipt 已存在；显式传入 --replace 后才能替换")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    expected_all = [str(turn["turn_id"]) for turn in sorted(turns, key=lambda item: int(item["sequence"]))]
+    returned_all = [str(turn["turn_id"]) for turn in ordered]
+    if returned_all != expected_all:
+        raise ValueError("组装结果未按来源顺序完整覆盖所有 turn")
 
-        run_id = str(bundle.get("run_id") or "")
-        receipt = {
-            "run_id": run_id,
-            "task_id": f"{run_id}:main:editing_assembly_receipt",
-            "dispatch_phase": "editing",
-            "artifact_owner": "Main Orchestrator",
-            "artifact_type": "editing_assembly_receipt",
-            "artifact": {
-                "manifest_sha256": str(manifest.get("manifest_sha256") or ""),
-                "edit_artifact_digest": canonical_json_digest(edit_artifacts),
-                "ordered_turn_ids": ordered_turn_ids,
-                "assembled_draft_path": str(output_path),
-                "assembled_draft_sha256": file_sha256(output_path),
-                "status": "assembled",
-            },
-        }
-        write_json(receipt_path, receipt)
-        return {
-            "ok": True,
-            "working_draft": str(output_path),
-            "receipt": str(receipt_path),
-            "turn_count": len(ordered_turn_ids),
-            "edit_artifact_count": len(edit_artifacts),
-        }
+    return {
+        "schema_version": "1.0",
+        "turns": ordered,
+        "coverage": {
+            "complete": True,
+            "turn_count": len(ordered),
+            "duplicate_turns": [],
+            "missing_turns": [],
+        },
+    }
+
+
+def _success_summary(result: dict[str, Any], output_path: Path) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "schema_version": result["schema_version"],
+        "turn_count": result["coverage"]["turn_count"],
+        "out": str(output_path),
+    }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="按全局 sequence 组装 speaker 编辑结果并写入主流程凭据")
-    parser.add_argument("task_dir", type=Path, help="MAS dispatch 目录")
-    parser.add_argument("--out", type=Path, help="主流程工作稿路径")
-    parser.add_argument("--replace", action="store_true", help="显式替换已有工作稿和 assembly receipt")
-    parser.add_argument("--json", action="store_true", help="输出 JSON")
+    parser = argparse.ArgumentParser(description="组装长材料 package returns 为有序 JSON 工作稿")
+    parser.add_argument("manifest", type=Path)
+    parser.add_argument("returns", nargs="+", type=Path)
+    parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
     try:
-        result = assemble_speaker_turn_edits(args.task_dir, args.out, replace=args.replace)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        result = {"ok": False, "errors": [str(exc)]}
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-    elif result.get("ok"):
-        print(result["working_draft"])
-    else:
-        print(result["errors"][0], file=sys.stderr)
-    return 0 if result.get("ok") else 1
+        manifest = read_json(args.manifest)
+        payloads = [read_json(path) for path in args.returns]
+        result = assemble_returns(manifest, payloads)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(_success_summary(result, args.out), ensure_ascii=False, indent=2))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"ok": False, "errors": [str(exc)]}, ensure_ascii=False, indent=2))
+        return 1
 
 
 if __name__ == "__main__":

@@ -1,126 +1,35 @@
 ---
 name: investment-meeting-minutes
-description: "Use when Codex needs to turn a Chinese investment meeting recording, transcript, DOCX/TXT/Markdown document, or mixed audio+text materials into source-faithful Markdown meeting minutes with a concise meeting-minutes section, a lightly cleaned reference-original section, speaker/Q&A preservation, entity correction, and optional doubtful items."
+description: "将中文投资会议录音、转写稿、DOCX/TXT/Markdown 文档或混合材料，整理为来源忠实、可追溯、可用于投资研究的 Markdown 会议纪要，并支持专业术语、重要非人专名候选召回与证券代码核验；适用于多人复盘会、上市公司交流和专家交流。"
 ---
 
-# Investment Meeting Minutes
+# 投资会议纪要整理
 
-## Goal
+## 目标
 
-Turn the current meeting's materials into one source-faithful Markdown note. The formal output contains:
+把有噪声的会议材料整理成一份事实不失真、论证链完整、专业可读的研究记录。正式输出依次为 `会议纪要`、`参考原文`，并按需附 `重要信息修改记录`、`存疑与待确认`；工作时先完成参考原文，再派生会议纪要。
 
-- `## 一、会议纪要`: synthesize decision-relevant content into fewer, denser paragraphs. Within the same speaker turn, Q&A block, or continuous theme, merge statements that support one conclusion; retain the conclusion, key evidence, necessary causal chain, numbers, conditions, risks, actions, and uncertainty, while omitting discussion process, redundant argument, and examples that add no independent investment information.
-- `## 二、参考原文`: lightly clean filler, obvious ASR noise, meaningless repetition, and repeated false starts while preserving all source turns.
-- `## 三、存疑与待确认`: include only when a name, security code, or term cannot be uniquely identified, or the current-session sources materially conflict.
+## 三条原则
 
-Both bodies preserve real order, speaker perspective, first person, logic, uncertainty, conditions, numbers, timing, actions, and every distinct fact. The final Markdown is written and modified only by the main workflow.
+1. **事实与表达分离**：校对可以修复表达噪声，不能改变原意。明显错词只有一个最小复原时直接纠正；原片段本身能够成立，或候选会形成不同事实时，只有本场证据唯一支持才改。
+2. **两层正文分工**：参考原文逐轮保留顺序、视角、问答和全部不同事实，删除纯口水与无意义重复，修复有证据的听写、语法和断句；会议纪要在同一发言或问答内聚合结论、依据、因果、条件、风险和动作，可删除整个低价值事实单元，不能重填被保留单元的字段、跨人合并或添加会议外结论。
+3. **来源决定会议事实**：证据依次为用户对本场的纠正、最小语境、本场其他直接证据、最小音频回听，以及允许使用的非人身份资料。公开资料只能辅助确认非人专名、代码或术语的正式写法，不能证明或改写会议主张；人名不外查。
 
-## Core boundaries
+数字、单位、口径、否定、方向、条件、时间边界、范围、排他性和判断强度绝不能漂移。具体校对和存疑结案只遵循 [证据策略](references/verification_policy.md)。
 
-- Use only current-session audio, transcripts, documents, and user corrections as meeting-content sources. External sources may confirm only non-person names, security codes, and terminology; they must not add or rewrite meeting claims.
-- Treat deletion, grammar repair, speaker boundaries, Q&A correspondence, source selection, target attribution, entity uniqueness, and fidelity as contextual model judgments. Do not replace them with keyword lists, regex allowlists, retention ratios, or deterministic semantic gates.
-- A professional term, company name, code, or abbreviation is not doubtful merely because of its category. When current-session context and available evidence identify one meaning without material conflict, resolve it automatically and do not request confirmation.
-- Preserve an expert's uncertainty, estimate, hearsay, inability to disclose, or need to check as meeting content. It is not a doubtful item unless the wording or identity itself is unclear.
-- Same-session user corrections are high-priority evidence. An explicit self-correction such as “A，刚才说错了，是 B” resolves to B unless independent evidence still creates a real conflict.
-- Never use public evidence to confirm or reject private customer relationships, orders, capacity, prices, figures, forecasts, internal progress, or other statements made in the meeting.
-- If the user requests read-only analysis, no archive, no file writes, or a feasibility discussion, do not archive, export, or modify files.
+## 执行
 
-## Routing by context and latency
+1. 选择来源：文档按真实顺序提取；音频用 `scripts/transcribe_audio.py` 完成一次转写，疑点只回听最小片段；混合材料按覆盖、顺序、逐字性、发言人证据和噪声选择主源，只有无法直接判断时才并行取得两种完整来源，另一来源优先用于局部补漏和重要疑点核对。
+2. 依据显式标签、回答提示和话语衔接恢复轮次。身份无法确认时按首次出现顺序使用 `发言人1`、`发言人2`，不按主题猜人。
+3. 始终对照未经编辑的主源完成参考原文，同时收集真正未决项、重要实质纠正和疑似错听的重要非人专名。
+4. 从参考原文派生会议纪要，保持来源顺序和归因，保留会改变投资理解的结论、依据、条件、风险、数字、动作与不确定性，不设固定压缩率。
+5. 生成时对照来源检查原意、发言归属和问答对应，然后按 [输出合约](references/output_contract.md) 与一个会议类型文件排版：多人复盘会用 [review_meeting.md](references/meeting_types/review_meeting.md)，公司交流用 [listed_company.md](references/meeting_types/listed_company.md)，专家交流用 [expert_call.md](references/meeting_types/expert_call.md)。
 
-Use `direct` when the selected source and both required bodies fit reliably in one model pass and the meeting depends on continuous global context. Use a few parallel source spans when the material has clean independent sections or complete Q&A boundaries and parallel generation will materially reduce latency. Do not route by a fixed character threshold.
+## 路由与边界
 
-Use `references/long_material_workflow.md` when one pass is unsafe or clean independent spans make parallel generation faster. Split once at natural paragraph, speaker-turn, or complete Q&A boundaries while reading the source. Do not create a separate full-source speaker-labeling copy or solve a globally optimal package plan.
+- 一次上下文能可靠处理时直接生成。只有材料有清晰完整的发言或问答边界且拆分确有帮助时，才读取 [长材料工作流](references/long_material_workflow.md)；切片不是输出边界，跨片句子、回答和因果链必须接回。
+- 对少量疑似错听的重要非人专名，在首次阅读时一并汇总：先用 `query_symbol_candidates.py` 批量查本地候选，未解决的再用 `build_entity_search_plan.py` 生成有界读音候选，所有实体合并为至多一次外部请求。召回只扩大候选，确认仍只按证据策略；该轮仍不唯一就停止并列疑，不追查。
+- 正常生产不增加全文二审、第二套转写、全量实体搜索、语义门禁、旁路审计或为了填表而复查。
+- 正常生产把来源对照和语义检查融入同次生成，写完 Markdown 后直接交付；不回读整份成稿，不运行开发验证脚本或另外的结构检查。
 
-## Workflow
-
-### 1. Prepare sources
-
-Archiving is not part of the base workflow and is never a prerequisite for transcription or writing. Handle an explicit archive request as a separate local-delivery task after the note is complete.
-
-Source modes:
-
-- `document_only`: extract readable text and preserve the document's real order.
-- `audio_only`: transcribe once with the local SenseVoice pipeline. Use the transcript, reliable timestamp index, meeting context, and source replay for review; keep genuinely unclear wording doubtful instead of running a second full-audio ASR.
-- `audio_plus_document`: extract the document immediately and run SenseVoice transcription concurrently. Compare the available same-session sources for coverage, order, verbatimness, speaker evidence, ASR noise, omissions, and human correction, then choose the more reliable body source. Use the other source only for cross-checking.
-
-Use UTF-8 without BOM for Markdown, TXT, JSON, CSV, TSV, and YAML. Python text I/O must pass `encoding="utf-8"`.
-
-### 2. Transcribe audio
-
-Use `scripts/transcribe_audio.py`: SenseVoiceSmall produces the transcript and fsmn-vad provides the global short-segment timeline. Do not run a second full-audio ASR. Resolve names, terms, numbers, and abbreviations from current-session context and permitted identity evidence; preserve genuinely unclear audio as doubtful. Do not use Whisper as a fallback.
-
-Before first audio use or after a machine change, run `python3 scripts/transcribe_audio.py --check-model-cache`. This is a deployment check, not a per-meeting gate.
-
-Timestamp rules and reliable-anchor requirements remain in `references/output_contract.md`.
-
-### 3. Establish speaker and Q&A boundaries
-
-Use the model to inspect short replies, mixed-speaker lines, answer-to-next-question transitions, and ambiguous labels before editing. Explicit speaker labels are evidence, not an input requirement. When labels are absent, infer only the turn or Q&A boundary supported by discourse context and use conservative `发言人1/2/...` labels when identity is uncertain. Never mechanically assign a short reply to the previous speaker or invent an identity.
-
-When long material has reliable explicit labels, `scripts/build_speaker_turn_manifest.py` may parse them and make a linear capacity-bounded package plan. Pass model-confirmed names through `--known-speaker` when the source uses named labels. When labels are missing or unreliable, do not create a second full-source working copy: infer conservative anonymous turns while processing each source span and preserve label continuity across adjacent spans. A normal question and its answer should remain together. Do not add a deterministic speaker classifier or infer personal identity in the script.
-
-### 4. Resolve names, codes, and terms
-
-Follow `references/verification_policy.md`.
-
-- Do not finalize a doubtful item from package-local context. For each candidate, inspect every occurrence and the relevant surrounding passages across the current meeting before deciding.
-- Start with meeting context and user corrections. Close anything that the current session identifies uniquely, including obvious ASR forms constrained by nearby explanations, numbers, or parallel terms.
-- For a still-unresolved public company, institution, security code, product, technology, model, or abbreviation, use available local candidates or a targeted external lookup before adding it to `doubtful_items`. Batch the small unresolved set when useful. `scripts/query_symbol_candidates.py` supplies candidates, not final truth. Send external tools only the candidate and necessary public aliases, never private meeting excerpts or relationship context.
-- Give every candidate exactly one internal verdict from `references/verification_policy.md`. Only `genuinely_doubtful` may enter `doubtful_items`; the other verdicts must close the candidate without an ambiguity row.
-- Correct a form only when current-session evidence or identity evidence makes the correction unique. A `genuinely_doubtful` item keeps the source fragment and adds one `doubtful_items` record.
-- For long material, each package candidate must carry its exact source fragment, `package_id` and `turn_id` or another reliable source locator, and the minimum surrounding context. The main workflow uses those locators to close the candidate across its current-meeting occurrences in memory; this is a targeted candidate review, not a second full-source rewrite or a new artifact.
-- Do not build a full entity inventory, candidate manifest, reason-code state machine, verification shard, or assembly receipt.
-
-### 5. Write both bodies
-
-Load `references/output_contract.md` and exactly one meeting-type reference:
-
-- `references/meeting_types/review_meeting.md`
-- `references/meeting_types/listed_company.md`
-- `references/meeting_types/expert_call.md`
-
-Generate both sections from the same ordered source turns.
-
-For `会议纪要`, write a materially shorter investment-research information layer rather than a lightly edited transcript. Aggregate one conclusion with its key evidence, necessary causal chain, conditions, risks, actions, numbers, and uncertainty. Retain research signals and follow-up variables even when they do not yet support an immediate decision. Omit rhetorical setup, conversational exploration, repeated support, and examples that merely illustrate an already supported point; keep an example only when it adds an independent fact, boundary, or counterexample. Preserve speaker attribution and Q&A order, and never merge different speakers. Do not target a fixed compression ratio.
-
-For `参考原文`, apply only light cleanup. Account for every source turn and do not apply the stronger condensation used in `会议纪要`. A wholly meaningless turn may produce no body text; record a short omission reason only in a long-material package where an entire source turn is removed. The direct path needs no additional artifact or gate.
-
-`参考原文` is still a model-edited readable body, not a direct copy of the input. Remove meaningless speech and filler, repair obvious grammar and sentence breaks, and omit visible source timestamps in the same model pass. Do not add a separate timestamp-cleaning stage when the model can ignore them directly.
-
-For `专家交流`, hide all speaker headings in `会议纪要` and retain only ordered bold questions with answers. Keep speaker headings and real turn boundaries in `参考原文`.
-
-### 6. Review where the text is generated
-
-For `direct`, check the generated bodies against the source in the same main workflow. For long material, each package performs this check for its own source span before returning body-ready text. Check:
-
-- every substantive paragraph maps to the correct source speaker and Q&A group; every entity, number, causal claim, or conclusion newly present in the output must map back to the current-session source. External identity evidence may normalize a public name or code but must not supply a meeting fact;
-- `参考原文` lost or strengthened no distinct substantive fact, reason, condition, comparison, number, time, action, uncertainty, or negation;
-- `会议纪要` lost or strengthened no research-relevant conclusion, key evidence, quantitative anchor, condition, assumption, risk, contrary view, follow-up variable, action, uncertainty, or negation that changes the interpretation boundary;
-- short replies and questions remain attributed correctly;
-- `会议纪要` is materially more concise and aggregated than `参考原文`, without dropping a decision-relevant conclusion, qualification, risk, or contrary view or adding an organizer's conclusion;
-- `参考原文` remains source-aligned;
-- entities and target headings follow the selected meeting-type rules.
-
-After long-material assembly, the main workflow only fixes ordering, meeting-type formatting, adjacent-span continuity, globally unique entity spelling, and explicitly flagged conflicts. It must not reread and semantically re-review the full source, rewrite completed packages, or launch an independent full-source reviewer. For a concrete high-risk conflict, reopen only the relevant source span plus the minimum neighboring context and change it only when that evidence supports the change. Do not create lexical diff manifests, fidelity shards, final-semantic receipts, or artifact gates.
-
-### 7. Validate and deliver
-
-Run only the checks that evaluate the current deliverable:
-
-```bash
-python3 scripts/validate_utf8_text.py NOTE.md --require-cjk
-python3 scripts/validate_meeting_minutes_contract.py NOTE.md --json
-```
-
-Handle an explicit Obsidian or other local-export request as a separate delivery task. Development regressions live outside the installed Skill and are never a per-meeting gate.
-
-The formal deliverable is Markdown. Do not create a verification sidecar in the base workflow; handle a separately requested audit artifact as a separate task.
-
-## Resources
-
-- `scripts/transcribe_audio.py`: local ASR and timestamp preparation.
-- `scripts/build_speaker_turn_manifest.py`: optional explicit-turn parsing and linear long-material package planning.
-- `scripts/assemble_speaker_turn_edits.py`: order one current-format return per source turn without writing final Markdown; write the full process JSON to `--out` and return only a compact coverage summary on stdout.
-- `scripts/query_symbol_candidates.py`: local security-name/code candidate lookup.
-- `scripts/validate_utf8_text.py`: encoding and portable Skill checks.
-- `scripts/validate_meeting_minutes_contract.py`: objective Markdown structure checks.
+辅助脚本：`build_speaker_turn_manifest.py` 与 `assemble_speaker_turn_edits.py` 只处理长材料轮次；`query_symbol_candidates.py` 查询本地证券候选，`build_entity_search_plan.py` 生成有界读音查询，两者都不能确认身份。

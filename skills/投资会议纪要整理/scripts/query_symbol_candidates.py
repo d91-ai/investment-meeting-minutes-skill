@@ -21,8 +21,8 @@ DEFAULT_WORKSPACE_ROOT = (
 )
 DEFAULT_SYMBOL_ROOT = DEFAULT_WORKSPACE_ROOT / "03 Resources/market-symbols"
 DEFAULT_ALIAS_PATH = DEFAULT_SYMBOL_ROOT / "company_aliases.csv"
-CANDIDATE_GUIDANCE = "仅作候选线索；先结合会议相关上下文，仍不唯一时再做定向外部核验。未核验前不得写入确认代码，也不得仅因本地结果非唯一直接列入存疑。"
-NOT_FOUND_GUIDANCE = "不要直接写入代码；先检查会议相关上下文，公开身份问题再做定向外部查询，仍不唯一时才列入存疑与待确认。"
+CANDIDATE_GUIDANCE = "仅作候选线索；结合原片段音形和当前会议上下文判断。不能排除竞争候选时保留原片段并列疑，不得写入确认代码。"
+NOT_FOUND_GUIDANCE = "不要为补代码或普通未命中扩大查询。疑似错听的重要非人专名可用 build_entity_search_plan.py 生成有界读音查询，并与其他实体合并为本场至多一轮外部请求；结果仍只作候选，不追查。"
 
 
 @dataclass

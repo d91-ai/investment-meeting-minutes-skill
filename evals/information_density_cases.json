@@ -30,6 +30,43 @@
       "expected_minutes_required": ["发言人1", "可能增长10%", "发言人2", "我不同意", "订单可见度不足", "只假设持平"],
       "expected_reference_required": ["发言人1", "可能增长10%", "发言人2", "我不同意", "订单可见度不足", "只假设持平"],
       "forbidden_additions": ["会议认为今年收入增长10%", "双方一致认为"]
+    },
+    {
+      "id": "preserve_self_asked_question",
+      "source": "发言人2：为什么本季度交付会更快？主要是认证流程从三步缩短到两步，所以我预计周期减少一周。",
+      "expected_minutes_required": ["发言人2", "为什么本季度交付会更快", "认证流程从三步缩短到两步", "我预计周期减少一周"],
+      "expected_reference_required": ["发言人2", "为什么本季度交付会更快", "主要是认证流程从三步缩短到两步", "我预计周期减少一周"],
+      "forbidden_additions": ["提问者", "发言人1提问", "确定减少一周"]
+    },
+    {
+      "id": "reference_priority_preserves_independent_examples",
+      "source": "发言人1：渠道有三个独立变化。第一，华东门店客流环比改善；第二，华南客单价仍在下降；第三，线上复购率连续两个月持平。综合看，我只判断边际企稳，还不能判断反转。",
+      "expected_minutes_required": ["华东门店客流环比改善", "华南客单价仍在下降", "线上复购率连续两个月持平", "边际企稳", "还不能判断反转"],
+      "expected_reference_required": ["第一", "华东门店客流环比改善", "第二", "华南客单价仍在下降", "第三", "线上复购率连续两个月持平", "边际企稳", "还不能判断反转"],
+      "forbidden_additions": ["消费已经反转", "三个渠道均改善"]
+    },
+    {
+      "id": "minutes_compresses_before_reference",
+      "source": "发言人1：我先解释背景。价格连续三周没有再跌，这是第一个信号。订单环比只改善5%，幅度不大，这是第二个信号。库存还在高位，所以我们暂时只跟踪，不加仓。我再强调一次，目前只是观察，不是推荐。",
+      "expected_minutes_required": ["价格连续三周没有再跌", "订单环比只改善5%", "库存还在高位", "只跟踪", "不加仓", "不是推荐"],
+      "expected_reference_required": ["第一个信号", "第二个信号", "价格连续三周没有再跌", "订单环比只改善5%", "库存还在高位", "只跟踪", "不加仓", "目前只是观察", "不是推荐"],
+      "minutes_may_remove": ["我先解释背景", "我再强调一次"],
+      "forbidden_additions": ["建议关注", "可以加仓"]
+    },
+    {
+      "id": "preserve_scope_when_compressing",
+      "source": "发言人1：本批次全部设备都需要返工，不是大部分，是全部；这个范围已经确认。",
+      "expected_minutes_required": ["本批次全部设备都需要返工", "范围已经确认"],
+      "expected_reference_required": ["本批次全部设备都需要返工", "不是大部分，是全部", "范围已经确认"],
+      "minutes_may_remove": ["不是大部分，是全部"],
+      "forbidden_additions": ["大部分设备需要返工", "多数设备需要返工", "部分设备需要返工"]
+    },
+    {
+      "id": "preserve_defined_category_when_compressing",
+      "source": "发言人1：这项产品在本场定义为托管服务。后面虽然讨论软件订阅和运维，但没有把产品类别改成SaaS。",
+      "expected_minutes_required": ["产品定义为托管服务", "讨论软件订阅和运维", "没有把产品类别改成SaaS"],
+      "expected_reference_required": ["产品在本场定义为托管服务", "讨论软件订阅和运维", "没有把产品类别改成SaaS"],
+      "forbidden_additions": ["产品是SaaS", "SaaS产品", "SaaS服务"]
     }
   ]
 }

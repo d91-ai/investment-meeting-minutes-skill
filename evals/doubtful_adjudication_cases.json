@@ -1,46 +1,304 @@
 {
-  "schema_version": "1.0",
-  "description": "Synthetic paired cases for model-based doubtful-item adjudication. No real meeting or entity data.",
+  "schema_version": "2.2",
+  "description": "Synthetic cases for text restoration, identity resolution, and uncertainty handling. No real meeting or entity data.",
   "cases": [
     {
-      "id": "context_unique",
-      "source": "发言人1：今天讨论青岚模块。青岚模块就是我们内部所称的 Q-17 电源管理模块。后面文稿里的青蓝模块都是同一个 Q-17。",
-      "candidate": "青蓝模块",
-      "identity_evidence": "not_needed",
-      "expected_verdict": "resolved_by_context",
+      "id": "ordinary_asr_unique",
+      "source": "发言人1：淡季出货下降主要是继结性原因，需求趋势没有变化。",
+      "candidate": "继结性原因",
+      "evidence": "同句讨论淡季与需求趋势，最小音形修复只有季节性原因能够闭合语义。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "季节性原因",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["需求恶化", "周期性原因"]
+    },
+    {
+      "id": "ordinary_repair_preserves_negation",
+      "source": "发言人1：渠道反馈是有寻价，没有签单；我只把它当观察信号。",
+      "candidate": "有寻价",
+      "evidence": "商业语境和最小字音变化唯一支持有询价。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "有询价，没有签单；我只把它当观察信号",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["订单落地", "建议买入"]
+    },
+    {
+      "id": "ordinary_common_verb_from_local_causality",
+      "source": "发言人1：监管方再次插首协调，随后双方恢复谈判。",
+      "candidate": "插首协调",
+      "evidence": "主语、协调宾语及紧邻结果已表达同一干预事件，最小音形复原唯一支持插手协调。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "监管方再次插手协调，随后双方恢复谈判",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["监管处罚", "达成协议"]
+    },
+    {
+      "id": "ordinary_comparison_from_adjacent_repetition",
+      "source": "发言人1：上句已经说明同店环比改善；本月客流相较环毕继续提升。",
+      "candidate": "相较环毕",
+      "evidence": "紧邻句明确给出同一比较基准，最小音形修复为环比。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "本月客流环比继续提升",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["同比", "较去年同期"]
+    },
+    {
+      "id": "standard_term_unique",
+      "source": "发言人1：模型做完证绿以后，端侧延迟明显下降。",
+      "candidate": "证绿",
+      "evidence": "模型处理与端侧部署语境中，最小音形修复唯一指向蒸馏。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "模型做完蒸馏以后，端侧延迟明显下降",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["知识蒸馏", "压缩比例", "准确率"]
+    },
+    {
+      "id": "standard_term_repairs_only_term",
+      "source": "发言人1：训练阶段采用量化感知练，部署时再转成低比特格式。",
+      "candidate": "量化感知练",
+      "evidence": "训练阶段的句法和标准术语唯一支持量化感知训练。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "量化感知训练",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["INT8", "INT4", "精度无损"]
+    },
+    {
+      "id": "undefined_abbreviation_stays_doubtful",
+      "source": "发言人1：毛利率改善主要看NRR，但本次没有拆分，也没有解释这个缩写。",
+      "candidate": "NRR",
+      "evidence": "当前材料没有定义缩写，多种公开含义不能排除。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "保留NRR并列疑",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["净收入留存率", "净留存收入"]
+    },
+    {
+      "id": "well_formed_acronym_not_replaced_by_fluency",
+      "source": "发言人1：系统把MIPS用量闭环到收入，但材料没有定义MIPS，也没有其他写法。",
+      "candidate": "MIPS",
+      "evidence": "MIPS形式完整；另一英文缩写放入句子更顺不构成当前会话证据。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "保留MIPS并列疑",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["改为MAU", "改为Tokens", "改为API calls"]
+    },
+    {
+      "id": "identity_unique_with_code",
+      "source": "发言人1：关注澄浦微，代码口述为688731。",
+      "candidate": "澄浦微 / 688731",
+      "evidence": "合成证券目录中只有澄浦微电子(688731.SH)同时匹配名称、完整代码和同场角色。",
+      "expected_disposition": "resolved_identity",
+      "expected_rendering": "澄浦微电子(688731.SH)",
       "expected_doubtful_items": 0
     },
     {
-      "id": "identity_unique",
-      "source": "发言人1：这一段说的是上市公司蓝峤股份，代码我口述成了 60319。",
-      "candidate": "蓝峤股份 / 60319",
-      "identity_evidence": "可靠的合成交易所目录中只有蓝峤股份(603190.SH)同时匹配公司名和代码前缀；无其他同名证券。",
-      "expected_verdict": "resolved_by_identity_evidence",
-      "expected_doubtful_items": 0
+      "id": "document_only_single_near_entity_without_anchor",
+      "source": "发言人1：软件计费从托普斯用量闭环到收入，材料没有代码、定义或其他重复写法。",
+      "candidate": "托普斯",
+      "evidence": "公开语境只有一个常见英文近音候选，但当前文档没有独立会内锚点证明原词。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "参考原文保留托普斯并可提示单一候选，会议纪要只保留托普斯",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["直接确认为Tokens", "Tokens用量"]
     },
     {
-      "id": "meeting_uncertainty",
-      "source": "专家：我不确定下半年能否达到30%，需要回去核实；客户订单细节现在不方便透露。",
-      "candidate": "不确定下半年能否达到30% / 客户订单细节不方便透露",
-      "identity_evidence": "not_applicable",
-      "expected_verdict": "preserve_as_meeting_uncertainty_no_doubt",
-      "expected_doubtful_items": 0
+      "id": "business_relationship_is_not_identity_anchor",
+      "source": "发言人1：我们有没有跟岚兴做过项目？材料只有这一处，没有代码、定义或正式写法。",
+      "candidate": "岚兴",
+      "evidence": "即使行业中存在一个熟悉近音公司，业务关系问句和行业适配都不能证明来源指向该实体。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "保留岚兴并列疑",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["直接改成岚芯科技", "确认合作方为岚芯科技"]
     },
     {
-      "id": "self_correction",
-      "source": "发言人1：刚才说青岚是口误，应该是赤岳。这里指赤岳项目，内部代号 R-9，后文均称赤岳。",
-      "candidate": "青岚 / 赤岳",
-      "identity_evidence": "not_needed",
-      "expected_verdict": "resolved_by_context",
-      "expected_doubtful_items": 0
+      "id": "identity_near_name_not_proven",
+      "source": "发言人1：关注澄浦微，材料没有代码、业务或其他出现位置。",
+      "candidate": "澄浦微",
+      "evidence": "公开目录只有近名的澄普微电子；存在本身不能解释来源字形。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "澄浦微（疑似“澄普微电子”）",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["确认是澄普微电子"]
     },
     {
-      "id": "genuine_ambiguity",
-      "source": "发言人1：云桥方案用于边缘网关。发言人2：这里的云桥也可能是数据同步技术，我不确定刚才指的是哪一个。材料没有进一步说明。",
-      "candidate": "云桥",
-      "identity_evidence": "两个合成公开术语都能匹配：云桥边缘网关方案 / 云桥数据同步技术；没有证据排除任一项。",
-      "expected_verdict": "genuinely_doubtful",
+      "id": "identity_multiple_candidates",
+      "source": "发言人1：设备方向看好霁原设备，材料没有更多说明。",
+      "candidate": "霁原设备",
+      "evidence": "合成目录有霁原装备和济源设备，音形与角色均不能排除任一项。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "保留霁原设备并列出两个候选",
       "expected_doubtful_items": 1
+    },
+    {
+      "id": "identity_self_correction",
+      "source": "发言人1：刚才说岚序是口误，应该是岚叙材料，后文都按岚叙材料。",
+      "candidate": "岚序 / 岚叙材料",
+      "evidence": "同会话明确自我纠正，后文重复确认。",
+      "expected_disposition": "resolved_identity",
+      "expected_rendering": "岚叙材料",
+      "expected_doubtful_items": 0
+    },
+    {
+      "id": "metadata_title_is_not_user_correction",
+      "source": "材料标题：青岚科技交流。发言人1：刚才标题写错了，本场说的是蓝岚科技，后文都按蓝岚科技。",
+      "candidate": "青岚科技 / 蓝岚科技",
+      "evidence": "材料标题只是来源线索；发言人随后明确自我纠正并稳定使用蓝岚科技。",
+      "expected_disposition": "resolved_identity",
+      "expected_rendering": "蓝岚科技",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["按标题保留青岚科技", "用户确认青岚科技"]
+    },
+    {
+      "id": "full_pronunciation_recall_with_repeated_anchor",
+      "source": "发言人1：我们关注的是澄浦新材。发言人2：再确认一次，完整名称读作澄浦新材，不是简称。",
+      "candidate": "澄浦新材 / 承普新材",
+      "identity_evidence": "合成公开目录中只有承普新材与完整读音 cheng pu xin cai、公司类型和两次同场完整指称同时匹配，没有竞争候选。",
+      "expected_disposition": "resolved_identity",
+      "expected_rendering": "承普新材",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["补充证券代码", "补充业务关系"]
+    },
+    {
+      "id": "full_pronunciation_candidate_without_anchor",
+      "source": "发言人1：设备方向关注霁原，材料只有这一处，没有代码、完整名称或定义。",
+      "candidate": "霁原 / 济源设备",
+      "identity_evidence": "有界读音查询召回济源设备，但本场没有独立证据证明霁原就是该公司。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "保留霁原并把济源设备列为候选",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["确认是济源设备"]
+    },
+    {
+      "id": "number_unit_not_inferred",
+      "source": "发言人1：订单增速大约47.3个点，管理层说还要观察。",
+      "candidate": "47.3个点",
+      "evidence": "来源虽然没有说明百分比、百分点或同比环比口径，但保留了完整的说法，不能只因表述不规范制造整理存疑。",
+      "expected_disposition": "preserve_meeting_uncertainty",
+      "expected_rendering": "原样保留约47.3个点和还要观察",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["47.3%", "47.3个百分点", "同比", "环比"]
+    },
+    {
+      "id": "number_unit_explicitly_missing",
+      "source": "发言人1：订单增速是47.3，后面的符号和单位没有录到。",
+      "candidate": "47.3",
+      "evidence": "来源明确说明数字单位丢失，当前材料不能恢复百分比、百分点或其他口径。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "保留47.3并列疑",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["47.3%", "47.3个百分点", "同比", "环比"]
+    },
+    {
+      "id": "financial_subject_not_inferred",
+      "source": "发言人1：现金流是2.4亿，较上季多0.8亿。",
+      "candidate": "现金流",
+      "evidence": "来源没有说明经营、投资、自由或净现金流，也没有给币种。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "现金流是2.4亿，较上季多0.8亿",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["经营性现金流", "自由现金流", "人民币"]
+    },
+    {
+      "id": "ratio_baseline_not_derived",
+      "source": "发言人1：高端型号占比18%，比上半年高6个点。",
+      "candidate": "18% / 高6个点",
+      "evidence": "来源没有确认两期分母与统计口径完全相同。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "高端型号占比18%，比上半年高6个点",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["上半年占比12%"]
+    },
+    {
+      "id": "forecast_range_and_condition",
+      "source": "发言人1：明年出货可能在3万到5万套之间，取决于认证。",
+      "candidate": "3万到5万套之间",
+      "evidence": "来源明确给出预测范围、不确定性和条件。",
+      "expected_disposition": "preserve_meeting_uncertainty",
+      "expected_rendering": "明年出货可能在3万到5万套之间，取决于认证",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["预计出货4万套", "确定出货"]
+    },
+    {
+      "id": "source_internal_scale_conflict",
+      "source": "发言人1：同一口径我前面说8亿元，后面又说800亿元，这两个数需要回去核实。",
+      "candidate": "8亿元 / 800亿元",
+      "evidence": "发言人明确指出同一口径存在来源内数量级冲突。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "同时保留8亿元和800亿元并列疑",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["按公开财报改成", "选择800亿元", "选择8亿元"]
+    },
+    {
+      "id": "incomplete_action_not_smoothed",
+      "source": "发言人1：设备已经换线，后一句只听到所以先……就断了。",
+      "candidate": "所以先……",
+      "evidence": "动作宾语已经丢失，没有当前材料可以恢复。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "保留所以先……并列疑",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["先停产", "先加仓", "先交付"]
+    },
+    {
+      "id": "incomplete_advantage_rendered_readably",
+      "source": "发言人1：公司具备独家卡位，另一项优势只听到还有成……，后面断了。",
+      "candidate": "还有成……",
+      "evidence": "独家卡位可确认，第二项优势不可恢复；应隔离原始片段而不是硬嵌入句子或补写优势。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "保留独家卡位；用完整句说明另一项优势原始片段为还有成……且所指待确认",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["具备成效", "成本优势", "协同效应"]
+    },
+    {
+      "id": "well_formed_strategy_label_preserved",
+      "source": "发言人1：本季度沿用桥接策略，后面分别讨论进攻端和防守端。",
+      "candidate": "桥接策略 / 双峰策略",
+      "evidence": "桥接策略本身语法成立且表达了完整策略类别；后文的两端结构只能让双峰策略显得顺畅，不能证明发言人说错了策略名称。",
+      "expected_disposition": "preserve_source",
+      "expected_rendering": "本季度沿用桥接策略，后面分别讨论进攻端和防守端",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["改为双峰策略", "沿用双峰策略"]
+    },
+    {
+      "id": "well_formed_business_attribute_preserved",
+      "source": "发言人1：项目采用联营模式，合作方负责本地交付。",
+      "candidate": "联营模式 / 经销模式",
+      "evidence": "联营模式是语法成立的业务属性；合作方负责交付与多种合作模式都能并存，不能据此把来源属性改成更熟悉的经销模式。",
+      "expected_disposition": "preserve_source",
+      "expected_rendering": "项目采用联营模式，合作方负责本地交付",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["经销模式", "经销商负责本地交付"]
+    },
+    {
+      "id": "entity_recall_uses_one_external_round",
+      "source": "发言人1：今天提到澄浦新材和霁原设备，转写可能有误，但没有代码或定义。",
+      "candidate": "澄浦新材 / 霁原设备",
+      "evidence": "两个重要非人专名都可先批量查本地候选；如仍未解决，应将它们合并为全场唯一一轮外部召回，而不是分别追查。",
+      "expected_disposition": "genuinely_doubtful",
+      "expected_rendering": "保留两个原始专名并列疑",
+      "expected_doubtful_items": 2,
+      "expected_external_search_rounds": 1,
+      "forbidden_additions": ["以多轮追查强行确认任一专名", "用业务关系确认专名"]
+    },
+    {
+      "id": "spoken_two_digit_year_normalized_when_complete",
+      "source": "发言人1：我们复盘的是二三年全年，不是二三个月。",
+      "candidate": "二三年",
+      "evidence": "“全年”与“不是二三个月”使两位口语年份的含义唯一，可作不改变事实的书面化。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "2023年全年",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["2023年2至3月", "年份待确认"]
+    },
+    {
+      "id": "financial_metric_restored_by_local_definition",
+      "source": "发言人1：这里说的是扣除非经常性损益后的利润，后面简称扣费利润3.7亿。",
+      "candidate": "扣费利润",
+      "evidence": "同句先给出完整科目定义，后续近音简称只能指向扣非利润。",
+      "expected_disposition": "normal_copyedit",
+      "expected_rendering": "扣非利润3.7亿",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["扣税后利润", "科目待确认"]
     }
   ]
 }

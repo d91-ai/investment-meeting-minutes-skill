@@ -7,7 +7,6 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +14,11 @@ REQUIRED_METADATA_FIELDS = ["会议日期", "整理时间", "会议标题", "会
 MEETING_TYPES = {"多人复盘会", "公司交流", "专家交流"}
 MEETING_TYPE_ALIASES = {"上市公司交流": "公司交流"}
 QUESTION_LINE_RE = re.compile(r"^\*\*【[^】\n]+】\*\*\s*$", re.MULTILINE)
-REVIEW_TARGET_HEADING_RE = re.compile(r"^####\s*【(?P<content>[^】\n]*)】\s*$")
-TARGET_WITH_CODE_RE = re.compile(r"^.+?(?:\([^()\n]+\)|（[^（）\n]+）)$")
 ALLOWED_AMBIGUITY_HEADERS = {
     ("原始表述", "当前判断", "候选项", "人工确认"),
     ("时间戳", "原始表述", "当前判断", "候选项", "人工确认"),
 }
+ALLOWED_CORRECTION_HEADERS = ("原始表述", "校对后", "依据")
 PLACEHOLDER_VALUES = {"", "-", "无", "暂无", "无存疑", "暂无存疑", "none", "n/a"}
 FORBIDDEN_PATTERNS = [
     r"AI结构化总结",
@@ -55,7 +53,11 @@ def body_section(markdown: str) -> str:
 
 
 def reference_section(markdown: str) -> str:
-    match = re.search(r"## 二、参考原文(?P<body>.*?)(?=^## 三、存疑与待确认|\Z)", markdown, re.S | re.M)
+    match = re.search(
+        r"## 二、参考原文(?P<body>.*?)(?=^## 重要信息修改记录|^## 三、存疑与待确认|\Z)",
+        markdown,
+        re.S | re.M,
+    )
     return match.group("body") if match else ""
 
 
@@ -95,21 +97,6 @@ def _expert_questions_without_answers(section: str) -> list[str]:
     return missing
 
 
-def _validate_dates(markdown: str) -> list[str]:
-    errors: list[str] = []
-    for field in ("会议日期", "整理时间"):
-        value = markdown_field(markdown, field)
-        if not value:
-            continue
-        try:
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-                raise ValueError
-            datetime.strptime(value, "%Y-%m-%d")
-        except ValueError:
-            errors.append(f"{field} 必须为 YYYY-MM-DD 且为合法日期: {value}")
-    return errors
-
-
 def _validate_meeting_type(markdown: str, meeting_type: str) -> list[str]:
     errors: list[str] = []
     normalized = MEETING_TYPE_ALIASES.get(meeting_type, meeting_type)
@@ -126,9 +113,6 @@ def _validate_meeting_type(markdown: str, meeting_type: str) -> list[str]:
         if "标的：" in body:
             errors.append("多人复盘会小段标题不使用 标的： 前缀")
     elif normalized == "公司交流":
-        title = markdown_field(markdown, "会议标题")
-        if title and not title.endswith("公司交流会议"):
-            errors.append("公司交流的会议标题应使用 XX公司交流会议")
         if not metadata_field_present(markdown, "会议标的"):
             errors.append("公司交流必须包含会议元信息字段: 会议标的")
         if not body_headings:
@@ -149,7 +133,7 @@ def _validate_meeting_type(markdown: str, meeting_type: str) -> list[str]:
     return errors
 
 
-def _heading_findings(markdown: str) -> tuple[list[str], list[str], list[str]]:
+def _heading_findings(markdown: str) -> tuple[list[str], list[str]]:
     escapes: list[str] = []
     empty: list[str] = []
     for match in re.finditer(r"(?m)^(#{2,6})\s*(.+?)\s*$", markdown):
@@ -158,20 +142,7 @@ def _heading_findings(markdown: str) -> tuple[list[str], list[str], list[str]]:
             escapes.append(match.group(0).strip())
     empty.extend(match.group(0).strip() for match in re.finditer(r"(?m)^#{4,5}\s*【\s*】\s*$", markdown))
 
-    target_errors: list[str] = []
-    if markdown_field(markdown, "会议类型") == "多人复盘会":
-        lines = [line.strip() for line in body_section(markdown).splitlines()]
-        for index, line in enumerate(lines):
-            match = REVIEW_TARGET_HEADING_RE.fullmatch(line)
-            if not match:
-                continue
-            next_line = next((candidate for candidate in lines[index + 1 :] if candidate), "")
-            if not next_line.startswith("##### "):
-                continue
-            missing = [item.strip() for item in match.group("content").split("｜") if item.strip() and not TARGET_WITH_CODE_RE.fullmatch(item.strip())]
-            if missing:
-                target_errors.append(f"{line}（缺少代码：{' / '.join(missing)}）")
-    return escapes, empty, target_errors
+    return escapes, empty
 
 
 def _sector_heading_findings(markdown: str) -> list[str]:
@@ -188,33 +159,6 @@ def _sector_heading_findings(markdown: str) -> list[str]:
         if match and ("｜" in match.group("content") or "|" in match.group("content")):
             findings.append(line)
     return findings
-
-
-def _review_heading_warnings(markdown: str) -> list[str]:
-    if markdown_field(markdown, "会议类型") != "多人复盘会":
-        return []
-    warnings: list[str] = []
-    current_speaker = ""
-    has_sector = False
-    for raw in body_section(markdown).splitlines():
-        line = raw.strip()
-        if not line or line == "---" or line.startswith("|"):
-            continue
-        if line.startswith("### "):
-            current_speaker = line[4:].strip()
-            has_sector = False
-        elif line.startswith("#### "):
-            match = REVIEW_TARGET_HEADING_RE.fullmatch(line)
-            targets = [item.strip() for item in match.group("content").split("｜")] if match else []
-            has_sector = not targets or not all(TARGET_WITH_CODE_RE.fullmatch(item) for item in targets)
-        elif line.startswith("##### "):
-            has_sector = True
-        elif not line.startswith("#") and not has_sector:
-            prefix = f"{current_speaker}：" if current_speaker else ""
-            warnings.append(f"多人复盘会正文段落缺少相邻板块标题，建议复核: {prefix}{line[:50]}")
-            if len(warnings) >= 4:
-                break
-    return warnings
 
 
 def _validate_ambiguity_section(markdown: str) -> list[str]:
@@ -236,6 +180,25 @@ def _validate_ambiguity_section(markdown: str) -> list[str]:
     return [] if real_rows else ["存疑与待确认章节存在时必须包含至少一条真实存疑"]
 
 
+def _validate_correction_section(markdown: str) -> list[str]:
+    heading = "## 重要信息修改记录"
+    if heading not in markdown:
+        return []
+    section = markdown.split(heading, 1)[1].split("## 三、存疑与待确认", 1)[0]
+    table = [line.strip() for line in section.splitlines() if line.strip().startswith("|")]
+    if len(table) < 3:
+        return ["重要信息修改记录存在时必须包含非空 Markdown 表格"]
+    headers = tuple(cell.strip() for cell in table[0].strip("|").split("|"))
+    if headers != ALLOWED_CORRECTION_HEADERS:
+        return ["重要信息修改记录表头必须为: 原始表述 / 校对后 / 依据"]
+    real_rows = []
+    for line in table[2:]:
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) >= 3 and all(cell.lower() not in PLACEHOLDER_VALUES for cell in cells[:3]):
+            real_rows.append(cells)
+    return [] if real_rows else ["重要信息修改记录存在时必须包含至少一条真实修改"]
+
+
 def validate_contract(
     markdown: str,
     *,
@@ -250,38 +213,39 @@ def validate_contract(
     for field in REQUIRED_METADATA_FIELDS:
         if not metadata_field_present(markdown, field):
             errors.append(f"缺少会议元信息字段: {field}")
-    errors.extend(_validate_dates(markdown))
     meeting_type = markdown_field(markdown, "会议类型")
     if meeting_type:
         errors.extend(_validate_meeting_type(markdown, meeting_type))
 
     body_position = markdown.find("## 一、会议纪要")
     reference_position = markdown.find("## 二、参考原文")
+    correction_position = markdown.find("## 重要信息修改记录")
     ambiguity_position = markdown.find("## 三、存疑与待确认")
     if body_position < 0 or not body_section(markdown).strip():
         errors.append("缺少或留空必需章节: ## 一、会议纪要")
     if reference_position < 0 or not reference_section(markdown).strip():
         errors.append("缺少或留空必需章节: ## 二、参考原文")
-    positions = [item for item in (body_position, reference_position, ambiguity_position) if item >= 0]
+    positions = [
+        item
+        for item in (body_position, reference_position, correction_position, ambiguity_position)
+        if item >= 0
+    ]
     if positions != sorted(positions):
         errors.append("必需章节顺序错误")
     for pattern in FORBIDDEN_PATTERNS:
         if re.search(pattern, markdown):
             errors.append(f"包含禁止输出内容: {pattern}")
 
-    escapes, empty, target_errors = _heading_findings(markdown)
+    escapes, empty = _heading_findings(markdown)
     if escapes:
         errors.append("包含契约外逃逸标题: " + "；".join(escapes[:6]))
     if empty:
         errors.append("标题不得使用空括号占位: " + "；".join(empty[:6]))
-    if target_errors:
-        errors.append("多人复盘会标的行中的每个标的必须包含非空代码: " + "；".join(target_errors[:6]))
     sectors = _sector_heading_findings(markdown)
     if sectors:
         errors.append("多人复盘会板块行只展示二级板块，不得包含一级板块前缀或分隔符: " + "；".join(sectors[:6]))
     errors.extend(_validate_ambiguity_section(markdown))
-    warnings.extend(_review_heading_warnings(markdown))
-
+    errors.extend(_validate_correction_section(markdown))
     for term in required_terms or []:
         if term not in markdown:
             errors.append(f"缺少样例关键锚点: {term}")

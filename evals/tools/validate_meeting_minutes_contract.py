@@ -26,6 +26,8 @@ FORBIDDEN_PATTERNS = [
     r"(?m)^##+\s*(?:摘要|投研摘要|整理者总结|投资结论|核心结论)\s*$",
     r"##\s*(?:四|五|六|七|八|九|十)[、.．]",
     r"处理说明",
+    r"正常生产不增加全文二审",
+    r"(?i)(?:对\s*)?skill\s*调整(?:的)?(?:提示|prompt|指令)?",
     r"(?m)^\*\*输入来源\*\*[:：]",
     r"(?m)^\*\*整理说明\*\*[:：]",
     r"Tool Call|skill_name|Traceback|Observation:",
@@ -150,13 +152,12 @@ def _sector_heading_findings(markdown: str) -> list[str]:
         return []
     findings: list[str] = []
     lines = [line.strip() for line in body_section(markdown).splitlines()]
-    for index, line in enumerate(lines):
-        is_sector = line.startswith("##### ")
-        if line.startswith("#### "):
-            next_line = next((candidate for candidate in lines[index + 1 :] if candidate), "")
-            is_sector = not next_line.startswith("##### ")
-        match = re.fullmatch(r"#{4,5}\s*【(?P<content>[^】\n]*)】\s*", line) if is_sector else None
-        if match and ("｜" in match.group("content") or "|" in match.group("content")):
+    for line in lines:
+        if line.startswith("##### "):
+            findings.append(line)
+            continue
+        match = re.fullmatch(r"####\s*【(?P<content>[^】\n]*)】\s*", line)
+        if match and "|" in match.group("content"):
             findings.append(line)
     return findings
 
@@ -243,7 +244,7 @@ def validate_contract(
         errors.append("标题不得使用空括号占位: " + "；".join(empty[:6]))
     sectors = _sector_heading_findings(markdown)
     if sectors:
-        errors.append("多人复盘会板块行只展示二级板块，不得包含一级板块前缀或分隔符: " + "；".join(sectors[:6]))
+        errors.append("多人复盘会标题不得使用五级板块行或 ASCII 分隔符: " + "；".join(sectors[:6]))
     errors.extend(_validate_ambiguity_section(markdown))
     errors.extend(_validate_correction_section(markdown))
     for term in required_terms or []:

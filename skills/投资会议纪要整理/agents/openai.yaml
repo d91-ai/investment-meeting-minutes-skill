@@ -1,4 +1,4 @@
 interface:
   display_name: "投资会议纪要整理"
   short_description: "整理来源忠实的双层投研纪要，并核验重要非人专名与证券代码"
-  default_prompt: "请使用 $investment-meeting-minutes 先建立来源忠实、专业可读的参考原文，再派生更短的会议纪要。主动召回疑似错听的重要非人专名候选并按需核验证券代码；候选不等于确认，无法唯一恢复的原始片段进入存疑。"
+  default_prompt: "请使用 $investment-meeting-minutes 整理提供的投资会议材料；先确认会议类型，再按对应规则输出来源忠实的双层 Markdown 纪要。"

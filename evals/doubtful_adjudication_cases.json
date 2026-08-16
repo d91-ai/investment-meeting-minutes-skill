@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.2",
+  "schema_version": "2.4",
   "description": "Synthetic cases for text restoration, identity resolution, and uncertainty handling. No real meeting or entity data.",
   "cases": [
     {
@@ -94,12 +94,13 @@
     {
       "id": "document_only_single_near_entity_without_anchor",
       "source": "发言人1：软件计费从托普斯用量闭环到收入，材料没有代码、定义或其他重复写法。",
-      "candidate": "托普斯",
-      "evidence": "公开语境只有一个常见英文近音候选，但当前文档没有独立会内锚点证明原词。",
-      "expected_disposition": "genuinely_doubtful",
-      "expected_rendering": "参考原文保留托普斯并可提示单一候选，会议纪要只保留托普斯",
-      "expected_doubtful_items": 1,
-      "forbidden_additions": ["直接确认为Tokens", "Tokens用量"]
+      "candidate": "托普斯 / Tokens",
+      "evidence": "计费用量闭环到收入的本场语境、完整近音和唯一合理候选共同支持Tokens。",
+      "expected_disposition": "resolved_contextual_candidate",
+      "expected_rendering": "软件计费从Tokens用量闭环到收入",
+      "expected_correction_record": true,
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["补充单价", "补充收入金额"]
     },
     {
       "id": "business_relationship_is_not_identity_anchor",
@@ -114,12 +115,13 @@
     {
       "id": "identity_near_name_not_proven",
       "source": "发言人1：关注澄浦微，材料没有代码、业务或其他出现位置。",
-      "candidate": "澄浦微",
-      "evidence": "公开目录只有近名的澄普微电子；存在本身不能解释来源字形。",
-      "expected_disposition": "genuinely_doubtful",
-      "expected_rendering": "澄浦微（疑似“澄普微电子”）",
-      "expected_doubtful_items": 1,
-      "forbidden_additions": ["确认是澄普微电子"]
+      "candidate": "澄浦微 / 澄普微电子",
+      "evidence": "证券关注语境、名称音形和目录中的单一合理候选共同支持澄普微电子。",
+      "expected_disposition": "resolved_contextual_candidate",
+      "expected_rendering": "澄普微电子",
+      "expected_correction_record": true,
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["补充未核验代码", "补充业务关系"]
     },
     {
       "id": "identity_multiple_candidates",
@@ -129,6 +131,17 @@
       "expected_disposition": "genuinely_doubtful",
       "expected_rendering": "保留霁原设备并列出两个候选",
       "expected_doubtful_items": 1
+    },
+    {
+      "id": "identity_multiple_candidates_context_selects_one",
+      "source": "发言人1：设备方向看好霁原设备，后文连续讨论其晶圆检测设备和半导体客户。",
+      "candidate": "霁原装备 / 济源设备",
+      "evidence": "两个候选都与原片段音形相近，但只有霁原装备与本场连续出现的晶圆检测设备语境相符。",
+      "expected_disposition": "resolved_contextual_candidate",
+      "expected_rendering": "设备方向看好霁原装备，后文连续讨论其晶圆检测设备和半导体客户",
+      "expected_correction_record": true,
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["补充未提供的订单", "列入存疑"]
     },
     {
       "id": "identity_self_correction",
@@ -163,11 +176,12 @@
       "id": "full_pronunciation_candidate_without_anchor",
       "source": "发言人1：设备方向关注霁原，材料只有这一处，没有代码、完整名称或定义。",
       "candidate": "霁原 / 济源设备",
-      "identity_evidence": "有界读音查询召回济源设备，但本场没有独立证据证明霁原就是该公司。",
-      "expected_disposition": "genuinely_doubtful",
-      "expected_rendering": "保留霁原并把济源设备列为候选",
-      "expected_doubtful_items": 1,
-      "forbidden_additions": ["确认是济源设备"]
+      "identity_evidence": "设备方向语境、完整近音和有界查询中的单一合理候选共同支持济源设备。",
+      "expected_disposition": "resolved_contextual_candidate",
+      "expected_rendering": "济源设备",
+      "expected_correction_record": true,
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["补充未核验代码", "补充业务关系"]
     },
     {
       "id": "number_unit_not_inferred",
@@ -270,15 +284,16 @@
       "forbidden_additions": ["经销模式", "经销商负责本地交付"]
     },
     {
-      "id": "entity_recall_uses_one_external_round",
-      "source": "发言人1：今天提到澄浦新材和霁原设备，转写可能有误，但没有代码或定义。",
-      "candidate": "澄浦新材 / 霁原设备",
-      "evidence": "两个重要非人专名都可先批量查本地候选；如仍未解决，应将它们合并为全场唯一一轮外部召回，而不是分别追查。",
-      "expected_disposition": "genuinely_doubtful",
-      "expected_rendering": "保留两个原始专名并列疑",
-      "expected_doubtful_items": 2,
+      "id": "mixed_unresolved_items_share_one_external_round",
+      "source": "发言人1：设备方向关注霁原；同时配置科创材料ETF。蓝川资源半年报净利润听成15亿美元，后文说简单年化约10亿美元。",
+      "candidate": "霁原 / 科创材料ETF代码 / 蓝川资源半年报净利润",
+      "evidence": "霁原仍有两个实质相当候选；可靠公开证券资料唯一确认科创材料ETF代码588799；蓝川资源官方半年报显示净利5.1亿美元，与后文简单年化10.2亿美元共同形成明显更合理的听写候选。三项与其他未决项仍合并为全场至多一轮外部召回。",
+      "expected_disposition": "mixed_candidate_adjudication",
+      "expected_rendering": "保留霁原并列疑；科创材料ETF补充代码588799；蓝川资源半年报净利润修正为5.1亿美元并记录修改",
+      "expected_correction_record": true,
+      "expected_doubtful_items": 1,
       "expected_external_search_rounds": 1,
-      "forbidden_additions": ["以多轮追查强行确认任一专名", "用业务关系确认专名"]
+      "forbidden_additions": ["分项执行多轮外部查询", "用公开资料新增业务关系或观点"]
     },
     {
       "id": "spoken_two_digit_year_normalized_when_complete",
@@ -299,6 +314,91 @@
       "expected_rendering": "扣非利润3.7亿",
       "expected_doubtful_items": 0,
       "forbidden_additions": ["扣税后利润", "科目待确认"]
+    },
+    {
+      "id": "confirmed_target_requires_code_supplement",
+      "source": "发言人1：我继续关注澄浦微电子，主要跟踪新品验证。材料没有口述证券代码。",
+      "candidate": "澄浦微电子",
+      "evidence": "本场已唯一确认证券标的名称；合成证券目录只有澄浦微电子(688731.SH)精确匹配。",
+      "expected_disposition": "resolved_identity",
+      "expected_rendering": "澄浦微电子(688731.SH)",
+      "expected_correction_record": true,
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["不补代码", "仅因来源没说代码而省略"]
+    },
+    {
+      "id": "history_minutes_are_supporting_evidence_only",
+      "source": "发言人1：设备方向关注霁原，当前材料只有这一处，没有代码、完整名称或定义。",
+      "candidate": "霁原 / 济源设备",
+      "history_evidence": "相关历史会议纪要反复使用济源设备(688799.SH)，且与本场设备方向和读音相符，没有竞争候选。",
+      "expected_disposition": "resolved_contextual_candidate",
+      "expected_rendering": "济源设备(688799.SH)",
+      "expected_correction_record": true,
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["把历史观点补入本场", "把历史关系补入本场"]
+    },
+    {
+      "id": "single_dominant_candidate_requires_adjudication",
+      "source": "发言人1：散热方向继续关注澄天伟页，下周安排调研。",
+      "candidate": "澄天伟页 / 澄天伟业",
+      "evidence": "原片段音形相容，本地证券目录只有澄天伟业这一合理候选，且散热关注与调研语境没有竞争解释。",
+      "expected_disposition": "resolved_contextual_candidate",
+      "expected_rendering": "散热方向继续关注澄天伟业，下周安排调研",
+      "expected_correction_record": true,
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["因confirmed为false列疑", "要求排除所有理论可能"]
+    },
+    {
+      "id": "speaker_claim_uncertainty_does_not_unresolve_identity",
+      "source": "发言人1：澄浦装备说下月可能发布新品，但只有这一家公司这样讲，消息真假无法判断。",
+      "candidate": "澄浦装备",
+      "evidence": "本场已经稳定识别公司名称；真假无法判断修饰的是新品消息，不是实体身份。",
+      "expected_disposition": "preserve_meeting_uncertainty",
+      "expected_rendering": "澄浦装备称下月可能发布新品，但目前只有该公司这样表述，消息真假无法判断",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["把澄浦装备列为身份存疑", "确认新品一定发布"]
+    },
+    {
+      "id": "low_impact_orphan_noise_not_doubtful",
+      "source": "发言人1：开场有一句只录到‘那个封……’，随后完整表达：我们继续关注设备国产替代，核心判断不变。",
+      "candidate": "那个封……",
+      "evidence": "孤立残片不承载标的身份、事实关系、数字口径或投资判断，完整观点已由后句保留。",
+      "expected_disposition": "omit_non_material_noise",
+      "expected_rendering": "保留我们继续关注设备国产替代，核心判断不变；不为孤立残片创建存疑项",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["把那个封列入存疑", "猜测残片原意"]
+    },
+    {
+      "id": "parallel_entities_are_adjudicated_individually",
+      "source": "发言人1：本周更新AlphaKit、澄浦框架和霁原云。AlphaKit在后文有完整产品定义，澄浦框架只有单一合理候选，霁原云仍有两个实质相当候选。",
+      "candidate": "AlphaKit / 澄浦框架 / 霁原云",
+      "evidence": "三个并列实体的证据强度不同，必须逐个结案，不能因霁原云未决而把整个列表送入存疑。",
+      "expected_disposition": "mixed_entity_adjudication",
+      "expected_rendering": "正文采用AlphaKit和澄浦框架；仅霁原云保留原片段并列疑",
+      "expected_doubtful_items": 1,
+      "forbidden_additions": ["整组列疑", "删除已确认实体"]
+    },
+    {
+      "id": "recommended_misheard_security_must_enter_candidate_batch",
+      "source": "发言人1：散热方向继续推荐成天伟页，下周安排调研；同段还给出液冷订单和服务器客户线索。",
+      "candidate": "成天伟页 / 澄天伟业",
+      "evidence": "该片段位于明确推荐位置，必须进入本场候选批次；音形、液冷业务和证券目录共同形成澄天伟业这一明显最优候选。",
+      "expected_disposition": "resolved_contextual_candidate",
+      "expected_rendering": "散热方向继续推荐澄天伟业，下周安排调研",
+      "expected_correction_record": true,
+      "expected_doubtful_items": 0,
+      "expected_candidate_batch_inclusion": true,
+      "forbidden_additions": ["因名称陌生跳过候选召回", "直接列入存疑"]
+    },
+    {
+      "id": "unverified_near_name_must_not_be_rewritten",
+      "source": "发言人1：材料提到署名为军政评，但没有其他重复、定义或可靠身份资料。",
+      "candidate": "军政评 / 军正评 / 钧正评",
+      "evidence": "原片段的重要性较低不等于可以凭近音改写；在没有形成有证据候选时应保留原始写法，也不为其单独创建存疑项。",
+      "expected_disposition": "preserve_source",
+      "expected_rendering": "保留军政评",
+      "expected_doubtful_items": 0,
+      "forbidden_additions": ["改为军正评", "改为钧正评", "列入存疑"]
     }
   ]
 }

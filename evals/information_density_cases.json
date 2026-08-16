@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "description": "Synthetic paired cases for evaluating information density without losing source meaning. No real meeting or entity data.",
   "cases": [
     {
@@ -67,6 +67,14 @@
       "expected_minutes_required": ["产品定义为托管服务", "讨论软件订阅和运维", "没有把产品类别改成SaaS"],
       "expected_reference_required": ["产品在本场定义为托管服务", "讨论软件订阅和运维", "没有把产品类别改成SaaS"],
       "forbidden_additions": ["产品是SaaS", "SaaS产品", "SaaS服务"]
+    },
+    {
+      "id": "contextual_rewrite_keeps_financial_meaning_and_record",
+      "source": "发言人1：这个利润改善吧，主要还是产品结构变好了这么一个事，价格其实没有往上调。",
+      "expected_minutes_required": ["利润改善", "产品结构改善", "价格没有上调"],
+      "expected_reference_required": ["利润改善主要来自产品结构改善", "价格没有上调"],
+      "expected_correction_record": ["产品结构变好了这么一个事", "产品结构改善", "上下文等义流畅化改写"],
+      "forbidden_additions": ["提价驱动利润改善", "毛利率改善", "销量增长"]
     }
   ]
 }

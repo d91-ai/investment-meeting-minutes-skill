@@ -21,8 +21,8 @@ DEFAULT_WORKSPACE_ROOT = (
 )
 DEFAULT_SYMBOL_ROOT = DEFAULT_WORKSPACE_ROOT / "03 Resources/market-symbols"
 DEFAULT_ALIAS_PATH = DEFAULT_SYMBOL_ROOT / "company_aliases.csv"
-CANDIDATE_GUIDANCE = "仅作候选线索；结合原片段音形和当前会议上下文判断。不能排除竞争候选时保留原片段并列疑，不得写入确认代码。"
-NOT_FOUND_GUIDANCE = "不要为补代码或普通未命中扩大查询。疑似错听的重要非人专名可用 build_entity_search_plan.py 生成有界读音查询，并与其他实体合并为本场至多一轮外部请求；结果仍只作候选，不追查。"
+CANDIDATE_GUIDANCE = "结合原片段音形和当前会议上下文选择最合理候选并写入正文；多个候选实质相当、确实无法判断时才保留原片段并列疑。证券代码仍须与已选标的身份一致。"
+NOT_FOUND_GUIDANCE = "实际投资标的未命中时，可与其他未解决的重要实体合并为本场至多一轮外部请求；普通未命中不扩大查询。疑似错听的重要非人专名可用 build_entity_search_plan.py 生成有界读音查询；有合理候选时结合上下文结案，仍无合理候选或候选实质相当时才列疑，不逐项追查。"
 
 
 @dataclass
@@ -206,13 +206,14 @@ def query_symbols(
             candidates.append(candidate)
 
     ranked = dedupe(candidate for candidate in candidates if market_allowed(candidate.market, market))[:limit]
-    status = "candidate_only" if ranked else "not_found"
+    status = "candidates_found" if ranked else "not_found"
     recommendation = CANDIDATE_GUIDANCE if ranked else NOT_FOUND_GUIDANCE
     return {
         "query": query,
         "market": market,
         "status": status,
-        "confirmed": False,
+        "requires_context_adjudication": bool(ranked),
+        "decision_owner": "main_workflow",
         "recommendation": recommendation,
         "candidates": [asdict(candidate) for candidate in ranked],
     }

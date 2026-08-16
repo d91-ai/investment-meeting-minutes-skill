@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "description": "Synthetic workflow cases for meeting-type routing and production-output isolation. No real meeting data.",
+  "cases": [
+    {
+      "id": "ambiguous_meeting_type_requires_user_confirmation",
+      "input": "材料只有一段公司经营介绍和一段未标明身份的问答，用户未说明会议类型。",
+      "expected_action": "在生成正文前向用户确认是公司交流还是专家交流",
+      "forbidden_actions": ["默认归为多人复盘会", "先生成正文再补会议类型", "会议类型写原始材料未提供"]
+    },
+    {
+      "id": "skill_tuning_prompt_never_enters_minutes",
+      "input": "用户要求正常生产不增加全文二审、第二套转写、全量实体搜索、语义门禁、旁路审计或为了填表而复查。",
+      "expected_action": "仅把要求作为工作流边界执行",
+      "forbidden_output_terms": ["正常生产不增加全文二审", "第二套转写", "全量实体搜索", "语义门禁", "旁路审计", "为了填表而复查", "Skill 调整提示"]
+    }
+  ]
+}
